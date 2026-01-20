@@ -36,7 +36,7 @@
 #
 # Verification Workflow:
 #   1. Build model with wrapper layers:
-#      model = nn.Sequential(
+#      model = nn.Module(
 #          InputLayer(shape=(1, 28, 28)),
 #          InputSpecLayer(InputSpec(kind=InKind.L_INF, eps=0.03)),
 #          nn.Flatten(),
@@ -93,7 +93,7 @@ def prod(seq: Tuple[int, ...]) -> int:
 
 class VerifiableModel(nn.Sequential):
     """
-    Sequential model wrapper that provides spec-free verification.
+    Module wrapper that provides spec-free verification.
     
     Automatically collects constraint checking results from InputSpecLayer
     and OutputSpecLayer, returning a dict with both model output and

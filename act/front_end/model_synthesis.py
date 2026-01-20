@@ -167,7 +167,7 @@ def synthesize_single_model_from_spec(
 
 def synthesize_models_from_specs(
     spec_results: List[Tuple[str, str, nn.Module, List[LabeledInputTensor], List[Tuple[InputSpec, OutputSpec]]]]
-) -> Tuple[Dict[str, nn.Sequential], Dict[str, WrapReport]]:
+) -> Tuple[Dict[str, nn.Module], Dict[str, WrapReport]]:
     """
     Synthesize wrapped models directly from spec creator results.
     
@@ -185,12 +185,12 @@ def synthesize_models_from_specs(
             - spec_pairs: List of (InputSpec, OutputSpec) tuples
     
     Returns:
-        wrapped_models: Dict[combo_id, nn.Sequential] - Synthesized VerifiableModel instances
+        wrapped_models: Dict[combo_id, nn.Module] - Synthesized VerifiableModel instances
         reports: Dict[combo_id, WrapReport] - Metadata for each wrapped model
         
     combo_id format: "m:<model_name>|x:<data_source>|s:<spec_index>|is:<input_kind>|os:<output_kind>_m<margin>"
     """
-    wrapped_models: Dict[str, nn.Sequential] = {}
+    wrapped_models: Dict[str, nn.Module] = {}
     reports: Dict[str, WrapReport] = {}
     
     print(f"\n🧬 Synthesizing models from {len(spec_results)} spec result(s)...")
@@ -241,7 +241,7 @@ def synthesize_models_from_specs(
 # -----------------------------------------------------------------------------
 # 4) Model synthesis main function
 # -----------------------------------------------------------------------------
-def model_synthesis(creator: str = 'torchvision') -> Dict[str, nn.Sequential]:
+def model_synthesis(creator: str = 'torchvision') -> Dict[str, nn.Module]:
     """
     Main model synthesis function using new spec creators.
     
@@ -252,7 +252,7 @@ def model_synthesis(creator: str = 'torchvision') -> Dict[str, nn.Sequential]:
         creator: Creator to use ('torchvision' or 'vnnlib'). Defaults to 'torchvision'.
     
     Returns:
-        wrapped_models: Dict[combo_id, nn.Sequential] - All synthesized wrapped models
+        wrapped_models: Dict[combo_id, nn.Module] - All synthesized wrapped models
         
     Raises:
         RuntimeError: If no spec creator can load data-model pairs or create specs
