@@ -369,7 +369,7 @@ def main():
                             print(f"  ❌ Test FAILED (output constraint violated)")
                     
                     else:
-                        # Legacy nn.Sequential (no verification)
+                        # Legacy nn.Module (no verification)
                         output = results
                         print(f"  ⚠️  Legacy model (no constraint checking)")
                         print(f"  Output shape: {list(output.shape)}")

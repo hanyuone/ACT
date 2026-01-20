@@ -173,7 +173,7 @@ class ACTFuzzer:
     """
     
     def __init__(self,
-                 wrapped_model: nn.Sequential,
+                 wrapped_model: nn.Module,
                  initial_seeds: List[LabeledInputTensor],
                  config: Optional[FuzzingConfig] = None):
         """
@@ -244,7 +244,7 @@ class ACTFuzzer:
     
     def _extract_spec(self, layer_type) -> Optional[InputSpec | OutputSpec]:
         """Extract spec from wrapper layer."""
-        for layer in self.model:
+        for layer in self.model.children():
             if isinstance(layer, layer_type):
                 return layer.spec
         return None

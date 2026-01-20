@@ -28,7 +28,7 @@
 #   ASSERT     → OutputSpecLayer     (output constraint checking)
 #
 # VerifiableModel:
-#   Wraps nn.Sequential to provide automatic constraint verification.
+#   Wraps nn.Module to provide automatic constraint verification.
 #   Returns dict with:
 #   - 'output': Model predictions
 #   - 'input_satisfied': Input constraint satisfaction status
@@ -78,13 +78,13 @@ class ACTToTorch:
     
     Usage:
         converter = ACTToTorch(act_net)
-        model = converter.run()  # Returns nn.Sequential
+        model = converter.run()  # Returns nn.Module
     
     Args:
         act_net: ACT Net object containing layers with architecture and weights
     
     Returns:
-        PyTorch nn.Sequential model ready for inference
+        PyTorch nn.Module model ready for inference
     """
     
     def __init__(self, act_net: Net):

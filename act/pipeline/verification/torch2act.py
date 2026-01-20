@@ -94,7 +94,7 @@ def _prod(shape_tail: Tuple[int, ...]) -> int:
 
 class TorchToACT:
     """
-    Convert a *wrapped* nn.Sequential to ACT Net/Layers.
+    Convert a *wrapped* nn.Module to ACT Net/Layers.
     Requirements (asserted in __init__):
       - Contains exactly one InputLayer (first-class source of input shape).
       - Contains at least one InputSpecLayer.
@@ -108,11 +108,11 @@ class TorchToACT:
     _InputSpecLayerTypeName = "InputSpecLayer"
     _OutputSpecLayerTypeName = "OutputSpecLayer"
 
-    def __init__(self, wrapped: nn.Sequential):
-        if not isinstance(wrapped, nn.Sequential):
-            raise TypeError("TorchToACT expects an nn.Sequential wrapper model.")
+    def __init__(self, wrapped: nn.Module):
+        if not isinstance(wrapped, nn.Module):
+            raise TypeError("TorchToACT expects an nn.Module wrapper model.")
         self.m = wrapped
-        mods = list(self.m)
+        mods = list(self.m.children())
 
         # --- Assertions: InputSpecLayer and OutputSpecLayer existence ---
         has_input_spec = any(type(x).__name__ == self._InputSpecLayerTypeName for x in mods)
@@ -525,7 +525,7 @@ class TorchToACT:
         self._emit_input()
 
         # Walk modules and recursively process them
-        for mod in self.m:
+        for mod in self.m.children():
             self._process_module(mod)
 
         # Build linear graph structure (sequential layers)

@@ -22,7 +22,7 @@ from typing import Dict, Any, Optional, List, Tuple, Union
 # ------------------- Model Inference Function --------------------------------
 # Helper function for single model inference
 # -----------------------------------------------------------------------------
-def infer_single_model(combo_id: str, model: nn.Sequential, input_tensor: torch.Tensor) -> Tuple[bool, Optional[torch.Tensor], Optional[str]]:
+def infer_single_model(combo_id: str, model: nn.Module, input_tensor: torch.Tensor) -> Tuple[bool, Optional[torch.Tensor], Optional[str]]:
     """
     Test a single wrapped model with input tensor.
     
@@ -50,15 +50,15 @@ def infer_single_model(combo_id: str, model: nn.Sequential, input_tensor: torch.
 
 # Main model inference function
 # -----------------------------------------------------------------------------
-def model_inference(models: Dict[str, nn.Sequential]) -> Dict[str, nn.Sequential]:
+def model_inference(models: Dict[str, nn.Module]) -> Dict[str, nn.Module]:
     """
     Test all wrapped models with their stored inputs and provide execution statistics.
     
     Args:
-        models: Dict[combo_id, nn.Sequential] - Synthesized wrapped models to test
+        models: Dict[combo_id, nn.Module] - Synthesized wrapped models to test
         
     Returns:
-        Dict[combo_id, nn.Sequential] - Successfully inferred models only
+        Dict[combo_id, nn.Module] - Successfully inferred models only
     """
     print(f"\n🔧 Testing {len(models)} models...")
     
