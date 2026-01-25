@@ -83,13 +83,20 @@ class FuzzingConfig:
     perturb_scale: float
     device: str
     save_counterexamples: bool
-    output_dir: str
+    output_dir: Path
     report_interval: int
     verbose: int
     trace_level: int
     trace_sample_rate: int
     trace_storage: str
     trace_output: Optional[Path] = None
+    
+    def __post_init__(self):
+        """Normalize output_dir to Path object."""
+        if isinstance(self.output_dir, str):
+            self.output_dir = Path(get_pipeline_log_dir()) / self.output_dir
+        elif not isinstance(self.output_dir, Path):
+            self.output_dir = Path(self.output_dir)
     
     @classmethod
     def from_yaml(cls, config_path: Optional[str | Path] = None, **overrides) -> "FuzzingConfig":
@@ -229,9 +236,6 @@ class ACTFuzzer:
         Args:
             wrapped_model: VerifiableModel from model_synthesis
                           (contains InputSpecLayer and OutputSpecLayer)
-        # Ensure output_dir is Path object
-        if isinstance(self.config.output_dir, str):
-            self.config.output_dir = Path(get_pipeline_log_dir()) / self.config.output_dir
             initial_seeds: List of LabeledInputTensor from spec creators
             config: Fuzzing configuration (uses defaults if None)
         """
