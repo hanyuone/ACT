@@ -97,15 +97,26 @@ def validate_layer(layer: "Layer") -> None:
                     )
             except ImportError:
                 pass
-            # Validate label component (must be int or list of ints)
-            if val.label is not None and not isinstance(val.label, (int, list)):
-                raise TypeError(
-                    f"{kind}.params['labeled_input'].label must be int or list[int], got {type(val.label)}."
-                )
-            if isinstance(val.label, list) and not all(isinstance(x, int) for x in val.label):
-                raise TypeError(
-                    f"{kind}.params['labeled_input'].label list contains non-int elements."
-                )
+            # Validate label component (accepts int, list[int], or torch.Tensor)
+            if val.label is not None:
+                try:
+                    import torch
+                    if not isinstance(val.label, (int, list, torch.Tensor)):
+                        raise TypeError(
+                            f"{kind}.params['labeled_input'].label must be int, list[int], or torch.Tensor, got {type(val.label)}."
+                        )
+                except ImportError:
+                    # If torch not available, only accept int or list
+                    if not isinstance(val.label, (int, list)):
+                        raise TypeError(
+                            f"{kind}.params['labeled_input'].label must be int or list[int], got {type(val.label)}."
+                        )
+                
+                # Additional validation for list types (ensure all elements are ints)
+                if isinstance(val.label, list) and not all(isinstance(x, int) for x in val.label):
+                    raise TypeError(
+                        f"{kind}.params['labeled_input'].label list contains non-int elements."
+                    )
             continue
         # If torch isn't available, skip the runtime type check.
         try:
@@ -118,18 +129,6 @@ def validate_layer(layer: "Layer") -> None:
     miss_p = _missing(spec['params_required'], layer.params)
     miss_m = _missing(spec['meta_required'], layer.meta)
     
-    # Additional INPUT-specific check: dtype VALUE matches device_manager
-    if kind == LayerKind.INPUT.value and 'dtype' in layer.meta:
-        from act.util.device_manager import get_default_dtype
-        expected_dtype = str(get_default_dtype()).replace('torch.', 'torch.')
-        yaml_dtype = layer.meta['dtype']
-        if yaml_dtype != expected_dtype:
-            raise ValueError(
-                f"INPUT layer {layer.id} has dtype='{yaml_dtype}' "
-                f"but device_manager expects '{expected_dtype}'. "
-                f"Update configuration to use dtype: \"{expected_dtype}\""
-            )
-
     allowed_p = spec['params_required'] + spec['params_optional']
     allowed_m = spec['meta_required'] + spec['meta_optional']
 

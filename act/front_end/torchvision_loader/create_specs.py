@@ -213,7 +213,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
             
             # Create LabeledInputTensor pairing image with label (keep batch dimension)
             tensor = images  # Keep batch dimension (1, C, H, W)
-            label = targets.item()
+            label = targets  # Keep as tensor (1,) 
             labeled_tensors.append(LabeledInputTensor(tensor=tensor, label=label))
         
         if not labeled_tensors:
@@ -304,19 +304,19 @@ class TorchVisionSpecCreator(BaseSpecCreator):
                     input_specs.append(InputSpec(
                         kind=InKind.LINF_BALL,
                         center=sample_tensor.clone(),
-                        eps=eps
+                        eps=torch.tensor(eps, dtype=torch.get_default_dtype())
                     ))
         
         return input_specs
     
-    def _generate_output_specs_for_label(self, label: int) -> List[OutputSpec]:
+    def _generate_output_specs_for_label(self, label: torch.Tensor) -> List[OutputSpec]:
         """
-        Generate output specifications for a single label.
+        Generate output specifications for a single label (batch-native).
         
         Creates MARGIN_ROBUST and/or TOP1_ROBUST specs based on configuration.
         
         Args:
-            label: Ground truth label
+            label: Ground truth label tensor (1,) shape, preserves device
             
         Returns:
             List of OutputSpec objects for this label
@@ -329,26 +329,27 @@ class TorchVisionSpecCreator(BaseSpecCreator):
         # Get margin values
         margins = self.config.get('margins', [0.0])
         
+        # No need to extract device - device_manager ensures all tensors use default device
+        
         for kind in output_kinds:
             if kind == 'MARGIN_ROBUST':
                 # MARGIN_ROBUST: classification with margin
                 for margin in margins:
                     output_specs.append(OutputSpec(
                         kind=OutKind.MARGIN_ROBUST,
-                        y_true=label,
-                        margin=margin
+                        y_true=label.clone(),  # Use label tensor directly (already (1,) shape)
+                        margin=torch.tensor([margin], dtype=torch.get_default_dtype())
                     ))
             
             elif kind == 'TOP1_ROBUST':
                 # TOP1_ROBUST: top-1 classification
                 output_specs.append(OutputSpec(
                     kind=OutKind.TOP1_ROBUST,
-                    y_true=label
+                    y_true=label.clone()  # Use label tensor directly (already (1,) shape)
                 ))
         
         return output_specs
     
-    # Legacy methods (kept for backward compatibility but not used)
     def _generate_input_specs(self, input_tensors: List[torch.Tensor]) -> List[InputSpec]:
         """
         Generate input specifications from sample tensors.
@@ -391,7 +392,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
                         input_specs.append(InputSpec(
                             kind=InKind.LINF_BALL,
                             center=sample_tensor.clone(),
-                            eps=eps
+                            eps=torch.tensor(eps, dtype=torch.get_default_dtype())
                         ))
         
         logger.debug(f"Generated {len(input_specs)} input specs from {len(input_tensors)} samples")
@@ -426,15 +427,15 @@ class TorchVisionSpecCreator(BaseSpecCreator):
                     for margin in margins:
                         output_specs.append(OutputSpec(
                             kind=OutKind.MARGIN_ROBUST,
-                            y_true=y_true,
-                            margin=margin
+                            y_true=torch.tensor([y_true], dtype=torch.int64),  # Batch: (1,) shape
+                            margin=torch.tensor([margin], dtype=torch.get_default_dtype())  # Batch: (1,) shape
                         ))
                 
                 elif kind == 'TOP1_ROBUST':
                     # TOP1_ROBUST: top-1 classification
                     output_specs.append(OutputSpec(
                         kind=OutKind.TOP1_ROBUST,
-                        y_true=y_true
+                        y_true=torch.tensor([y_true], dtype=torch.int64)  # Batch: (1,) shape
                     ))
         
         logger.debug(f"Generated {len(output_specs)} output specs from {len(labels)} labels")

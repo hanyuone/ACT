@@ -463,11 +463,14 @@ def load_vnnlib_pair(
         raise RuntimeError(f"VNNLIB parsing failed: {e}")
     
     # Extract ground truth label from VNNLIB comment (if available)
-    ground_truth_label = extract_label_from_vnnlib(vnnlib_path)
-    if ground_truth_label is not None:
-        logger.info(f"  ✓ Ground truth label: {ground_truth_label}")
+    ground_truth_label_int = extract_label_from_vnnlib(vnnlib_path)
+    if ground_truth_label_int is not None:
+        logger.info(f"  ✓ Ground truth label: {ground_truth_label_int}")
+        ground_truth_label = torch.tensor([ground_truth_label_int], dtype=torch.int64)
+    else:
+        ground_truth_label = None
     
-    # Create LabeledInputTensor pairing input with label
+    # Create LabeledInputTensor pairing input with label (tensor)
     labeled_tensor = LabeledInputTensor(tensor=input_tensor, label=ground_truth_label)
     
     logger.info(f"Successfully loaded VNNLIB instance from '{category}'")

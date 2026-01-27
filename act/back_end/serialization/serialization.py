@@ -64,7 +64,11 @@ class TensorEncoder:
     
     @staticmethod
     def decode_tensor(tensor_dict: Dict[str, Any], target_device: Optional[str] = None) -> torch.Tensor:
-        """Convert JSON dictionary back to PyTorch tensor."""
+        """Convert JSON dictionary back to PyTorch tensor.
+        
+        Note: Always converts to device_manager's default dtype for runtime consistency.
+        This allows loading float64 JSON files in float32 runtime and vice versa.
+        """
         if not HAS_TORCH:
             raise ACTSerializationError("PyTorch not available for tensor decoding")
             
@@ -73,15 +77,11 @@ class TensorEncoder:
         buffer = io.BytesIO(base64.b64decode(encoded_data.encode('utf-8')))
         np_array = np.load(buffer)
         
-        # Create tensor with original properties
-        tensor = torch.from_numpy(np_array)
-        
-        # Apply dtype conversion if needed
-        if "dtype" in tensor_dict:
-            dtype_str = tensor_dict["dtype"]
-            if hasattr(torch, dtype_str.split('.')[-1]):
-                dtype = getattr(torch, dtype_str.split('.')[-1])
-                tensor = tensor.to(dtype)
+        # Create tensor and convert to runtime dtype
+        # IMPORTANT: We always use device_manager's dtype for consistency
+        from act.util.device_manager import get_default_dtype
+        target_dtype = get_default_dtype()
+        tensor = torch.from_numpy(np_array).to(dtype=target_dtype)
         
         # Move to device
         device = target_device or tensor_dict.get("device", "cpu")

@@ -28,9 +28,35 @@ class InputSpec:
     lb: Optional[torch.Tensor] = None
     ub: Optional[torch.Tensor] = None
     center: Optional[torch.Tensor] = None
-    eps: Optional[float] = None
+    eps: Optional[torch.Tensor] = None
     A: Optional[torch.Tensor] = None
     b: Optional[torch.Tensor] = None
+    
+    def __post_init__(self):
+        """Ensure all numeric fields are tensors for architecture."""
+        # Convert eps (scalar → 1-D tensor)
+        if self.eps is not None and not isinstance(self.eps, torch.Tensor):
+            self.eps = torch.tensor([float(self.eps)], dtype=torch.get_default_dtype())
+        
+        # Convert d (scalar → 1-D tensor)
+        if hasattr(self, 'd') and self.d is not None and not isinstance(self.d, torch.Tensor):
+            self.d = torch.tensor([float(self.d)], dtype=torch.get_default_dtype())
+        
+        # Convert lb, ub, center (list or scalar → tensor)
+        for field in ['lb', 'ub', 'center']:
+            val = getattr(self, field, None)
+            if val is not None and not isinstance(val, torch.Tensor):
+                if isinstance(val, (list, tuple)):
+                    setattr(self, field, torch.tensor(val, dtype=torch.get_default_dtype()))
+                else:
+                    setattr(self, field, torch.tensor([float(val)], dtype=torch.get_default_dtype()))
+        
+        # Convert A, b (list → tensor, keep None as is)
+        for field in ['A', 'b']:
+            val = getattr(self, field, None)
+            if val is not None and not isinstance(val, torch.Tensor):
+                if isinstance(val, (list, tuple)):
+                    setattr(self, field, torch.tensor(val, dtype=torch.get_default_dtype()))
 
 class OutKind:
     LINEAR_LE   = "LINEAR_LE"
@@ -42,9 +68,35 @@ class OutKind:
 class OutputSpec:
     kind: str
     c: Optional[torch.Tensor] = None
-    d: Optional[float] = None
-    y_true: Optional[int] = None
-    margin: float = 0.0
+    d: Optional[torch.Tensor] = None
+    y_true: Optional[torch.Tensor] = None
+    margin: Optional[torch.Tensor] = None
     lb: Optional[torch.Tensor] = None
     ub: Optional[torch.Tensor] = None
     meta: Dict[str, Any] = field(default_factory=dict)
+    
+    def __post_init__(self):
+        """Ensure all numeric fields are tensors for batch-native architecture."""
+        # Convert y_true (int/list → tensor)
+        if self.y_true is not None and not isinstance(self.y_true, torch.Tensor):
+            if isinstance(self.y_true, (list, tuple)):
+                self.y_true = torch.tensor(self.y_true, dtype=torch.int64)
+            else:
+                self.y_true = torch.tensor([int(self.y_true)], dtype=torch.int64)
+        
+        # Convert margin (scalar → 1-D tensor)
+        if self.margin is not None and not isinstance(self.margin, torch.Tensor):
+            self.margin = torch.tensor([float(self.margin)], dtype=torch.get_default_dtype())
+        
+        # Convert d (scalar → 1-D tensor)
+        if self.d is not None and not isinstance(self.d, torch.Tensor):
+            self.d = torch.tensor([float(self.d)], dtype=torch.get_default_dtype())
+        
+        # Convert c, lb, ub (list or scalar → tensor)
+        for field in ['c', 'lb', 'ub']:
+            val = getattr(self, field, None)
+            if val is not None and not isinstance(val, torch.Tensor):
+                if isinstance(val, (list, tuple)):
+                    setattr(self, field, torch.tensor(val, dtype=torch.get_default_dtype()))
+                else:
+                    setattr(self, field, torch.tensor([float(val)], dtype=torch.get_default_dtype()))

@@ -239,7 +239,9 @@ class PGDMutation(MutationStrategy):
                     f"Model output should have batch dimension, got shape {output.shape}. "
                     f"Ensure model outputs include batch dimension."
                 )
-                target = torch.full((output.shape[0],), label, dtype=torch.long, device=get_default_device())
+                # Extract scalar from label tensor (batch-native: label is now 1-D tensor)
+                label_scalar = int(label[0]) if isinstance(label, torch.Tensor) else int(label)
+                target = torch.full((output.shape[0],), label_scalar, dtype=torch.long, device=get_default_device())
                 loss = F.cross_entropy(output, target)
             else:
                 # If no label is provided, maximize output variance

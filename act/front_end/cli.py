@@ -540,7 +540,7 @@ Examples:
             from act.front_end.model_synthesis import model_synthesis
             from act.util.model_inference import model_inference
             
-            wrapped_models, input_data = model_synthesis(creator=creator_name)
+            wrapped_models = model_synthesis(creator=creator_name)
             print(f"\n✓ Successfully synthesized {len(wrapped_models)} models")
             
             # Automatically run inference after synthesis
@@ -548,7 +548,8 @@ Examples:
             print(f"MODEL INFERENCE - {creator_name.upper()}")
             print(f"{'='*100}\n")
             
-            successful_models = model_inference(wrapped_models, input_data)
+            # model_inference extracts input from InputLayer 
+            successful_models = model_inference(wrapped_models)
             print(f"\n✓ Successfully ran inference on {len(successful_models)}/{len(wrapped_models)} models")
             print(f"  Models are ready for verification")
         except Exception as e:
