@@ -7,67 +7,48 @@
 #===---------------------------------------------------------------------===#
 #
 # Purpose:
-#   PyTorch wrapper layers for spec-free verification. Provides nn.Module
-#   components that embed specifications directly into models, enabling
-#   constraint checking during inference and seamless ACT conversion.
+#   Batch-native PyTorch wrapper layers for spec-free verification.
+#   Embeds constraints directly into models, enabling efficient batched
+#   verification where N samples are checked in a single forward pass.
 #
 # Key Features:
-#   - Spec-free: Constraints embedded in model architecture, not external
-#   - PyTorch-native: Full nn.Module compatibility for training/inference
-#   - Bidirectional: Converts to/from ACT format via torch2act/act2torch
-#   - Automatic verification: Returns constraint satisfaction status
-#   - Rich metadata: Tracks input shapes, dtypes, devices for verification
+#   - Batch-native: Processes (N, ...) tensors, verifies N samples 
+#   - Spec-free: Constraints embedded in model, not external files
+#   - PyTorch-native: Full nn.Module compatibility
+#   - Automatic verification: Returns per-sample constraint satisfaction
 #
-# Core Wrapper Layers:
+# Core Layers:
 #
-#   InputLayer:
-#     Declares symbolic input with metadata (shape, dtype, device).
-#     No-op at inference, converted to INPUT layer in ACT.
+#   InputLayer(labeled_input, shape=(N, C, H, W), dtype=...)
+#     Declares batched input with metadata. No-op at inference.
 #
-#   InputSpecLayer:
-#     Input constraint checking (BOX, L_INF, LIN_POLY).
-#     Returns (x, satisfied, explanation) tuple during inference.
-#     Converted to INPUT_SPEC layer in ACT.
+#   InputSpecLayer(spec=InputSpec(lb=(N,...), ub=(N,...)))
+#     Checks N input constraints. Returns (x, satisfied(N,), explanation).
 #
-#   OutputSpecLayer:
-#     Output constraint checking (SAFETY, TOP1_ROBUST, MARGIN, etc.).
-#     Returns (x, satisfied, explanation) tuple during inference.
-#     Converted to ASSERT layer in ACT.
+#   OutputSpecLayer(spec=OutputSpec(y_true=(N,), margin=(N,)))
+#     Checks N output properties. Returns (y, satisfied(N,), explanation).
 #
-# Verification Workflow:
-#   1. Build model with wrapper layers:
-#      model = nn.Module(
-#          InputLayer(shape=(1, 28, 28)),
-#          InputSpecLayer(InputSpec(kind=InKind.L_INF, eps=0.03)),
-#          nn.Flatten(),
-#          nn.Linear(784, 128),
-#          nn.ReLU(),
-#          nn.Linear(128, 10),
-#          OutputSpecLayer(OutputSpec(kind=OutKind.TOP1_ROBUST, y_true=5))
-#      )
+# Batched Workflow:
+#   # 1. Build model with batched specs (N=3 samples)
+#   model = VerifiableModel(
+#       InputLayer(labeled_input, shape=(3, 1, 28, 28), dtype=torch.float32),
+#       InputSpecLayer(InputSpec(kind=InKind.BOX, lb=(3,1,28,28), ub=(3,1,28,28))),
+#       nn.Flatten(start_dim=1),
+#       nn.Linear(784, 10),
+#       OutputSpecLayer(OutputSpec(kind=OutKind.TOP1_ROBUST, y_true=[5,3,7]))
+#   )
 #
-#   2. Wrap with VerifiableModel (from act2torch.py):
-#      verifiable = VerifiableModel(*model)
+#   # 2. Run: 3 samples verified in one forward pass
+#   result = model(batch_input)  # batch_input: (3, 1, 28, 28)
+#   # Returns: {output: (3,10), input_satisfied: bool, output_satisfied: bool}
 #
-#   3. Run with automatic constraint checking:
-#      results = verifiable(input_tensor)
-#      # Returns: {'output', 'input_satisfied', 'output_satisfied', ...}
+#   # 3. Convert to ACT for formal verification
+#   from act.pipeline.torch2act import TorchToACT
+#   act_net = TorchToACT(model).run()
 #
-#   4. Convert to ACT for formal verification:
-#      from act.pipeline.torch2act import TorchToACT
-#      act_net = TorchToACT(verifiable).run()
-#
-# Specification Support:
-#   Input constraints (InKind):
-#     - BOX: Interval bounds [lb, ub]
-#     - L_INF: ε-ball around center
-#     - LIN_POLY: Linear polyhedron Ax ≤ b
-#
-#   Output constraints (OutKind):
-#     - SAFETY: Linear constraints cx ≤ d
-#     - TOP1_ROBUST: Classification robustness (true label stays top-1)
-#     - MARGIN: Classification margin > threshold
-#     - LOCAL_ROBUST: Local robustness verification
+# Supported Constraints:
+#   InKind: BOX, LINF_BALL, LIN_POLY
+#   OutKind: TOP1_ROBUST, MARGIN_ROBUST, LINEAR_LE, RANGE
 #
 #===---------------------------------------------------------------------===#
 
@@ -93,30 +74,27 @@ def prod(seq: Tuple[int, ...]) -> int:
 
 class VerifiableModel(nn.Sequential):
     """
-    Module wrapper that provides spec-free verification.
+    verification wrapper for PyTorch models.
     
-    Automatically collects constraint checking results from InputSpecLayer
-    and OutputSpecLayer, returning a dict with both model output and
-    constraint satisfaction status.
+    Processes batched tensors (N, ...) where N samples are verified independently
+    in a single forward pass. Collects constraint results from spec layers.
     
-    Strict Mode:
-        Controlled via VerifiableModel.set_strict_mode(True/False).
-        When enabled, raises ValueError on input/output constraint violations.
-        Default: False (graceful violation reporting).
+    Batched Architecture:
+        Input: (N, C, H, W) or (N, features)
+        → InputSpecLayer: checks each sample's input constraints
+        → Model layers: processes entire batch
+        → OutputSpecLayer: checks each sample's output properties
+        Output: Aggregated bool (all samples satisfied)
     
     Args:
-        *args: Layers to include in the sequential model
+        *args: Layers (InputLayer, InputSpecLayer, model, OutputSpecLayer)
     
     Returns:
-        Dict with keys:
-        - 'output': Model output tensor
-        - 'input_satisfied': True if input constraints satisfied
-        - 'input_explanation': Human-readable input constraint result
-        - 'output_satisfied': True if output constraints satisfied
-        - 'output_explanation': Human-readable output constraint result
-    
-    Raises:
-        ValueError: If strict mode enabled and input/output constraints are violated
+        Dict with:
+        - output: (N, ...) tensor
+        - input_satisfied: bool (all N samples satisfy input constraints)
+        - output_satisfied: bool (all N samples satisfy output properties)
+        - input_explanation/output_explanation: Human-readable results
     """
     
     # Class-level strict mode setting (shared across all instances)
@@ -169,6 +147,13 @@ class VerifiableModel(nn.Sequential):
                 # Regular layer, just pass through
                 x = result
         
+        # Convert tensor satisfied to bool for dict output (backward compatible)
+        # Spec layers now always return tensor, convert here
+        if isinstance(input_satisfied, torch.Tensor):
+            input_satisfied = bool(input_satisfied.all().item())
+        if isinstance(output_satisfied, torch.Tensor):
+            output_satisfied = bool(output_satisfied.all().item())
+        
         # Strict mode: raise on constraint violations
         if self._strict_mode:
             if not input_satisfied:
@@ -194,14 +179,21 @@ class VerifiableModel(nn.Sequential):
 
 class InputLayer(nn.Module):
     """
-    Declares the symbolic input block with rich metadata. No-op at inference.
+    Declares batched input with metadata. No-op during forward pass.
     
-    Stores complete labeled input sample (tensor + label) for self-contained models.
-    Supports comprehensive metadata tracking for verification including data type,
-    layout, dataset information.
+    Batch Format:
+        shape: (N, C, H, W) or (N, features) where N is batch size
+        Allocates N * per_sample_vars for ACT verification
+        Stores labeled_input: (tensor, label) with N samples
     
-    NOTE: dtype is REQUIRED for verification soundness (different dtypes have
-    different precision/range affecting bound propagation).
+    Args:
+        labeled_input: LabeledInputTensor with (N, ...) tensor and labels
+        shape: Input shape including batch dimension
+        dtype: REQUIRED - affects verification precision/range
+        dataset_name, layout, etc.: Optional metadata
+    
+    Forward:
+        x → x (pass-through, metadata only)
     """
     def __init__(
         self,
@@ -223,11 +215,13 @@ class InputLayer(nn.Module):
         channels: Optional[int] = None,
     ):
         super().__init__()
-        if shape[0] != 1:
-            raise ValueError(f"Verification wrapper assumes batch=1, got batch size {shape[0]}")
+        # Allow any batch size >= 1 for verification
+        if shape[0] < 1:
+            raise ValueError(f"Batch size must be >= 1, got {shape[0]}")
         
         # Core attributes (dtype now required)
         self.shape = tuple(shape)
+        self._batched = shape[0] > 1  # Track if batched for to_act_layers
         self.dtype = dtype  # REQUIRED
         self.desc = desc
         
@@ -250,27 +244,27 @@ class InputLayer(nn.Module):
         # Assumes device/dtype already initialized by caller (e.g., via initialize_device)
         self.register_buffer("_input_tensor", labeled_input.tensor)
         
-        # Store label: convert to tensor if needed
-        # Note: Labels use int64 regardless of float dtype initialization
-        label_value = labeled_input.label
-        if isinstance(label_value, int):
-            label_tensor = torch.tensor([label_value])
-        elif isinstance(label_value, (list, tuple)):
-            label_tensor = torch.tensor(label_value)
-        elif isinstance(label_value, torch.Tensor):
-            label_tensor = label_value.reshape(-1)
+        # Store label (tensor or None)
+        # Note: Labels use int64 dtype
+        if labeled_input.label is not None:
+            if not isinstance(labeled_input.label, torch.Tensor):
+                raise TypeError(
+                    f"labeled_input.label must be torch.Tensor or None, "
+                    f"got {type(labeled_input.label).__name__}"
+                )
+            self.register_buffer("_label_tensor", labeled_input.label.reshape(-1))
         else:
-            raise TypeError(f"Unsupported label type: {type(label_value)}")
-        self.register_buffer("_label_tensor", label_tensor)
+            # No label provided
+            self.register_buffer("_label_tensor", torch.tensor([], dtype=torch.int64))
         
         self._validate_schema()
     
     @property
     def labeled_input(self) -> "LabeledInputTensor":
-        """Get the complete labeled input (tensor + label pair)."""
+        """Get the complete labeled input (tensor + tensor label)."""
         from act.front_end.spec_creator_base import LabeledInputTensor
-        # Return original label format (int if single element, list otherwise)
-        label = self._label_tensor.item() if self._label_tensor.numel() == 1 else self._label_tensor.tolist()
+        # Return tensor label directly
+        label = self._label_tensor if self._label_tensor.numel() > 0 else None
         return LabeledInputTensor(tensor=self._input_tensor, label=label)
     
     @property
@@ -279,9 +273,9 @@ class InputLayer(nn.Module):
         return self._input_tensor
     
     @property
-    def label(self) -> Union[int, List[int]]:
-        """Get label (convenience accessor)."""
-        return self._label_tensor.item() if self._label_tensor.numel() == 1 else self._label_tensor.tolist()
+    def label(self) -> torch.Tensor:
+        """Get label tensor (always (N,) shape)."""
+        return self._label_tensor
 
     def _validate_schema(self):
         """Validate parameters against INPUT layer schema"""
@@ -337,8 +331,13 @@ class InputLayer(nn.Module):
                 raise ValueError(f"InputLayer has unknown meta: {key}")
 
     def to_act_layers(self, layer_id_start: int, in_vars: List[int]) -> Tuple[List, List[int]]:
-        """Convert to ACT Layer(s) and return (layers, out_vars)"""
-        N = prod(self.shape[1:])
+        """Convert to ACT Layer(s) and return (layers, out_vars)
+        
+        For batched inputs (shape[0] > 1), allocates batch_size * per_sample_vars.
+        """
+        batch_size = self.shape[0]
+        per_sample = prod(self.shape[1:])
+        N = batch_size * per_sample  # Total vars for all samples in batch
         out_vars = list(range(len(in_vars), len(in_vars) + N))
         
         # Collect params (optional: labeled_input for ACT serialization)
@@ -349,7 +348,8 @@ class InputLayer(nn.Module):
         # Collect meta (dtype is REQUIRED, always present)
         meta = {
             "shape": self.shape,
-            "dtype": str(self.dtype)  # REQUIRED
+            "dtype": str(self.dtype),  # REQUIRED
+            "batch_size": batch_size,  # Track batch size for batched verification
         }
         
         if self.desc != "input":
@@ -397,7 +397,7 @@ class InputLayer(nn.Module):
             "value_range": self.value_range,
             "scale_hint": self.scale_hint,
             "distribution": self.distribution,
-            "label": self.label,
+            "label": self.label.tolist(),  # Convert tensor to list for readability
             "sample_id": self.sample_id,
             "domain": self.domain,
             "channels": self.channels,
@@ -409,7 +409,9 @@ class InputLayer(nn.Module):
         meta_str = f"shape={self.shape}"
         if self.dataset_name:
             meta_str += f", dataset={self.dataset_name}"
-        meta_str += f", label={self.label}"
+        # Display label in readable format
+        label_display = self.label.tolist() if self.label.numel() > 1 else self.label.item()
+        meta_str += f", label={label_display}"
         if self.layout:
             meta_str += f", layout={self.layout}"
         return f"InputLayer({meta_str})"
@@ -420,19 +422,32 @@ class InputLayer(nn.Module):
 
 class InputSpecLayer(nn.Module):
     """
-    Wraps ACT's InputSpec AND is an nn.Module. Returns constraint checking tuple.
+    Batched input constraint checker (BOX, L∞, LIN_POLY).
+    
+    Batch Processing:
+        Input: x with shape (N, C, H, W)
+        Constraints: lb/ub/center with shape (N, C, H, W) - per-sample bounds
+        Checks: Each sample x[i] verified independently against its bounds
+        Output: (x, satisfied, explanation)
+            - satisfied: (N,) bool tensor, one per sample
+            - explanation: "✅ INPUT BOX: {n_ok}/{N} satisfied"
     
     Args:
-        spec: InputSpec object with constraint information
+        spec: InputSpec with batched constraint tensors
     
-    Returns:
-        Tuple of (tensor, satisfied, explanation) for use with VerifiableModel.
+    Forward:
+        x (N, ...) → (x, satisfied (N,), explanation str)
     """
     def __init__(self, spec: Optional[InputSpec] = None, **kwargs):
         super().__init__()
         self.spec = spec or InputSpec(**kwargs)
         self.kind = self.spec.kind
-        self.eps = float(self.spec.eps) if self.spec.eps is not None else None
+        
+        # Register eps as buffer for device mobility
+        if self.spec.eps is not None:
+            self.register_buffer("eps", self.spec.eps)
+        else:
+            self.eps = None
 
         # Register tensor fields as buffers so .to(device) works
         for name in ("lb", "ub", "center", "A", "b"):
@@ -486,74 +501,67 @@ class InputSpecLayer(nn.Module):
 
     def forward(self, x: torch.Tensor):
         """
-        Forward pass with constraint checking.
+        Forward pass with unified constraint checking for single or batched input.
         
         Returns:
             Tuple of (tensor, satisfied, explanation)
+            - For batch=1 andbatch>1: satisfied is (batch,) bool tensor
         """
-        # If no spec, pass through without checking
         if self.spec is None:
             return (x, True, "✅ INPUT: No constraints")
         
-        # Check constraints based on kind
+        batch_size = x.shape[0]
+        
         if self.kind == InKind.BOX:
-            # Box constraint: lb <= x <= ub
             if self.lb is None or self.ub is None:
                 return (x, True, "⚠️ INPUT BOX: Missing lb/ub")
             
-            # Reshape bounds to match input shape (handles flat -> image reshape)
-            lb = self.lb.reshape(x.shape)
-            ub = self.ub.reshape(x.shape)
+            lb, ub = self.lb, self.ub
+            # model_synthesis.py ensures lb.shape[0] == batch_size
+
+            lb_ok = (x >= lb).reshape(batch_size, -1).all(dim=1)  # (batch,)
+            ub_ok = (x <= ub).reshape(batch_size, -1).all(dim=1)  # (batch,)
+            satisfied = lb_ok & ub_ok  # (batch,) bool tensor
+            n_ok = satisfied.sum().item()
+            explanation = f"✅ INPUT BOX: {n_ok}/{batch_size} satisfied"
             
-            lb_satisfied = (x >= lb).all()
-            ub_satisfied = (x <= ub).all()
-            satisfied = bool(lb_satisfied and ub_satisfied)
-            
-            if satisfied:
-                margin_lb = (x - lb).min().item()
-                margin_ub = (ub - x).min().item()
-                margin = min(margin_lb, margin_ub)
-                explanation = f"✅ INPUT BOX: lb≤x≤ub (margin={margin:.4f})"
-            else:
-                lb_viol = (x < lb).sum().item()
-                ub_viol = (x > ub).sum().item()
-                explanation = f"❌ INPUT BOX: {lb_viol} lb violations, {ub_viol} ub violations"
-            
+            # Always return tensor (unified output format)
             return (x, satisfied, explanation)
         
         elif self.kind == InKind.LINF_BALL:
-            # L∞-ball constraint: ||x - center||∞ <= eps
             if self.center is None or self.eps is None:
                 return (x, True, "⚠️ INPUT L∞: Missing center/eps")
             
-            # Center has batch dimension matching x (both are (1, C, H, W))
-            linf_dist = (x - self.center).abs().max().item()
-            satisfied = linf_dist <= self.eps
+            center = self.center
             
-            if satisfied:
-                explanation = f"✅ INPUT L∞: ||x-c||∞={linf_dist:.4f}≤ε={self.eps:.4f}"
-            else:
-                explanation = f"❌ INPUT L∞: ||x-c||∞={linf_dist:.4f}>ε={self.eps:.4f}"
+            # Per-sample L∞ distance
+            linf = (x - center).abs().reshape(batch_size, -1).max(dim=1)[0]  # (batch,)
             
+            # Compare against eps threshold (tensor, supports batched comparison)
+            satisfied = linf <= self.eps
+            
+            n_ok = satisfied.sum().item()
+            explanation = f"✅ INPUT L∞: {n_ok}/{batch_size} satisfied"
+            
+            # Always return tensor (unified output format)
             return (x, satisfied, explanation)
         
         elif self.kind == InKind.LIN_POLY:
-            # Linear polytope: Ax <= b
             if self.A is None or self.b is None:
                 return (x, True, "⚠️ INPUT LIN_POLY: Missing A/b")
             
-            x_flat = x.reshape(-1)
-            residuals = self.A @ x_flat - self.b  # Should be <= 0
-            max_violation = residuals.max().item()
-            satisfied = max_violation <= 0
+            # LIN_POLY typically single sample; batched requires per-sample A,b
+            x_flat = x.reshape(batch_size, -1)  # (batch, n_vars)
+            # For now, apply same A,b to each sample
+            residuals = x_flat @ self.A.T - self.b  # (batch, n_constraints)
+            max_viol = residuals.max(dim=1)[0]  # (batch,)
+            satisfied = max_viol <= 0
             
-            if satisfied:
-                margin = -max_violation  # How much slack we have
-                explanation = f"✅ INPUT LIN_POLY: Ax≤b (margin={margin:.4f})"
-            else:
-                num_violations = (residuals > 0).sum().item()
-                explanation = f"❌ INPUT LIN_POLY: {num_violations} constraints violated (max={max_violation:.4f})"
+            # Unified explanation format (consistent across all batch sizes)
+            n_ok = satisfied.sum().item()
+            explanation = f"✅ INPUT LIN_POLY: {n_ok}/{batch_size} satisfied"
             
+            # Always return tensor (unified output format)
             return (x, satisfied, explanation)
         
         else:
@@ -562,22 +570,39 @@ class InputSpecLayer(nn.Module):
 
 class OutputSpecLayer(nn.Module):
     """
-    Wraps ACT's OutputSpec AND is an nn.Module. Returns constraint checking tuple.
+    Batched output property checker (TOP1_ROBUST, MARGIN_ROBUST, etc.).
+    
+    Batch Processing:
+        Input: y with shape (N, n_classes) or (N, features)
+        Properties: y_true (N,), margin (N,) - per-sample targets
+        Checks: Each sample y[i] verified independently against its property
+        Output: (y, satisfied, explanation)
+            - satisfied: (N,) bool tensor, one per sample
+            - explanation: "✅ OUTPUT TOP1: {n_ok}/{N} robust"
     
     Args:
-        spec: OutputSpec object with constraint information
+        spec: OutputSpec with batched property tensors
     
-    Returns:
-        Tuple of (tensor, satisfied, explanation) for use with VerifiableModel.
+    Forward:
+        y (N, ...) → (y, satisfied (N,), explanation str)
     """
     def __init__(self, spec: Optional[OutputSpec] = None, **kwargs):
         super().__init__()
         self.spec = spec or OutputSpec(**kwargs)
         self.kind = self.spec.kind
-        self.y_true = self.spec.y_true
-        self.margin = float(self.spec.margin)
-        self.d = None if self.spec.d is None else float(self.spec.d)
+        self.d = self.spec.d
         self.meta = dict(self.spec.meta)
+        
+        # register as buffer for device mobility
+        if self.spec.y_true is not None:
+            self.register_buffer("y_true", self.spec.y_true)
+        else:
+            self.y_true = None
+        
+        if self.spec.margin is not None:
+            self.register_buffer("margin", self.spec.margin)
+        else:
+            self.margin = None
 
         for name in ("c", "lb", "ub"):
             val = getattr(self.spec, name, None)
@@ -635,94 +660,90 @@ class OutputSpecLayer(nn.Module):
 
     def forward(self, y: torch.Tensor):
         """
-        Forward pass with constraint checking.
+        Forward pass with unified constraint checking for single or batched output.
         
         Returns:
             Tuple of (tensor, satisfied, explanation)
+            For batch=1 and batch>1: satisfied is (batch,) bool tensor
         """
-        # If no spec, pass through without checking
         if self.spec is None:
             return (y, True, "✅ OUTPUT: No constraints")
         
-        # Check constraints based on kind
+        batch_size = y.shape[0]
+        
         if self.kind == OutKind.TOP1_ROBUST:
-            # Top-1 robustness: y_true class has highest score
             if self.y_true is None:
                 return (y, True, "⚠️ OUTPUT TOP1: Missing y_true")
             
-            y_flat = y.reshape(-1)
-            pred_class = y_flat.argmax().item()
-            y_true_score = y_flat[self.y_true].item()
-            max_other_score = y_flat[[i for i in range(len(y_flat)) if i != self.y_true]].max().item()
-            margin = y_true_score - max_other_score
+            preds = y.argmax(dim=1)  # (batch,)
+            satisfied = preds == self.y_true  # (batch,) bool tensor
             
-            satisfied = pred_class == self.y_true
+            # Unified explanation format (consistent across all batch sizes)
+            n_ok = satisfied.sum().item()
+            explanation = f"✅ OUTPUT TOP1: {n_ok}/{batch_size} robust"
             
-            if satisfied:
-                explanation = f"✅ OUTPUT TOP1: Class {self.y_true} wins (margin={margin:.4f})"
-            else:
-                explanation = f"❌ OUTPUT TOP1: Class {pred_class} wins, expected {self.y_true} (margin={margin:.4f})"
-            
+            # Always return tensor (unified output format)
             return (y, satisfied, explanation)
         
         elif self.kind == OutKind.MARGIN_ROBUST:
-            # Margin robustness: y_true class score exceeds others by margin
-            if self.y_true is None or self.margin is None:
-                return (y, True, "⚠️ OUTPUT MARGIN: Missing y_true/margin")
+            if self.y_true is None:
+                return (y, True, "⚠️ OUTPUT MARGIN: Missing y_true")
             
-            y_flat = y.reshape(-1)
-            y_true_score = y_flat[self.y_true].item()
-            max_other_score = y_flat[[i for i in range(len(y_flat)) if i != self.y_true]].max().item()
-            actual_margin = y_true_score - max_other_score
+            # y is (batch, n_classes)
+            n_classes = y.shape[1]
+            true_scores = y[torch.arange(batch_size, device=y.device), self.y_true]  # (batch,)
             
-            satisfied = actual_margin >= self.margin
+            # Mask out true class to get max of others
+            mask = torch.ones_like(y, dtype=torch.bool)
+            mask[torch.arange(batch_size, device=y.device), self.y_true] = False
+            other_scores = y.masked_fill(~mask, float('-inf'))
+            max_other = other_scores.max(dim=1)[0]  # (batch,)
             
-            if satisfied:
-                explanation = f"✅ OUTPUT MARGIN: margin={actual_margin:.4f}≥{self.margin:.4f}"
-            else:
-                explanation = f"❌ OUTPUT MARGIN: margin={actual_margin:.4f}<{self.margin:.4f}"
+            actual_margin = true_scores - max_other  # (batch,)
+            margin_threshold = self.margin  # Always tensor now (even for n=1)
+            satisfied = actual_margin >= margin_threshold  # (batch,) bool
             
+            # Unified explanation format (consistent across all batch sizes)
+            n_ok = satisfied.sum().item()
+            explanation = f"✅ OUTPUT MARGIN: {n_ok}/{batch_size} satisfied"
+            
+            # Always return tensor (unified output format)
             return (y, satisfied, explanation)
         
         elif self.kind == OutKind.LINEAR_LE:
-            # Linear inequality: c^T y <= d
             if self.c is None or self.d is None:
                 return (y, True, "⚠️ OUTPUT LINEAR_LE: Missing c/d")
             
-            y_flat = y.reshape(-1)
-            # Ensure dtype consistency for dot product
-            c_typed = self.c.to(dtype=y_flat.dtype, device=y_flat.device)
-            lhs = (c_typed @ y_flat).item()
-            satisfied = lhs <= self.d
+            # Works for both single and batched (c applied to each sample)
+            y_2d = y.reshape(batch_size, -1)  # (batch, n_vars)
+            c_typed = self.c.to(dtype=y_2d.dtype, device=y_2d.device)
+            lhs = (y_2d @ c_typed)  # (batch,)
+            satisfied = lhs <= self.d  # (batch,) bool
             
-            if satisfied:
-                margin = self.d - lhs
-                explanation = f"✅ OUTPUT LINEAR_LE: c^T·y={lhs:.4f}≤d={self.d:.4f} (margin={margin:.4f})"
-            else:
-                violation = lhs - self.d
-                explanation = f"❌ OUTPUT LINEAR_LE: c^T·y={lhs:.4f}>d={self.d:.4f} (violation={violation:.4f})"
+            # Unified explanation format (consistent across all batch sizes)
+            n_ok = satisfied.sum().item()
+            explanation = f"✅ OUTPUT LINEAR_LE: {n_ok}/{batch_size} satisfied"
             
+            # Always return tensor (unified output format)
             return (y, satisfied, explanation)
         
         elif self.kind == OutKind.RANGE:
-            # Range constraint: lb <= y <= ub
             if self.lb is None or self.ub is None:
                 return (y, True, "⚠️ OUTPUT RANGE: Missing lb/ub")
             
-            lb_satisfied = (y >= self.lb).all()
-            ub_satisfied = (y <= self.ub).all()
-            satisfied = bool(lb_satisfied and ub_satisfied)
+            lb, ub = self.lb, self.ub
+            # ensures lb.shape[0] == batch_size
+            # No broadcast needed - shapes always match
             
-            if satisfied:
-                margin_lb = (y - self.lb).min().item()
-                margin_ub = (self.ub - y).min().item()
-                margin = min(margin_lb, margin_ub)
-                explanation = f"✅ OUTPUT RANGE: lb≤y≤ub (margin={margin:.4f})"
-            else:
-                lb_viol = (y < self.lb).sum().item()
-                ub_viol = (y > self.ub).sum().item()
-                explanation = f"❌ OUTPUT RANGE: {lb_viol} lb violations, {ub_viol} ub violations"
+            lb_ok = (y >= lb).reshape(batch_size, -1).all(dim=1)  # (batch,)
+            ub_ok = (y <= ub).reshape(batch_size, -1).all(dim=1)  # (batch,)
+            satisfied = lb_ok & ub_ok  # (batch,) bool
             
+            # Unified explanation format (consistent across all batch sizes)
+            n_ok = satisfied.sum().item()
+            explanation = f"✅ OUTPUT RANGE: {n_ok}/{batch_size} satisfied"
+            
+            # Always return tensor (unified output format)
             return (y, satisfied, explanation)
         
         else:

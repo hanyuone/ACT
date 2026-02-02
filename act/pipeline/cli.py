@@ -472,7 +472,7 @@ def cmd_fuzz(args):
     VerifiableModel.set_strict_mode(args.strict_mode)
     
     try:
-        wrapped_models, reports, input_data = synthesize_models_from_specs(spec_results)
+        wrapped_models = synthesize_models_from_specs(spec_results)
     except Exception as e:
         print(f"❌ Model synthesis failed: {e}")
         import traceback

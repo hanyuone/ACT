@@ -22,12 +22,12 @@ from typing import Dict, Any, Optional, List, Tuple, Union
 # ------------------- Model Inference Function --------------------------------
 # Helper function for single model inference
 # -----------------------------------------------------------------------------
-def infer_single_model(combo_id: str, model: nn.Module, input_tensor: torch.Tensor) -> Tuple[bool, Optional[torch.Tensor], Optional[str]]:
+def infer_single_model(combo_id: Union[str, Tuple], model: nn.Module, input_tensor: torch.Tensor) -> Tuple[bool, Optional[torch.Tensor], Optional[str]]:
     """
     Test a single wrapped model with input tensor.
     
     Args:
-        combo_id: Model identifier (e.g., "m:mnist_mlp_small|x:mnist")
+        combo_id: Model identifier (str or tuple of (dataset, model, in_kind, out_kind))
         model: Synthesized wrapped model to test (may return tensor or dict)
         input_tensor: Input tensor for model inference
         
@@ -50,12 +50,13 @@ def infer_single_model(combo_id: str, model: nn.Module, input_tensor: torch.Tens
 
 # Main model inference function
 # -----------------------------------------------------------------------------
-def model_inference(models: Dict[str, nn.Module]) -> Dict[str, nn.Module]:
+def model_inference(models: Dict[Union[str, Tuple], nn.Module]) -> Dict[Union[str, Tuple], nn.Module]:
     """
     Test all wrapped models with their stored inputs and provide execution statistics.
     
     Args:
         models: Dict[combo_id, nn.Module] - Synthesized wrapped models to test
+                combo_id can be str or tuple of (dataset, model, in_kind, out_kind)
         
     Returns:
         Dict[combo_id, nn.Module] - Successfully inferred models only
@@ -82,20 +83,38 @@ def model_inference(models: Dict[str, nn.Module]) -> Dict[str, nn.Module]:
             continue
         
         test_input = input_layer.input_tensor
-        test_label = input_layer.label  # Extract ground truth label
-        dataset = combo_id.split('|')[1].split(':')[1]  # Extract from x:dataset_name
-        model_name = combo_id.split('|')[0].split(':')[1]
+        test_label = input_layer.label
+        
+        # Move input to same device as model
+        model_device = next(model.parameters()).device
+        test_input = test_input.to(model_device)
+        
+        # Parse combo_id: handle tuple keys (dataset, model, in_kind, out_kind)
+        if isinstance(combo_id, tuple):
+            # New tuple format: (dataset, model, in_kind, out_kind)
+            dataset = combo_id[0] if len(combo_id) > 0 else 'unknown'
+            model_name = combo_id[1] if len(combo_id) > 1 else 'unknown'
+        elif '|' in combo_id:
+            # Old string format: m:model_name|x:dataset_name
+            dataset = combo_id.split('|')[1].split(':')[1]
+            model_name = combo_id.split('|')[0].split(':')[1]
+        else:
+            # String format: DATASET:MODEL:IN_KIND:OUT_KIND
+            parts = combo_id.split(':')
+            dataset = parts[0] if len(parts) > 0 else 'unknown'
+            model_name = parts[1] if len(parts) > 1 else 'unknown'
+        
         success, output, error_msg = infer_single_model(combo_id, model, test_input)
         
         if success:
-            # Validate prediction against ground truth label
-            pred_class = output.argmax().item() if output.dim() > 0 else output.item()
-            is_correct = (pred_class == test_label)
+            # Validate prediction against ground truth label tensor (N,), output is (N, num_classes)
+            pred_classes = output.argmax(dim=1)  # (N,)
+            is_correct = (pred_classes == test_label).all().item()
             
             success_count += 1
             if is_correct:
                 correct_predictions += 1
-            successful_models[combo_id] = model  # Store successful model
+            successful_models[combo_id] = model
         else:
             failure_count += 1
             # Track unique failure patterns

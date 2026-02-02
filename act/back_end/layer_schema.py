@@ -161,6 +161,7 @@ REGISTRY: Dict[str, Dict[str, List[str]]] = {
             "layout",           # Optional str: data format - "CHW" (channel-first), "HWC" (channel-last), "FLAT" (flattened)
             "dataset_name",     # Optional str: dataset identifier (e.g., "mnist", "cifar10", "custom_data")
             # Tier 2: Important metadata for verification context
+            "batch_size",       # Optional int: batch size for batched verification (extracted from shape[0])
             "num_classes",      # Optional int: number of output classes for classification tasks
             "value_range",      # Optional tuple: (min, max) actual value range in data (e.g., (0.0, 1.0) or (0.0, 255.0))
             "scale_hint",       # Optional str: scale description - "0-1", "0-255", "normalized", "unknown"

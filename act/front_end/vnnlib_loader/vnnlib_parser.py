@@ -159,7 +159,7 @@ def parse_vnnlib_to_specs(
         lb_tensor = torch.tensor(lb_values, dtype=get_default_dtype())
         ub_tensor = torch.tensor(ub_values, dtype=get_default_dtype())
         
-        # Extract input_shape and true_label from labeled_tensor if provided (safe parsing)
+        # Extract input_shape and true_label from labeled_tensor if provided
         input_shape = labeled_tensor.tensor.shape if labeled_tensor is not None else None
         true_label = labeled_tensor.label if labeled_tensor is not None else None
         
@@ -183,16 +183,17 @@ def parse_vnnlib_to_specs(
             output_spec = OutputSpec(
                 kind=OutKind.LINEAR_LE,
                 c=torch.tensor(c, dtype=get_default_dtype()),
-                d=float(d),
+                d=torch.tensor(float(d), dtype=get_default_dtype()),
                 meta={'all_constraints': output_constraints}
             )
         else:
-            # Fallback: If true_label is provided, promote to TOP1_ROBUST
+            # If true_label is provided, promote to TOP1_ROBUST
             # for classification robustness properties. Otherwise, use RANGE.
             if true_label is not None:
+                # true_label is already a tensor with correct device from labeled_tensor
                 output_spec = OutputSpec(
                     kind=OutKind.TOP1_ROBUST,
-                    y_true=int(true_label),
+                    y_true=true_label.clone() if isinstance(true_label, torch.Tensor) else torch.tensor([int(true_label)], dtype=torch.int64),
                     meta={'promoted_from': OutKind.RANGE}
                 )
             else:
