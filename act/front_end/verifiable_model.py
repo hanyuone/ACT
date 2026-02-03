@@ -461,39 +461,37 @@ class InputSpecLayer(nn.Module):
     def _validate_schema(self):
         """Validate parameters against INPUT_SPEC layer schema"""
         schema = REGISTRY[LayerKind.INPUT_SPEC.value]
-        params = {}
+        params = {"kind": self.kind}  # kind is now in params
         for name in ("lb", "ub", "center", "A", "b"):
             val = getattr(self, name, None)
             if val is not None:
                 params[name] = val
-        meta = {"kind": self.kind}
         if self.eps is not None:
-            meta["eps"] = self.eps
+            params["eps"] = self.eps
         
         # Check schema compliance
-        for key in schema["meta_required"]:
-            if key not in meta:
-                raise ValueError(f"InputSpecLayer missing required meta: {key}")
-        for key in meta:
-            if key not in schema["meta_required"] + schema["meta_optional"]:
-                raise ValueError(f"InputSpecLayer has unknown meta: {key}")
+        for key in schema["params_required"]:
+            if key not in params:
+                raise ValueError(f"InputSpecLayer missing required param: {key}")
+        for key in params:
+            if key not in schema["params_required"] + schema["params_optional"]:
+                raise ValueError(f"InputSpecLayer has unknown param: {key}")
 
     def to_act_layers(self, layer_id_start: int, in_vars: List[int]) -> Tuple[List, List[int]]:
         """Convert to ACT Layer(s) - INPUT_SPEC doesn't create new vars"""
-        params = {}
+        params = {"kind": self.kind}  # kind is now in params
         for name in ("lb", "ub", "center", "A", "b"):
             val = getattr(self, name, None)
             if val is not None:
                 params[name] = val
-        meta = {"kind": self.kind}
         if self.eps is not None:
-            meta["eps"] = self.eps
+            params["eps"] = self.eps
         
         layer = create_layer(
             id=layer_id_start,
             kind=LayerKind.INPUT_SPEC.value,
             params=params,
-            meta=meta,
+            meta={},  
             in_vars=in_vars,
             out_vars=in_vars  # INPUT_SPEC doesn't change variables
         )

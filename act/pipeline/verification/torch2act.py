@@ -445,11 +445,7 @@ class _LayerGraphBuilder:
         layer_id = self._add_layer(
             LayerKind.FLATTEN.value, {},
             {"input_shape": self.shape, "output_shape": output_shape,
-             "start_dim": start_dim, "end_dim": end_dim,
-             # Torch restoration metadata
-             "torch_module": "torch.nn.Flatten",
-             "torch_args": [],
-             "torch_kwargs": {"start_dim": start_dim, "end_dim": end_dim}},
+             "start_dim": start_dim, "end_dim": end_dim},
             self.prev_out, out_vars
         )
         self.prev_out = out_vars
@@ -472,16 +468,14 @@ class _LayerGraphBuilder:
         b = mod.bias.detach() if has_bias else torch.zeros(out_features, dtype=W.dtype, device=W.device)
         
         out_vars = self._alloc_ids(out_features)
+        params = {"weight": W}
+        if b is not None:
+            params["bias"] = b
         self._add_layer(
             LayerKind.DENSE.value,
-            {"W": W, "b": b},
+            params,
             {"input_shape": self.shape, "output_shape": (1, out_features),
-             "in_features": in_features, "out_features": out_features,
-             "bias_enabled": has_bias,
-             # Torch restoration metadata
-             "torch_module": "torch.nn.Linear",
-             "torch_args": [in_features, out_features],
-             "torch_kwargs": {"bias": has_bias}},
+             "in_features": in_features, "out_features": out_features},
             self.prev_out, out_vars
         )
         self.shape = (1, out_features)
@@ -518,13 +512,7 @@ class _LayerGraphBuilder:
             {"input_shape": input_shape, "output_shape": output_shape,
              "kernel_size": mod.kernel_size, "stride": mod.stride,
              "padding": mod.padding, "dilation": mod.dilation,
-             "groups": mod.groups, "in_channels": in_c, "out_channels": out_c,
-             # Torch restoration metadata
-             "torch_module": "torch.nn.Conv2d",
-             "torch_args": [in_c, out_c, mod.kernel_size],
-             "torch_kwargs": {"stride": mod.stride, "padding": mod.padding,
-                              "dilation": mod.dilation, "groups": mod.groups,
-                              "bias": has_bias}},
+             "groups": mod.groups, "in_channels": in_c, "out_channels": out_c},
             self.prev_out, out_vars
         )
         self.shape = output_shape
@@ -547,28 +535,11 @@ class _LayerGraphBuilder:
         out_w = (in_w + 2 * pad[1] - ks[1]) // st[1] + 1
         output_shape = (1, in_c, out_h, out_w)
         
-        # Torch restoration metadata
-        torch_module = "torch.nn.MaxPool2d" if is_max else "torch.nn.AvgPool2d"
-        torch_kwargs: Dict[str, Any] = {
-            "stride": mod.stride or mod.kernel_size,
-            "padding": mod.padding
-        }
-        if is_max:
-            torch_kwargs["dilation"] = mod.dilation
-            torch_kwargs["ceil_mode"] = mod.ceil_mode
-        else:
-            torch_kwargs["ceil_mode"] = mod.ceil_mode
-            torch_kwargs["count_include_pad"] = mod.count_include_pad
-        
         out_vars = self._alloc_ids(in_c * out_h * out_w)
         self._add_layer(
             kind.value, {},
             {"kernel_size": mod.kernel_size, "stride": mod.stride or mod.kernel_size,
-             "padding": mod.padding, "input_shape": self.shape, "output_shape": output_shape,
-             # Torch restoration metadata
-             "torch_module": torch_module,
-             "torch_args": [mod.kernel_size],
-             "torch_kwargs": torch_kwargs},
+             "padding": mod.padding, "input_shape": self.shape, "output_shape": output_shape},
             self.prev_out, out_vars
         )
         self.shape = output_shape
@@ -586,11 +557,7 @@ class _LayerGraphBuilder:
         
         out_vars = self._alloc_ids(in_c * out_h * out_w)
         self._add_layer(LayerKind.ADAPTIVEAVGPOOL2D.value, {},
-                       {"output_size": (out_h, out_w),
-                        # Torch restoration metadata
-                        "torch_module": "torch.nn.AdaptiveAvgPool2d",
-                        "torch_args": [(out_h, out_w)],
-                        "torch_kwargs": {}},
+                       {"output_size": (out_h, out_w)},
                        self.prev_out, out_vars)
         self.shape = output_shape
         self.prev_out = out_vars
@@ -661,30 +628,14 @@ class _LayerGraphBuilder:
         """Convert activation function."""
         out_vars = self._same_size_forward()
 
-        # Map LayerKind to torch module info
-        activation_torch_info: Dict[LayerKind, Tuple[str, List, Dict]] = {
-            LayerKind.RELU: ("torch.nn.ReLU", [], {}),
-            LayerKind.SILU: ("torch.nn.SiLU", [], {}),
-            LayerKind.SIGMOID: ("torch.nn.Sigmoid", [], {}),
-            LayerKind.TANH: ("torch.nn.Tanh", [], {}),
-            LayerKind.LRELU: ("torch.nn.LeakyReLU", [], {"negative_slope": getattr(mod, 'negative_slope', 0.01)}),
-        }
-
         # Only include input_shape/output_shape for layers that support them
         # LRELU only accepts negative_slope, not shape metadata
         if kind == LayerKind.LRELU:
-            meta = {}
+            meta = {"negative_slope": getattr(mod, 'negative_slope', 0.01)}
         else:
             meta = {"input_shape": self.shape, "output_shape": self.shape}
         if extra_meta:
             meta.update(extra_meta)
-        
-        # Add torch restoration metadata
-        if kind in activation_torch_info:
-            torch_module, torch_args, torch_kwargs = activation_torch_info[kind]
-            meta["torch_module"] = torch_module
-            meta["torch_args"] = torch_args
-            meta["torch_kwargs"] = torch_kwargs
 
         self._add_layer(kind.value, {}, meta, self.prev_out, out_vars)
         self.prev_out = out_vars

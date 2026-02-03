@@ -137,7 +137,6 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
 from act.back_end.core import Layer, Net
-from act.back_end.layer_util import KIND_TO_TORCH_MODULE
 from act.back_end.serialization.serialization import NetSerializer
 from act.front_end.specs import InKind, OutKind
 from act.util.device_manager import get_default_dtype
@@ -181,28 +180,31 @@ class NetFactory:
             return torch.randn(*weight_shape) * 0.1
         return None
     
-    def _generate_input_spec_params(self, params: Dict[str, Any], meta: Dict[str, Any], input_shape: Optional[List[int]]) -> None:
-        """Generate INPUT_SPEC params based on kind and meta values."""
+    def _generate_input_spec_params(self, params: Dict[str, Any], input_shape: Optional[List[int]]) -> None:
+        """Generate INPUT_SPEC params based on kind and param values.
+        
+        Note: All INPUT_SPEC config (kind, eps, lb_val, etc.) is now in params.
+        """
         if not input_shape:
             raise ValueError("Cannot generate INPUT_SPEC params: input shape is required but not provided")
         
-        spec_kind = meta.get("kind")
+        spec_kind = params.get("kind")
         
         # Compare with enum class variables (these are strings, not Enum objects)
         if spec_kind == InKind.BOX:
-            # Generate lb/ub from meta values
-            lb_val = meta.get("lb_val", 0.0)
-            ub_val = meta.get("ub_val", 1.0)
+            # Generate lb/ub from param values
+            lb_val = params.get("lb_val", 0.0)
+            ub_val = params.get("ub_val", 1.0)
             params["lb"] = torch.full(input_shape, lb_val)
             params["ub"] = torch.full(input_shape, ub_val)
         
         elif spec_kind == InKind.LINF_BALL:
             # Generate center + lb/ub from center_val and eps
-            eps = meta.get("eps")
+            eps = params.get("eps")
             if eps is None:
-                raise ValueError("LINF_BALL requires 'eps' in meta")
+                raise ValueError("LINF_BALL requires 'eps' in params")
             
-            center_val = meta.get("center_val", 0.5)  # Default to 0.5 for normalized inputs
+            center_val = params.get("center_val", 0.5)  # Default to 0.5 for normalized inputs
             params["center"] = torch.full(input_shape, center_val)
             params["lb"] = params["center"] - eps
             params["ub"] = params["center"] + eps
@@ -383,17 +385,20 @@ class NetFactory:
             
             # === AUTO-GENERATION DISPATCH ===
             if kind == "INPUT_SPEC":
-                self._generate_input_spec_params(params, meta, input_shape)
+                # Merge meta into params for INPUT_SPEC (all config now in params)
+                for key in ["kind", "eps", "lb_val", "ub_val", "center_val"]:
+                    if key in meta and key not in params:
+                        params[key] = meta.pop(key)
+                self._generate_input_spec_params(params, input_shape)
             elif kind == "ASSERT":
                 self._generate_assert_params(params, meta, output_shape)
-            elif kind == "DENSE" and "W" not in params:
+            elif kind == "DENSE" and "weight" not in params:
                 weight = self.generate_weight_tensor(kind, meta)
                 if weight is not None:
-                    params["W"] = weight
-                # Generate bias if enabled
-                if meta.get("bias_enabled", False):
-                    out_features = meta.get("out_features", 10)
-                    params["b"] = torch.zeros(out_features)
+                    params["weight"] = weight
+                # Generate bias (check if "bias" should be included)
+                out_features = meta.get("out_features", 10)
+                params["bias"] = torch.zeros(out_features)
             elif kind.startswith("CONV") and "weight" not in params:
                 weight = self.generate_weight_tensor(kind, meta)
                 if weight is not None:
@@ -401,13 +406,6 @@ class NetFactory:
                 # Generate bias if needed (CONV layers typically have bias by default)
                 # For now, we don't add bias to CONV layers unless specified
             
-            # Inject torch_module metadata for act2torch dynamic restoration
-            if kind in KIND_TO_TORCH_MODULE:
-                module_path, args_fn, kwargs_fn = KIND_TO_TORCH_MODULE[kind]
-                meta['torch_module'] = module_path
-                meta['torch_args'] = args_fn(meta)
-                meta['torch_kwargs'] = kwargs_fn(meta)
-
             # Create layer (validation happens automatically in __post_init__)
             layer = Layer(
                 id=i,

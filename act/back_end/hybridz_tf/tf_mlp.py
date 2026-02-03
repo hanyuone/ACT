@@ -21,9 +21,9 @@ from act.back_end.core import Bounds, Fact, Layer, ConSet
 @torch.no_grad()
 def hybridz_tf_dense(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for dense/linear layers with zonotope precision."""
-    # Extract parameters
-    W = L.params["W"]  # (out_features, in_features)
-    b = L.params.get("b", None)
+    # Extract parameters (names aligned with PyTorch)
+    W = L.params["weight"]  # (out_features, in_features)
+    b = L.params.get("bias", None)
     
     # Apply linear transformation with HybridZ operations
     # For now, use interval arithmetic as base implementation

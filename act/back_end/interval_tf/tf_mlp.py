@@ -20,11 +20,11 @@ from act.back_end.utils import affine_bounds, pwl_meta
 
 # -------- MLP Basics --------
 def tf_dense(L: Layer, Bin: Bounds) -> Fact:
-    # Handle parameter compatibility: schema defines W, but optimization uses W_pos/W_neg
-    W = L.params["W"]
-    W_pos = L.params.get("W_pos", torch.clamp(W, min=0))
-    W_neg = L.params.get("W_neg", torch.clamp(W, max=0))
-    b = L.params.get("b", torch.zeros(W.shape[0], device=W.device, dtype=W.dtype))
+    # Parameter names aligned with PyTorch: weight, bias, weight_pos, weight_neg
+    W = L.params["weight"]
+    W_pos = L.params.get("weight_pos", torch.clamp(W, min=0))
+    W_neg = L.params.get("weight_neg", torch.clamp(W, max=0))
+    b = L.params.get("bias", torch.zeros(W.shape[0], device=W.device, dtype=W.dtype))
     
     B = affine_bounds(W_pos, W_neg, b, Bin)
     C = ConSet(); C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"dense:{L.id}", "W": W, "b": b}))

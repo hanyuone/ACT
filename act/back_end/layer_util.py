@@ -48,52 +48,6 @@ except Exception:  # typing only
     Tensor = "torch.Tensor"  # type: ignore
 
 # ------------------------------
-# Torch Restoration Meta Keys
-# ------------------------------
-# These meta keys are globally allowed for all layer types to support
-# dynamic PyTorch module restoration in act2torch.py
-TORCH_RESTORATION_META = frozenset([
-    # Core restoration metadata
-    "torch_module",      # Full module path, e.g. "torch.nn.Linear"
-    "torch_args",        # Positional args for module constructor
-    "torch_kwargs",      # Keyword args for module constructor
-    # BatchNorm decomposition restoration
-    "is_batchnorm_decomposition",  # True if this layer is part of BatchNorm decomposition
-    "batchnorm_module",            # Original BatchNorm module path
-    "batchnorm_args",              # BatchNorm constructor args
-    "batchnorm_kwargs",            # BatchNorm constructor kwargs
-    "batchnorm_state",             # BatchNorm state_dict for restoration
-    "paired_with_scale",           # True for BIAS layer paired with SCALE
-    # Graph structure metadata (for non-Sequential models)
-    "requires_graph_restoration",  # True if layer needs DAG structure
-    "input_node_ids",              # Input layer IDs for multi-input ops
-])
-
-# ------------------------------
-# KIND → PyTorch Module Mapping
-# ------------------------------
-# Maps ACT layer kinds to PyTorch module info for dynamic restoration.
-# Format: KIND → (module_path, args_builder, kwargs_builder)
-KIND_TO_TORCH_MODULE = {
-    'DENSE': ('torch.nn.Linear',
-              lambda m: [m.get('in_features', 1), m.get('out_features', 1)],
-              lambda m: {'bias': m.get('bias_enabled', True)}),
-    'CONV1D': ('torch.nn.Conv1d',
-               lambda m: [m.get('in_channels', 1), m.get('out_channels', 1), m.get('kernel_size', 3)],
-               lambda m: {'stride': m.get('stride', 1), 'padding': m.get('padding', 0), 'bias': m.get('bias_enabled', False)}),
-    'CONV2D': ('torch.nn.Conv2d',
-               lambda m: [m.get('in_channels', 1), m.get('out_channels', 1), m.get('kernel_size', 3)],
-               lambda m: {'stride': m.get('stride', 1), 'padding': m.get('padding', 0), 'bias': m.get('bias_enabled', False)}),
-    'CONV3D': ('torch.nn.Conv3d',
-               lambda m: [m.get('in_channels', 1), m.get('out_channels', 1), m.get('kernel_size', 3)],
-               lambda m: {'stride': m.get('stride', 1), 'padding': m.get('padding', 0), 'bias': m.get('bias_enabled', False)}),
-    'RELU': ('torch.nn.ReLU', lambda m: [], lambda m: {}),
-    'SIGMOID': ('torch.nn.Sigmoid', lambda m: [], lambda m: {}),
-    'TANH': ('torch.nn.Tanh', lambda m: [], lambda m: {}),
-    'FLATTEN': ('torch.nn.Flatten', lambda m: [], lambda m: {'start_dim': m.get('start_dim', 1)}),
-}
-
-# ------------------------------
 # Strict validation & helpers
 # ------------------------------
 def _missing(required: List[str], got: Dict[str, Any]) -> List[str]:
@@ -164,6 +118,11 @@ def validate_layer(layer: "Layer") -> None:
                         f"{kind}.params['labeled_input'].label list contains non-int elements."
                     )
             continue
+        # Allow scalar params for certain fields (e.g., INPUT_SPEC's kind, eps, etc.)
+        # These are JSON-serializable scalars 
+        SCALAR_PARAM_NAMES = {'kind', 'eps', 'lb_val', 'ub_val', 'center_val'}
+        if name in SCALAR_PARAM_NAMES:
+            continue
         # If torch isn't available, skip the runtime type check.
         try:
             import torch  # noqa
@@ -176,8 +135,7 @@ def validate_layer(layer: "Layer") -> None:
     miss_m = _missing(spec['meta_required'], layer.meta)
     
     allowed_p = spec['params_required'] + spec['params_optional']
-    # Include globally allowed torch restoration meta for all layers
-    allowed_m = spec['meta_required'] + spec['meta_optional'] + list(TORCH_RESTORATION_META)
+    allowed_m = spec['meta_required'] + spec['meta_optional']
 
     unk_p = _unknown(allowed_p, layer.params)
     unk_m = _unknown(allowed_m, layer.meta)
@@ -321,7 +279,7 @@ if __name__ == "__main__":
         ub_tensor = torch.full((1,3,32,32), 1.0)
         layers.append(create_layer(
             id=1, kind=LayerKind.INPUT_SPEC.value,
-            params={"lb": lb_tensor, "ub": ub_tensor}, meta={"kind": InKind.BOX},
+            params={"kind": InKind.BOX, "lb": lb_tensor, "ub": ub_tensor}, meta={},
             in_vars=[0], out_vars=[0],
         ))
         # Model toy

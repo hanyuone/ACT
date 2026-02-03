@@ -153,7 +153,7 @@ class DualTF(TransferFunction):
     
     # -------- Backward Handlers --------
     def _backward_dense(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return dual_dense_backward(nu, L.params["W"], L.params.get("b"))
+        return dual_dense_backward(nu, L.params["weight"], L.params.get("bias"))
     
     def _backward_relu(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         bounds = self._bounds_dict.get(L.id)

@@ -175,8 +175,8 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
 def _fwd_dense(layer: Layer, A: torch.Tensor, bias: torch.Tensor, 
                x0: torch.Tensor, eps: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dense: new = W @ (A @ x + bias) + b = (W @ A) @ x + (W @ bias + b)"""
-    W = layer.params["W"]
-    b = layer.params.get("b")
+    W = layer.params["weight"]
+    b = layer.params.get("bias")
     
     n_in = W.shape[1]
     if A.shape[0] != n_in:

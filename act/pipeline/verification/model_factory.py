@@ -226,12 +226,12 @@ class ModelFactory:
         
         # Get INPUT_SPEC constraints if present
         if input_spec_layer is not None:
-            spec_meta = input_spec_layer.get('meta', {})
-            spec_kind = spec_meta.get('kind')
+            spec_params = input_spec_layer.get('params', {})
+            spec_kind = spec_params.get('kind')
             
             if spec_kind == 'BOX':
-                lb_val = spec_meta.get('lb_val', 0.0)
-                ub_val = spec_meta.get('ub_val', 1.0)
+                lb_val = spec_params.get('lb_val', 0.0)
+                ub_val = spec_params.get('ub_val', 1.0)
                 
                 if test_case == 'center':
                     # Center of box: (lb + ub) / 2
@@ -248,8 +248,8 @@ class ModelFactory:
                     raise ValueError(f"Unknown test_case '{test_case}'")
             
             elif spec_kind == 'LINF_BALL':
-                center_val = spec_meta.get('center_val', 0.5)
-                eps = spec_meta.get('eps', 0.1)
+                center_val = spec_params.get('center_val', 0.5)
+                eps = spec_params.get('eps', 0.1)
                 
                 if test_case == 'center':
                     # At center of L∞ ball

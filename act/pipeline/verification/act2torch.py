@@ -7,33 +7,30 @@
 # Distributed without any warranty; see <http://www.gnu.org/licenses/>.
 #===---------------------------------------------------------------------===#
 #
-# Purpose:
-#   ACT → PyTorch converter using dynamic module restoration.
-#   Converts ACT Net graphs into executable PyTorch models by reconstructing
-#   modules from stored metadata (torch_module, torch_args, torch_kwargs).
+# ACT → PyTorch Converter (Schema-Driven)
+# =======================================
+# Single source of truth: layer_schema.py REGISTRY
 #
-# Key Features:
-#   - Dynamic restoration: No manual if-elif mapping for layer types
-#   - Weight preservation: Loads state_dict from ACT params
-#   - VerifiableModel: Returns wrapped model with constraint checking
-#   - BatchNorm restoration: Reconstructs BatchNorm from SCALE+BIAS decomposition
+# Design:
+#   - Zero mapping tables: torch_module, params, meta all from REGISTRY
+#   - Param names match PyTorch: weight, bias, stride, padding, etc.
 #
-# Architecture:
+# Layer Routing:
 #   INPUT      → (skipped)
 #   INPUT_SPEC → InputSpecLayer
+#   <MODEL>    → REGISTRY[kind]['torch_module'] (if defined)
 #   ASSERT     → OutputSpecLayer
-#   SCALE+BIAS → BatchNorm (if is_batchnorm_decomposition)
-#   Others     → Dynamic restoration via torch_module metadata
 #
 #===---------------------------------------------------------------------===#
 
-from typing import Optional
+from typing import Optional, Dict, Any, Tuple
 import importlib
 import torch
 import torch.nn as nn
 import logging
 
 from act.back_end.core import Net, Layer
+from act.back_end.layer_schema import REGISTRY
 from act.util.device_manager import get_default_dtype, get_default_device
 
 logger = logging.getLogger(__name__)
@@ -103,17 +100,18 @@ class ACTToTorch:
                 from act.front_end.verifiable_model import InputSpecLayer
                 from act.front_end.specs import InputSpec, InKind
                 
-                # Build InputSpec from ACT layer
-                kind_str = meta['kind']
+                # Build InputSpec from ACT layer (kind/eps in params)
+                params = act_layer.params
+                kind_str = params['kind']
                 spec_kind = getattr(InKind, kind_str)  # Convert string to enum
                 spec_dict = {'kind': spec_kind}
-                if 'eps' in meta:
-                    spec_dict['eps'] = meta['eps']
+                if 'eps' in params:
+                    spec_dict['eps'] = params['eps']
                 
                 # Convert parameter tensors to device_manager dtype for consistency
                 for param_key in ['lb', 'ub', 'center', 'A', 'b']:
-                    if param_key in act_layer.params:
-                        tensor = act_layer.params[param_key]
+                    if param_key in params:
+                        tensor = params[param_key]
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
                 
                 spec = InputSpec(**spec_dict)
@@ -166,17 +164,11 @@ class ACTToTorch:
             if kind == 'BIAS' and meta.get('paired_with_scale'):
                 continue
             
-            # Skip non-Sequential layers (ADD, CONCAT, MUL) with warning
-            if kind in ('ADD', 'CONCAT', 'MUL') or meta.get('requires_graph_restoration'):
-                logger.warning(f"Skipping {kind} layer (id={act_layer.id}): "
-                              f"requires DAG structure, not supported in Sequential model")
-                continue
-            
-            # Dynamic restoration for all other layers
-            torch_layer = self._build_from_meta(act_layer)
+            # Schema-driven restoration for all other layers
+            torch_layer = self._build_from_schema(act_layer)
             if torch_layer is None:
-                raise ValueError(f"Layer '{kind}' (id={act_layer.id}) missing torch_module metadata. "
-                               f"Ensure torch2act stores dynamic restoration info.")
+                # Skip if restore kind is 'skip' or 'graph'
+                continue
             
             torch_layers.append(torch_layer)
         
@@ -234,40 +226,69 @@ class ACTToTorch:
 
         return bn
 
-    # ACT param names → PyTorch state_dict key mapping
-    ACT_TO_TORCH_PARAM_MAP = {
-        'W': 'weight',
-        'b': 'bias',
-    }
-
-    def _build_from_meta(self, act_layer: Layer) -> Optional[nn.Module]:
+    def _build_from_schema(self, act_layer: Layer) -> Optional[nn.Module]:
         """
-        Dynamically build PyTorch module from ACT layer metadata.
+        Build PyTorch module from layer_schema.py REGISTRY (single source of truth).
 
-        Uses stored torch_module, torch_args, torch_kwargs to reconstruct
-        the original PyTorch module without manual if-elif mapping.
+        Schema provides everything needed:
+          - torch_module: PyTorch module path (e.g., "torch.nn.Linear")
+          - meta_required: Constructor positional args
+          - meta_optional: Constructor kwargs (names match PyTorch)
+          - params: State dict keys (names match PyTorch: "weight", "bias")
+        
+        Layers without torch_module are skipped (INPUT, ASSERT, graph ops, etc.)
         """
+        kind = act_layer.kind
         meta = act_layer.meta
-        module_path = meta.get("torch_module")
-        if not module_path:
+        
+        # Get schema spec - single source of truth
+        if kind not in REGISTRY:
+            raise ValueError(f"Layer kind '{kind}' not found in REGISTRY")
+        spec = REGISTRY[kind]
+
+        # Check for torch_module in schema - layers without it are skipped
+        torch_module = spec.get('torch_module')
+        if not torch_module:
+            # Graph layers (ADD, MUL, CONCAT) require DAG structure - warn user
+            if 'requires_graph_restoration' in spec.get('meta_optional', []):
+                logger.warning(f"Skipping {kind} layer (id={act_layer.id}): "
+                              f"requires DAG structure, not supported in Sequential model")
             return None
 
         # Parse module path: "torch.nn.Linear" -> ("torch.nn", "Linear")
-        mod_name, cls_name = module_path.rsplit(".", 1)
+        mod_name, cls_name = torch_module.rsplit(".", 1)
         cls = getattr(importlib.import_module(mod_name), cls_name)
 
+        # Build positional args from meta_required
+        args = []
+        for key in spec.get('meta_required', []):
+            if key not in meta:
+                raise ValueError(f"Layer '{kind}' (id={act_layer.id}) missing required meta '{key}'")
+            args.append(meta[key])
+
+        # Build kwargs from meta_optional (names match PyTorch directly)
+        # Only include kwargs that PyTorch module accepts
+        kwargs = {}
+        # Check if bias exists in params to set bias kwarg for Linear/Conv
+        if "bias" in act_layer.params:
+            kwargs["bias"] = True
+        elif kind in ("DENSE", "CONV1D", "CONV2D", "CONV3D"):
+            kwargs["bias"] = False
+        # Pass through common kwargs from meta
+        for key in ("stride", "padding", "dilation", "groups", "start_dim"):
+            if key in meta:
+                kwargs[key] = meta[key]
+
         # Create module instance
-        args = meta.get("torch_args", [])
-        kwargs = meta.get("torch_kwargs", {})
         m = cls(*args, **kwargs)
 
-        # Load state_dict if params exist
+        # Load state_dict directly (param names already match PyTorch)
         if act_layer.params:
             state_dict = {}
             for key, value in act_layer.params.items():
-                # Map ACT param names to PyTorch state_dict keys
-                torch_key = self.ACT_TO_TORCH_PARAM_MAP.get(key, key)
-                state_dict[torch_key] = value
+                if not isinstance(value, torch.Tensor):
+                    continue
+                state_dict[key] = value
 
             if state_dict:
                 m.load_state_dict(state_dict, strict=False)

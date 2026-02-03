@@ -610,9 +610,9 @@ class VerificationValidator:
                     )
 
                 # 2) LINF_BALL: center + eps
-                if "center" in params and "eps" in meta:
+                if "center" in params and "eps" in params:
                     center = params["center"].flatten().to(device=self.device, dtype=self.dtype)
-                    eps = meta["eps"]
+                    eps = params["eps"]
                     if not torch.is_tensor(eps):
                         eps = torch.tensor(eps, device=self.device, dtype=self.dtype)
                     else:
