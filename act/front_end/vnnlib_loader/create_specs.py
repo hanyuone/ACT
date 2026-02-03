@@ -146,6 +146,11 @@ class VNNLibSpecCreator(BaseSpecCreator):
         
         results = []
         
+        # Cache converted models by (category, onnx_filename) so instances
+        # sharing the same ONNX file reuse the same Python object.  This is
+        # critical for model_synthesis.py which groups by id(pytorch_model).
+        _model_cache: Dict[Tuple[str, str], nn.Module] = {}
+        
         for instance_info in all_instances:
             category = instance_info['category']
             onnx_model = instance_info['onnx_model']
@@ -164,6 +169,13 @@ class VNNLibSpecCreator(BaseSpecCreator):
                     auto_download=False  # Already filtered to downloaded
                 )
                 
+                # Reuse cached model if same ONNX file was already converted
+                cache_key = (category, onnx_model)
+                if cache_key in _model_cache:
+                    instance_data['model'] = _model_cache[cache_key]
+                else:
+                    _model_cache[cache_key] = instance_data['model']
+                
                 # Generate specs for this instance
                 result = self._create_specs_for_single_instance(
                     category=category,
@@ -176,7 +188,7 @@ class VNNLibSpecCreator(BaseSpecCreator):
                     results.append(result)
                 
                 # Memory optimization: Free instance_data after extracting model/specs
-                # instance_data may contain large ONNX models and intermediate tensors
+                # (model itself is kept alive via _model_cache)
                 import gc
                 del instance_data
                 gc.collect()

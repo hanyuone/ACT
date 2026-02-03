@@ -22,21 +22,28 @@ class FuzzingSeed:
     Fuzzing seed with metadata.
     
     Attributes:
-        tensor: Input tensor
+        tensor: Input tensor (current, may be mutated)
+        original_tensor: Original clean image (NEVER mutated, for visualization)
+        original_index: Index in the original dataset (for tracking)
         label: Ground truth label (if available)
         energy: Seed energy (higher = more interesting)
         depth: How many mutations from original seed
         parent_id: ID of parent seed (for provenance tracking)
     """
     tensor: torch.Tensor
-    label: Optional[int]
+    original_tensor: Optional[torch.Tensor] = None  # Original clean image
+    original_index: Optional[int] = None  # Index in loader.images
+    label: Optional[int] = None
     energy: float = 1.0
     depth: int = 0
     parent_id: Optional[str] = None
     
     def __post_init__(self):
-        """Generate unique ID after initialization."""
+        """Generate unique ID and set original_tensor if not provided."""
         self.id = f"seed_{id(self)}"
+        # If original_tensor not set, use tensor (for initial seeds)
+        if self.original_tensor is None:
+            self.original_tensor = self.tensor.clone()
 
 
 class SeedCorpus:
@@ -74,10 +81,13 @@ class SeedCorpus:
         self.seen_hashes: set = set()
         
         # Convert LabeledInputTensor to FuzzingSeed
-        for labeled_tensor in initial_seeds:
+        for i, labeled_tensor in enumerate(initial_seeds):
+            tensor_cpu = labeled_tensor.tensor.cpu()
             seed = FuzzingSeed(
-                tensor=labeled_tensor.tensor.cpu(),
-                label=labeled_tensor.label,
+                tensor=tensor_cpu,
+                original_tensor=tensor_cpu.clone(),  # Store original
+                original_index=i,  # Track index in dataset
+                label=int(labeled_tensor.label.item()) if isinstance(labeled_tensor.label, torch.Tensor) else labeled_tensor.label,
                 energy=1.0,
                 depth=0
             )
@@ -93,7 +103,7 @@ class SeedCorpus:
     def _hash_tensor(self, tensor: torch.Tensor) -> int:
         """Compute hash of tensor for deduplication."""
         # Simple hash based on tensor values
-        return hash(tensor.flatten().numpy().tobytes())
+        return hash(tensor.flatten().cpu().numpy().tobytes())
     
     def select(self) -> FuzzingSeed:
         """
