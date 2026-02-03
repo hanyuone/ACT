@@ -137,6 +137,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
 from act.back_end.core import Layer, Net
+from act.back_end.layer_util import KIND_TO_TORCH_MODULE
 from act.back_end.serialization.serialization import NetSerializer
 from act.front_end.specs import InKind, OutKind
 from act.util.device_manager import get_default_dtype
@@ -400,6 +401,13 @@ class NetFactory:
                 # Generate bias if needed (CONV layers typically have bias by default)
                 # For now, we don't add bias to CONV layers unless specified
             
+            # Inject torch_module metadata for act2torch dynamic restoration
+            if kind in KIND_TO_TORCH_MODULE:
+                module_path, args_fn, kwargs_fn = KIND_TO_TORCH_MODULE[kind]
+                meta['torch_module'] = module_path
+                meta['torch_args'] = args_fn(meta)
+                meta['torch_kwargs'] = kwargs_fn(meta)
+
             # Create layer (validation happens automatically in __post_init__)
             layer = Layer(
                 id=i,
