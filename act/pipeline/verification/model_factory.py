@@ -112,7 +112,7 @@ class ModelFactory:
             try:
                 with open(net_path, 'r') as f:
                     net_dict = json.load(f)
-                act_net, _ = NetSerializer.deserialize_net(net_dict)
+                act_net = NetSerializer.deserialize_net(net_dict)
                 self.nets[name] = act_net
                 logger.debug(f"Pre-loaded ACT Net '{name}' from {net_path}")
             except Exception as e:
@@ -181,7 +181,7 @@ class ModelFactory:
     
     def generate_test_input(self, name: str, test_case: str = "center") -> torch.Tensor:
         """
-        Generate strategic test input considering both INPUT metadata and INPUT_SPEC constraints.
+        Generate strategic test input considering both INPUT params and INPUT_SPEC constraints.
         
         Args:
             name: Network name from examples_config.yaml
@@ -213,9 +213,8 @@ class ModelFactory:
         if input_layer is None:
             raise ValueError(f"No INPUT layer found in network '{name}'")
         
-        # Get INPUT metadata
-        input_meta = input_layer.get('meta', {})
-        shape = input_meta.get('shape')
+        input_params = input_layer.get('params', {})
+        shape = input_params.get('shape')
         if shape is None:
             raise ValueError(f"INPUT layer missing 'shape' in network '{name}'")
         
@@ -267,12 +266,12 @@ class ModelFactory:
             
             else:
                 # LIN_POLY or unknown: fallback to uniform random in value_range
-                value_range = input_meta.get('value_range', [0.0, 1.0])
+                value_range = input_params.get('value_range', [0.0, 1.0])
                 tensor = torch.rand(*shape, dtype=dtype) * (value_range[1] - value_range[0]) + value_range[0]
         
         else:
             # No INPUT_SPEC: use uniform random in value_range
-            value_range = input_meta.get('value_range', [0.0, 1.0])
+            value_range = input_params.get('value_range', [0.0, 1.0])
             tensor = torch.rand(*shape, dtype=dtype) * (value_range[1] - value_range[0]) + value_range[0]
         
         return tensor
@@ -282,7 +281,7 @@ class ModelFactory:
         return list(self.config['networks'].keys())
     
     def get_network_info(self, name: str) -> Dict[str, Any]:
-        """Get metadata about a network without creating it."""
+        """Get info about a network without creating it."""
         if name not in self.config['networks']:
             raise KeyError(f"Network '{name}' not found")
         
@@ -294,7 +293,6 @@ class ModelFactory:
             'architecture_type': spec.get('architecture_type', 'unknown'),
             'input_shape': spec.get('input_shape', 'unknown'),
             'num_layers': len([l for l in spec['layers'] if l['kind'] not in ['INPUT', 'INPUT_SPEC', 'ASSERT']]),
-            'metadata': spec.get('metadata', {})
         }
 
 

@@ -23,16 +23,16 @@ def hybridz_tf_lstm(L: Layer, Bin: Bounds) -> Fact:
     # LSTM is complex with internal gates - conservative approximation
     # For now, use interval-based bounds with HybridZ constraint generation
     
-    input_size = L.meta.get("input_size")
-    hidden_size = L.meta.get("hidden_size") 
+    input_size = L.params.get("input_size")
+    hidden_size = L.params.get("hidden_size") 
     
     # Conservative bounds for LSTM output
     # Hidden state typically bounded by tanh activation [-1, 1]
     # Cell state can have wider range
     
     # Split input into sequence and initial hidden/cell states if needed
-    seq_len = L.meta.get("seq_len", 1)
-    batch_size = L.meta.get("batch_size", 1)
+    seq_len = L.params.get("seq_len", 1)
+    batch_size = L.params.get("batch_size", 1)
     
     # Output bounds (hidden states)
     lb = torch.full((hidden_size,), -1.0, device=Bin.lb.device, dtype=Bin.lb.dtype)
@@ -59,8 +59,8 @@ def hybridz_tf_gru(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for GRU cells."""
     # GRU is simpler than LSTM but still complex
     
-    input_size = L.meta.get("input_size")
-    hidden_size = L.meta.get("hidden_size")
+    input_size = L.params.get("input_size")
+    hidden_size = L.params.get("hidden_size")
     
     # GRU output (hidden state) bounded by tanh activation
     lb = torch.full((hidden_size,), -1.0, device=Bin.lb.device, dtype=Bin.lb.dtype)
@@ -86,9 +86,9 @@ def hybridz_tf_rnn(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for basic RNN cells."""
     # Basic RNN: h_t = tanh(W_ih @ x_t + b_ih + W_hh @ h_{t-1} + b_hh)
     
-    input_size = L.meta.get("input_size")
-    hidden_size = L.meta.get("hidden_size")
-    nonlinearity = L.meta.get("nonlinearity", "tanh")  # tanh or relu
+    input_size = L.params.get("input_size")
+    hidden_size = L.params.get("hidden_size")
+    nonlinearity = L.params.get("nonlinearity", "tanh")  # tanh or relu
     
     if nonlinearity == "tanh":
         # Tanh activation bounds output to [-1, 1]
@@ -116,8 +116,8 @@ def hybridz_tf_embedding(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for embedding lookup."""
     # Embedding lookup: discrete input indices -> continuous embeddings
     
-    num_embeddings = L.meta.get("num_embeddings")
-    embedding_dim = L.meta.get("embedding_dim")
+    num_embeddings = L.params.get("num_embeddings")
+    embedding_dim = L.params.get("embedding_dim")
     weight = L.params.get("weight")  # (num_embeddings, embedding_dim)
     
     if weight is not None:

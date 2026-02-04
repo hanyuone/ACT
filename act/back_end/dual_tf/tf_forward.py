@@ -112,7 +112,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
         elif kind in ["LRELU", "LEAKY_RELU"]:
             if not post_activation:
                 bounds_dict[lid] = Bounds(lb.clone(), ub.clone())  # PRE-activation (for dual backward)
-            alpha = float(layer.meta.get("alpha", 0.01))
+            alpha = float(layer.params.get("alpha", 0.01))
             A, bias, lb, ub = _fwd_lrelu(A, bias, x0, eps, lb, ub, alpha)
             if post_activation:
                 bounds_dict[lid] = Bounds(lb.clone(), ub.clone())  # POST-activation (for validation)
@@ -133,8 +133,8 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
         elif kind == "ADD":
             # ADD layer: z = x + y (+ bias if present)
             # Get bounds from predecessor layers via x_src and y_src
-            x_src = layer.meta.get("x_src")
-            y_src = layer.meta.get("y_src")
+            x_src = layer.params.get("x_src")
+            y_src = layer.params.get("y_src")
             
             if x_src is not None and y_src is not None and x_src in bounds_dict and y_src in bounds_dict:
                 lb_x, ub_x = bounds_dict[x_src].lb.flatten(), bounds_dict[x_src].ub.flatten()
@@ -299,10 +299,10 @@ def _fwd_lrelu(A: torch.Tensor, bias: torch.Tensor, x0: torch.Tensor, eps: torch
 def _fwd_conv2d(layer: Layer, lb: torch.Tensor, ub: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Conv2D interval based"""
     weight, bias = layer.params["weight"], layer.params.get("bias")
-    stride = layer.meta.get("stride", 1)
-    padding = layer.meta.get("padding", 0)
-    dilation = layer.meta.get("dilation", 1)
-    groups = layer.meta.get("groups", 1)
+    stride = layer.params.get("stride", 1)
+    padding = layer.params.get("padding", 0)
+    dilation = layer.params.get("dilation", 1)
+    groups = layer.params.get("groups", 1)
     
     if isinstance(stride, (list, tuple)): stride = stride[0]
     if isinstance(padding, (list, tuple)): padding = padding[0]
@@ -330,11 +330,11 @@ def _fwd_conv2d(layer: Layer, lb: torch.Tensor, ub: torch.Tensor) -> Tuple[torch
 
 def _fwd_maxpool2d(layer: Layer, lb: torch.Tensor, ub: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """MaxPool2D (interval based)"""
-    kernel_size = layer.meta.get("kernel_size", 2)
-    stride = layer.meta.get("stride", kernel_size)
-    padding = layer.meta.get("padding", 0)
-    dilation = layer.meta.get("dilation", 1)
-    input_shape = layer.meta.get("input_shape")
+    kernel_size = layer.params.get("kernel_size", 2)
+    stride = layer.params.get("stride", kernel_size)
+    padding = layer.params.get("padding", 0)
+    dilation = layer.params.get("dilation", 1)
+    input_shape = layer.params.get("input_shape")
     if input_shape is None: return lb, ub
     
     b, c, h, w = input_shape
@@ -344,10 +344,10 @@ def _fwd_maxpool2d(layer: Layer, lb: torch.Tensor, ub: torch.Tensor) -> Tuple[to
 
 def _fwd_avgpool2d(layer: Layer, lb: torch.Tensor, ub: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """AvgPool2D (interval based)"""
-    kernel_size = layer.meta.get("kernel_size", 2)
-    stride = layer.meta.get("stride", kernel_size)
-    padding = layer.meta.get("padding", 0)
-    input_shape = layer.meta.get("input_shape")
+    kernel_size = layer.params.get("kernel_size", 2)
+    stride = layer.params.get("stride", kernel_size)
+    padding = layer.params.get("padding", 0)
+    input_shape = layer.params.get("input_shape")
     if input_shape is None: return lb, ub
     
     b, c, h, w = input_shape

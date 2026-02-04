@@ -28,7 +28,7 @@
 #    Purpose: Verify that the true class has the highest score
 #    Verification: argmax(y) == y_true
 #    
-#    Required meta:
+#    Required params:
 #    - y_true: Index of the ground truth class (int)
 #    
 #    Use cases:
@@ -41,7 +41,7 @@
 #    - FAIL: Different class has higher score (misclassification)
 #    
 #    Example:
-#    meta:
+#    params:
 #      kind: "TOP1_ROBUST"
 #      y_true: 7  # Verify output predicts class 7
 #
@@ -50,7 +50,7 @@
 #    Purpose: Verify true class exceeds others by a safety margin
 #    Verification: y[y_true] - max(y[i≠y_true]) >= margin
 #    
-#    Required meta:
+#    Required params:
 #    - y_true: Index of the ground truth class (int)
 #    - margin: Minimum required separation from other classes (float)
 #    
@@ -64,7 +64,7 @@
 #    - FAIL: Margin too small (weak confidence) or misclassification
 #    
 #    Example:
-#    meta:
+#    params:
 #      kind: "MARGIN_ROBUST"
 #      y_true: 3
 #      margin: 0.5  # Require 0.5 separation from other classes
@@ -90,9 +90,8 @@
 #    
 #    Example (verify sum of outputs ≤ 5.0):
 #    params:
-#      c: [1.0, 1.0, 1.0, 1.0, 1.0]  # Sum all 5 outputs
-#    meta:
 #      kind: "LINEAR_LE"
+#      c: [1.0, 1.0, 1.0, 1.0, 1.0]  # Sum all 5 outputs
 #      d: 5.0  # Upper bound
 #
 # 4. RANGE (Box Constraint on Outputs)
@@ -116,10 +115,9 @@
 #    
 #    Example (verify regression output in [0, 10]):
 #    params:
+#      kind: "RANGE"
 #      lb: [0.0, 0.0, 0.0]  # 3 outputs, all >= 0
 #      ub: [10.0, 10.0, 10.0]  # All <= 10
-#    meta:
-#      kind: "RANGE"
 #
 # Notes:
 # - All params specified as lists in YAML are automatically converted to tensors
@@ -151,17 +149,17 @@ class NetFactory:
         self.output_dir = Path("act/back_end/examples/nets")
         self.output_dir.mkdir(exist_ok=True)
     
-    def generate_weight_tensor(self, kind: str, meta: Dict[str, Any]) -> torch.Tensor:
+    def generate_weight_tensor(self, kind: str, layer_config: Dict[str, Any]) -> torch.Tensor:
         """Generate minimal weight tensors that satisfy schema requirements."""
         if kind == "DENSE":
-            in_features = meta.get("in_features", 10)
-            out_features = meta.get("out_features", 10)
+            in_features = layer_config.get("in_features", 10)
+            out_features = layer_config.get("out_features", 10)
             # Create minimal weight tensor W
             return torch.randn(out_features, in_features) * 0.1
         elif kind in ["CONV2D", "CONV1D", "CONV3D"]:
-            in_channels = meta.get("in_channels", 1)
-            out_channels = meta.get("out_channels", 1)
-            kernel_size = meta.get("kernel_size", 3)
+            in_channels = layer_config.get("in_channels", 1)
+            out_channels = layer_config.get("out_channels", 1)
+            kernel_size = layer_config.get("kernel_size", 3)
             if isinstance(kernel_size, int):
                 if kind == "CONV1D":
                     weight_shape = (out_channels, in_channels, kernel_size)
@@ -211,8 +209,8 @@ class NetFactory:
         
         # LIN_POLY: skip (too complex, user must provide A and b matrices)
     
-    def _generate_assert_params(self, params: Dict[str, Any], meta: Dict[str, Any], output_shape: Optional[List[int]]) -> None:
-        """Generate ASSERT (OutputSpec) params based on kind and meta values.
+    def _generate_assert_params(self, params: Dict[str, Any], layer_config: Dict[str, Any], output_shape: Optional[List[int]]) -> None:
+        """Generate ASSERT (OutputSpec) params based on kind and layer_config values.
         
         Supports four ASSERT kinds: TOP1_ROBUST, MARGIN_ROBUST, LINEAR_LE, and RANGE.
         See file header for detailed documentation of each kind.
@@ -220,31 +218,31 @@ class NetFactory:
         if not output_shape:
             raise ValueError("Cannot generate ASSERT params: output shape is required but not provided")
         
-        assert_kind = meta.get("kind")
+        assert_kind = layer_config.get("kind")
         
         # Compare with OutKind class variables (these are strings, not Enum objects)
         if assert_kind == OutKind.TOP1_ROBUST:
-            # No params to generate (y_true already in meta)
+            # No params to generate (y_true already in layer_config)
             # Just validate y_true is present
-            if "y_true" not in meta:
-                raise ValueError("TOP1_ROBUST requires 'y_true' in meta")
+            if "y_true" not in layer_config:
+                raise ValueError("TOP1_ROBUST requires 'y_true' in layer config")
         
         elif assert_kind == OutKind.MARGIN_ROBUST:
-            # No params to generate (y_true and margin already in meta)
+            # No params to generate (y_true and margin already in layer_config)
             # Just validate they are present
-            if "y_true" not in meta:
-                raise ValueError("MARGIN_ROBUST requires 'y_true' in meta")
-            if "margin" not in meta:
-                raise ValueError("MARGIN_ROBUST requires 'margin' in meta")
+            if "y_true" not in layer_config:
+                raise ValueError("MARGIN_ROBUST requires 'y_true' in layer config")
+            if "margin" not in layer_config:
+                raise ValueError("MARGIN_ROBUST requires 'margin' in layer config")
         
         elif assert_kind == OutKind.LINEAR_LE:
             # Convert c from list to tensor if present
             if "c" in params and isinstance(params["c"], list):
                 params["c"] = torch.tensor(params["c"], dtype=torch.float32)
             
-            # Validate d is present in meta
-            if "d" not in meta:
-                raise ValueError("LINEAR_LE requires 'd' in meta")
+            # Validate d is present in layer_config
+            if "d" not in layer_config:
+                raise ValueError("LINEAR_LE requires 'd' in layer config")
         
         elif assert_kind == OutKind.RANGE:
             # Convert lb/ub from lists to tensors if present
@@ -260,11 +258,11 @@ class NetFactory:
     def _generate_layer_variables(self, kind: str,
                                   layer_index: int,
                                   var_counter: int,
-                                  meta: Dict[str, Any],
+                                  layer_config: Dict[str, Any],
                                   layers: List[Layer]) -> Tuple[List[int], List[int], int]:
         """generate vars based on layer shape"""
         if kind == "INPUT":
-            shape = meta.get("shape", [])
+            shape = layer_config.get("shape", [])
             if shape:
                 out_num_vars = torch.Size(shape).numel()
             else:
@@ -274,8 +272,8 @@ class NetFactory:
             return [], out_vars, var_counter
 
         elif kind == "DENSE":
-            in_features = meta.get("in_features", 1)
-            out_features = meta.get("out_features", 1)
+            in_features = layer_config.get("in_features", 1)
+            out_features = layer_config.get("out_features", 1)
             if layers and layer_index > 0:
                 prev_out_vars = layers[layer_index - 1].out_vars
                 if len(prev_out_vars) != in_features:
@@ -303,12 +301,12 @@ class NetFactory:
             else:
                 raise ValueError(f"Convolutional layer '{kind}' cannot be the first layer in network")
 
-            output_shape = meta.get("output_shape")
+            output_shape = layer_config.get("output_shape")
             if output_shape:
                 out_num_vars = torch.Size(output_shape).numel()
             else:
                 raise ValueError(
-                    f"Convolutional layer '{kind}' requires 'output_shape' in meta for variable generation")
+                    f"Convolutional layer '{kind}' requires 'output_shape' in layer config for variable generation")
 
             out_vars = list(range(var_counter, var_counter + out_num_vars))
             var_counter += out_num_vars
@@ -350,31 +348,31 @@ class NetFactory:
         var_counter = 0  # init in/out var counter
 
         for i, layer_spec in enumerate(spec['layers']):
-            # Copy params and add required weight tensors if needed
             params = layer_spec.get('params', {}).copy()
-            meta = layer_spec.get('meta', {}).copy()  # Use copy() to avoid modifying YAML
+            # layer_config is a reference to params for internal processing
+            layer_config = params
             kind = layer_spec['kind']
 
             # Simple sequential variable assignment
-            in_vars, out_vars, var_counter = self._generate_layer_variables(kind, i, var_counter, meta, layers)
+            in_vars, out_vars, var_counter = self._generate_layer_variables(kind, i, var_counter, layer_config, layers)
             
             # Update INPUT layer dtype to match current device_manager
-            if kind == "INPUT" and 'dtype' in meta:
-                meta['dtype'] = current_dtype
+            if kind == "INPUT" and 'dtype' in layer_config:
+                layer_config['dtype'] = current_dtype
             
             # Get input shape for INPUT_SPEC generation
             input_shape = None
             if i > 0 and layers[i-1].kind == "INPUT":
-                input_shape = layers[i-1].meta.get("shape")
+                input_shape = layers[i-1].params.get("shape")
             
             # Get output shape for ASSERT generation (from last non-wrapper layer)
             output_shape = None
             if i > 0:
-                # Look at previous layer's meta for out_features (DENSE) or output shape
+                # Look at previous layer's params for out_features (DENSE) or output shape
                 for j in range(i-1, -1, -1):
                     prev_layer = layers[j]
                     if prev_layer.kind == "DENSE":
-                        out_features = prev_layer.meta.get("out_features")
+                        out_features = prev_layer.params.get("out_features")
                         if out_features:
                             output_shape = [1, out_features]
                             break
@@ -385,33 +383,37 @@ class NetFactory:
             
             # === AUTO-GENERATION DISPATCH ===
             if kind == "INPUT_SPEC":
-                # Merge meta into params for INPUT_SPEC (all config now in params)
+                # Merge layer_config into params for INPUT_SPEC (all config now in params)
                 for key in ["kind", "eps", "lb_val", "ub_val", "center_val"]:
-                    if key in meta and key not in params:
-                        params[key] = meta.pop(key)
+                    if key in layer_config and key not in params:
+                        params[key] = layer_config.pop(key)
                 self._generate_input_spec_params(params, input_shape)
             elif kind == "ASSERT":
-                self._generate_assert_params(params, meta, output_shape)
+                self._generate_assert_params(params, layer_config, output_shape)
             elif kind == "DENSE" and "weight" not in params:
-                weight = self.generate_weight_tensor(kind, meta)
+                weight = self.generate_weight_tensor(kind, layer_config)
                 if weight is not None:
                     params["weight"] = weight
                 # Generate bias (check if "bias" should be included)
-                out_features = meta.get("out_features", 10)
+                out_features = layer_config.get("out_features", 10)
                 params["bias"] = torch.zeros(out_features)
             elif kind.startswith("CONV") and "weight" not in params:
-                weight = self.generate_weight_tensor(kind, meta)
+                weight = self.generate_weight_tensor(kind, layer_config)
                 if weight is not None:
                     params["weight"] = weight
                 # Generate bias if needed (CONV layers typically have bias by default)
                 # For now, we don't add bias to CONV layers unless specified
+            
+            # Merge layer_config into params
+            for key, val in layer_config.items():
+                if key not in params:
+                    params[key] = val
             
             # Create layer (validation happens automatically in __post_init__)
             layer = Layer(
                 id=i,
                 kind=kind,
                 params=params,
-                meta=meta,
                 in_vars=in_vars,
                 out_vars=out_vars
             )
@@ -422,22 +424,12 @@ class NetFactory:
         preds = {i: [i-1] if i > 0 else [] for i in range(len(layers))}
         succs = {i: [i+1] if i < len(layers)-1 else [] for i in range(len(layers))}
         
-        net = Net(layers=layers, preds=preds, succs=succs)
-        net.meta = {
-            'name': name,
-            'description': spec.get('description', ''),
-            'architecture_type': spec.get('architecture_type', ''),
-            'input_shape': spec.get('input_shape', [])
-        }
-        return net
+        return Net(layers=layers, preds=preds, succs=succs)
     
     def save_network(self, net: Net, name: str) -> None:
         """Save network using proper ACT serialization with tensor encoding."""
         output_path = self.output_dir / f"{name}.json"
-        
-        # Use NetSerializer to properly handle tensors
-        net_dict = NetSerializer.serialize_net(net, metadata={'generated_by': 'NetFactory'})
-        
+        net_dict = NetSerializer.serialize_net(net)
         with open(output_path, 'w') as f:
             json.dump(net_dict, f, indent=2)
         print(f"Saved: {output_path}")

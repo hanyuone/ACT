@@ -15,19 +15,21 @@
 # core.py
 import torch
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Union
 import importlib
 
 # Import validation functions
 from act.back_end.layer_util import validate_layer, validate_graph, validate_wrapper_graph
+
+# Type alias for union-typed parameter values
+ParamValue = Union[torch.Tensor, int, str, tuple, bool, None]
 
 # Supported layer types: Please see them in act/back_end/layer_schema.py
 @dataclass
 class Layer:
     id: int                                     # Unique layer identifier
     kind: str                                   # UPPER name (e.g., "DENSE", "CONV2D", "RELU")
-    params: Dict[str, torch.Tensor]            # Numeric tensors (weights, biases) on device
-    meta: Dict[str, Any]                       # Non-numeric metadata (shapes, strides, etc.)
+    params: Dict[str, ParamValue]              # Union-typed parameters: tensors, scalars, shapes, etc.
     in_vars: List[int]                         # Input variable indices 
     out_vars: List[int]                        # Output variable indices
     cache: Dict[str, torch.Tensor] = field(default_factory=dict)  # Runtime cache tensors
@@ -68,16 +70,41 @@ class Layer:
         return bounds_dict
     
     def get_input_shape(self) -> Optional[Tuple[int, ...]]:
-        """Get input shape from metadata, or None if not stored."""
+        """Get input shape from params, or None if not stored."""
         if self.kind == "INPUT":
-            return self.meta.get("shape")
-        return self.meta.get("input_shape")
+            return self.params.get("shape")
+        return self.params.get("input_shape")
     
     def get_output_shape(self) -> Optional[Tuple[int, ...]]:
-        """Get output shape from metadata, or None if not stored."""
+        """Get output shape from params, or None if not stored."""
         if self.kind == "INPUT":
-            return self.meta.get("shape")
-        return self.meta.get("output_shape")
+            return self.params.get("shape")
+        return self.params.get("output_shape")
+    
+    def get_tensor(self, key: str, default: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
+        """Get tensor parameter. Returns default if missing or not a tensor."""
+        val = self.params.get(key)
+        if val is None or not isinstance(val, torch.Tensor):
+            return default
+        return val
+    
+    def get_scalar(self, key: str, default: Any = None) -> Any:
+        """Get non-tensor parameter."""
+        return self.params.get(key, default)
+    
+    def get_int(self, key: str, default: int = 0) -> int:
+        """Get integer parameter."""
+        val = self.params.get(key, default)
+        return int(val) if val is not None else default
+    
+    def get_tuple(self, key: str, default: tuple = ()) -> tuple:
+        """Get tuple parameter."""
+        val = self.params.get(key, default)
+        return tuple(val) if val is not None else default
+    
+    def is_tensor(self, key: str) -> bool:
+        """Check if parameter is a tensor."""
+        return isinstance(self.params.get(key), torch.Tensor)
     
     def get_num_input_vars(self) -> int:
         """Get number of input variables (flattened dimension)."""

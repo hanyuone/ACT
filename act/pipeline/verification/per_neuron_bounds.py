@@ -20,7 +20,7 @@
 #       PyTorch modules (Linear/Conv/ReLU/Pool/Flatten/...).
 #   - Built-in alignment to ACT layer IDs:
 #       Aligns hook events to ACT layers using a strict hookable-order strategy
-#       (with optional shape sanity checks from ACT layer meta).
+#       (with optional shape sanity checks from ACT layer params).
 #   - Per-neuron violation detection:
 #       A neuron is flagged only if it exceeds [lb, ub] beyond tolerance:
 #           tol = atol + rtol * |a|   (a = concrete activation)
@@ -239,11 +239,12 @@ def collect_concrete_activations(
                 f"Kind/type mismatch at position {idx}: act_kind={layer.kind} event_type={module_type}"
             )
         expected_shape = None
-        meta = getattr(layer, "meta", {}) or {}
-        if "output_shape" in meta:
-            expected_shape = tuple(int(x) for x in meta["output_shape"])
-        elif "shape" in meta:
-            expected_shape = tuple(int(x) for x in meta["shape"])
+
+        params = getattr(layer, "params", {}) or {}
+        if "output_shape" in params:
+            expected_shape = tuple(int(x) for x in params["output_shape"])
+        elif "shape" in params:
+            expected_shape = tuple(int(x) for x in params["shape"])
         if expected_shape is not None:
             raw_shape = tuple(int(x) for x in tensor.shape)
             no_batch_shape, dropped, drop_reason = _drop_batch_if_and_only_if_batch1(
@@ -262,13 +263,13 @@ def collect_concrete_activations(
                 )
         mapping[layer.id] = tensor
 
-    meta = {
+    info = {
         "mode": "hookable_order_strict",
         "hookable_events": len(hookable_events),
         "hookable_layers": len(hookable_layers),
     }
 
-    return mapping, errors, warnings, meta
+    return mapping, errors, warnings, info
 
 
 def _is_finite(t: torch.Tensor) -> bool:

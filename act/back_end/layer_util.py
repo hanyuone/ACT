@@ -118,43 +118,23 @@ def validate_layer(layer: "Layer") -> None:
                         f"{kind}.params['labeled_input'].label list contains non-int elements."
                     )
             continue
-        # Allow scalar params for certain fields (e.g., INPUT_SPEC's kind, eps, etc.)
-        # These are JSON-serializable scalars 
-        SCALAR_PARAM_NAMES = {'kind', 'eps', 'lb_val', 'ub_val', 'center_val'}
-        if name in SCALAR_PARAM_NAMES:
-            continue
-        # If torch isn't available, skip the runtime type check.
-        try:
-            import torch  # noqa
-            if not isinstance(val, Tensor):  # type: ignore[arg-type]
-                raise TypeError(f"{kind}.params['{name}'] must be torch.Tensor, got {type(val)}.")
-        except ImportError:
-            pass
+        # Tensor params are auto-detected at runtime via isinstance(val, torch.Tensor).
+        # No explicit 'tensors' list validation needed - params can be any type (tensor or scalar).
+        # Type validation is implicitly handled by downstream code that uses the params.
 
     miss_p = _missing(spec['params_required'], layer.params)
-    miss_m = _missing(spec['meta_required'], layer.meta)
     
     allowed_p = spec['params_required'] + spec['params_optional']
-    allowed_m = spec['meta_required'] + spec['meta_optional']
 
     unk_p = _unknown(allowed_p, layer.params)
-    unk_m = _unknown(allowed_m, layer.meta)
 
     errs: List[str] = []
     if miss_p:
         errs.append(f"Missing required PARAMS: {miss_p}. Add them or relax schema in REGISTRY['{kind}']['params_required'].")
-    if miss_m:
-        errs.append(f"Missing required META: {miss_m}. Add them or relax schema in REGISTRY['{kind}']['meta_required'].")
     if unk_p:
         errs.append(_format_unknown(kind, "params_optional/params_required", unk_p, allowed_p))
-    if unk_m:
-        errs.append(_format_unknown(kind, "meta_optional/meta_required", unk_m, allowed_m))
 
     # Critical op sanity
-    if kind == LayerKind.CONCAT.value and not isinstance(layer.meta.get("concat_dim", None), int):
-        errs.append("CONCAT.meta['concat_dim'] must be int.")
-    if kind == LayerKind.SOFTMAX.value and not isinstance(layer.meta.get("axis", None), int):
-        errs.append("SOFTMAX.meta['axis'] must be int.")
     if kind == LayerKind.MHA.value:
         has_any = any(k in layer.params for k in ("in_proj_weight","q_proj.weight","k_proj.weight","v_proj.weight","out_proj.weight"))
         if not has_any:
@@ -232,7 +212,7 @@ def validate_conset_ops(conset) -> None:
                 "and exporter handling if intentional."
             )
 
-def create_layer(id: int, kind: str, params: Dict[str, Any], meta: Dict[str, Any],
+def create_layer(id: int, kind: str, params: Dict[str, Any],
                  in_vars: List[int], out_vars: List[int]) -> "Layer":
     """Create and validate a layer."""
     try:
@@ -246,7 +226,7 @@ def create_layer(id: int, kind: str, params: Dict[str, Any], meta: Dict[str, Any
         sys.path.insert(0, project_root)
         from act.back_end.core import Layer
     
-    ly = Layer(id=id, kind=kind, params=params, meta=meta, in_vars=in_vars, out_vars=out_vars)
+    ly = Layer(id=id, kind=kind, params=params, in_vars=in_vars, out_vars=out_vars)
     validate_layer(ly)
     return ly
 
@@ -271,7 +251,7 @@ if __name__ == "__main__":
         # INPUT
         layers.append(create_layer(
             id=0, kind=LayerKind.INPUT.value,
-            params={}, meta={"shape": (1,3,32,32), "dtype": "torch.float64"},
+            params={},
             in_vars=[0], out_vars=[0],
         ))
         # SPEC (directly after INPUT - no adapters)
@@ -279,24 +259,24 @@ if __name__ == "__main__":
         ub_tensor = torch.full((1,3,32,32), 1.0)
         layers.append(create_layer(
             id=1, kind=LayerKind.INPUT_SPEC.value,
-            params={"kind": InKind.BOX, "lb": lb_tensor, "ub": ub_tensor}, meta={},
+            params={"kind": InKind.BOX, "lb": lb_tensor, "ub": ub_tensor},
             in_vars=[0], out_vars=[0],
         ))
         # Model toy
         layers.append(create_layer(
             id=2, kind=LayerKind.FLATTEN.value,
-            params={}, meta={"start_dim": 1, "end_dim": -1},
+            params={},
             in_vars=[0], out_vars=[1],
         ))
         W, b = torch.randn(10, 3072), torch.randn(10)
         layers.append(create_layer(
             id=3, kind=LayerKind.DENSE.value,
-            params={"W": W, "b": b}, meta={},
+            params={"W": W, "b": b},
             in_vars=[1], out_vars=[2],
         ))
         layers.append(create_layer(
             id=4, kind=LayerKind.ASSERT.value,
-            params={}, meta={"kind": OutKind.TOP1_ROBUST, "y_true": 3},
+            params={},
             in_vars=[2], out_vars=[2],
         ))
 

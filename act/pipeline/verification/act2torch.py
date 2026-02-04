@@ -12,7 +12,7 @@
 # Single source of truth: layer_schema.py REGISTRY
 #
 # Design:
-#   - Zero mapping tables: torch_module, params, meta all from REGISTRY
+#   - Zero mapping tables: torch_module, params all from REGISTRY
 #   - Param names match PyTorch: weight, bias, stride, padding, etc.
 #
 # Layer Routing:
@@ -89,7 +89,7 @@ class ACTToTorch:
                 continue
             
             kind = act_layer.kind
-            meta = act_layer.meta
+            params = act_layer.params
             
             # Handle wrapper layers specially
             if kind == 'INPUT':
@@ -101,7 +101,6 @@ class ACTToTorch:
                 from act.front_end.specs import InputSpec, InKind
                 
                 # Build InputSpec from ACT layer (kind/eps in params)
-                params = act_layer.params
                 kind_str = params['kind']
                 spec_kind = getattr(InKind, kind_str)  # Convert string to enum
                 spec_dict = {'kind': spec_kind}
@@ -126,20 +125,20 @@ class ACTToTorch:
                 from act.front_end.specs import OutputSpec, OutKind
                 
                 # Build OutputSpec from ACT layer
-                kind_str = meta['kind']
+                kind_str = params['kind']
                 spec_kind = getattr(OutKind, kind_str)  # Convert string to enum
                 spec_dict = {'kind': spec_kind}
-                if 'y_true' in meta:
-                    spec_dict['y_true'] = meta['y_true']
-                if 'margin' in meta:
-                    spec_dict['margin'] = meta['margin']
-                if 'd' in meta:
-                    spec_dict['d'] = meta['d']
+                if 'y_true' in params:
+                    spec_dict['y_true'] = params['y_true']
+                if 'margin' in params:
+                    spec_dict['margin'] = params['margin']
+                if 'd' in params:
+                    spec_dict['d'] = params['d']
                 
                 # Convert parameter tensors to device_manager dtype for consistency
                 for param_key in ['c', 'lb', 'ub']:
-                    if param_key in act_layer.params:
-                        tensor = act_layer.params[param_key]
+                    if param_key in params:
+                        tensor = params[param_key]
                         spec_dict[param_key] = tensor.to(dtype=target_dtype, device=target_device)
                 
                 spec = OutputSpec(**spec_dict)
@@ -149,7 +148,7 @@ class ACTToTorch:
                 continue
             
             # SCALE with BatchNorm decomposition → Restore BatchNorm
-            if kind == 'SCALE' and meta.get('is_batchnorm_decomposition'):
+            if kind == 'SCALE' and params.get('is_batchnorm_decomposition'):
                 # Find paired BIAS layer
                 bias_layer = self._find_paired_bias(i)
                 if bias_layer is not None:
@@ -161,7 +160,7 @@ class ACTToTorch:
                     continue
             
             # Skip BIAS paired with SCALE (already handled)
-            if kind == 'BIAS' and meta.get('paired_with_scale'):
+            if kind == 'BIAS' and params.get('paired_with_scale'):
                 continue
             
             # Schema-driven restoration for all other layers
@@ -190,7 +189,7 @@ class ACTToTorch:
         layers = self.act_net.layers
         for j in range(scale_idx + 1, len(layers)):
             layer = layers[j]
-            if layer.kind == 'BIAS' and layer.meta.get('paired_with_scale'):
+            if layer.kind == 'BIAS' and layer.params.get('paired_with_scale'):
                 return layer
             # Stop if we hit a non-BIAS layer
             if layer.kind != 'BIAS':
@@ -198,10 +197,10 @@ class ACTToTorch:
         return None
     
     def _restore_batchnorm(self, scale_layer: Layer) -> Optional[nn.Module]:
-        """Restore BatchNorm from SCALE layer with batchnorm_* metadata."""
-        meta = scale_layer.meta
+        """Restore BatchNorm from SCALE layer with batchnorm_* params."""
+        params = scale_layer.params
 
-        bn_module_path = meta.get('batchnorm_module')
+        bn_module_path = params.get('batchnorm_module')
         if not bn_module_path:
             return None
 
@@ -210,12 +209,12 @@ class ACTToTorch:
         cls = getattr(importlib.import_module(mod_name), cls_name)
 
         # Create BatchNorm instance
-        args = meta.get('batchnorm_args', [])
-        kwargs = meta.get('batchnorm_kwargs', {})
+        args = params.get('batchnorm_args', [])
+        kwargs = params.get('batchnorm_kwargs', {})
         bn = cls(*args, **kwargs)
 
         # Load state from batchnorm_state
-        bn_state = meta.get('batchnorm_state', {})
+        bn_state = params.get('batchnorm_state', {})
         if bn_state:
             state_dict = {}
             for key in ['weight', 'bias', 'running_mean', 'running_var', 'num_batches_tracked']:
@@ -232,14 +231,17 @@ class ACTToTorch:
 
         Schema provides everything needed:
           - torch_module: PyTorch module path (e.g., "torch.nn.Linear")
-          - meta_required: Constructor positional args
-          - meta_optional: Constructor kwargs (names match PyTorch)
-          - params: State dict keys (names match PyTorch: "weight", "bias")
+          - params_required: Required params (tensors + constructor args)
+          - params_optional: Optional params (tensors + constructor kwargs)
+        
+        Tensor params are auto-detected via isinstance(val, torch.Tensor).
+        Constructor args = params_required where value is NOT a tensor.
+        Constructor kwargs = params_optional where value is NOT a tensor.
         
         Layers without torch_module are skipped (INPUT, ASSERT, graph ops, etc.)
         """
         kind = act_layer.kind
-        meta = act_layer.meta
+        params = act_layer.params
         
         # Get schema spec - single source of truth
         if kind not in REGISTRY:
@@ -250,7 +252,7 @@ class ACTToTorch:
         torch_module = spec.get('torch_module')
         if not torch_module:
             # Graph layers (ADD, MUL, CONCAT) require DAG structure - warn user
-            if 'requires_graph_restoration' in spec.get('meta_optional', []):
+            if 'requires_graph_restoration' in spec.get('params_optional', []):
                 logger.warning(f"Skipping {kind} layer (id={act_layer.id}): "
                               f"requires DAG structure, not supported in Sequential model")
             return None
@@ -259,14 +261,18 @@ class ACTToTorch:
         mod_name, cls_name = torch_module.rsplit(".", 1)
         cls = getattr(importlib.import_module(mod_name), cls_name)
 
-        # Build positional args from meta_required
+        # Build positional args from params_required (excluding tensors)
+        # Tensors are auto-detected via isinstance() - they go to state_dict, not constructor
         args = []
-        for key in spec.get('meta_required', []):
-            if key not in meta:
-                raise ValueError(f"Layer '{kind}' (id={act_layer.id}) missing required meta '{key}'")
-            args.append(meta[key])
+        for key in spec.get('params_required', []):
+            if key not in params:
+                raise ValueError(f"Layer '{kind}' (id={act_layer.id}) missing required param '{key}'")
+            # Skip tensor params - they go to state_dict
+            if isinstance(params[key], torch.Tensor):
+                continue
+            args.append(params[key])
 
-        # Build kwargs from meta_optional (names match PyTorch directly)
+        # Build kwargs from params_optional (names match PyTorch directly)
         # Only include kwargs that PyTorch module accepts
         kwargs = {}
         # Check if bias exists in params to set bias kwarg for Linear/Conv
@@ -274,10 +280,10 @@ class ACTToTorch:
             kwargs["bias"] = True
         elif kind in ("DENSE", "CONV1D", "CONV2D", "CONV3D"):
             kwargs["bias"] = False
-        # Pass through common kwargs from meta
+        # Pass through common kwargs from params
         for key in ("stride", "padding", "dilation", "groups", "start_dim"):
-            if key in meta:
-                kwargs[key] = meta[key]
+            if key in params:
+                kwargs[key] = params[key]
 
         # Create module instance
         m = cls(*args, **kwargs)

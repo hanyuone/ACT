@@ -37,8 +37,8 @@ def run_verification(args):
     
     # Load network
     print(f"Loading network from: {args.network}")
-    net, metadata = load_net_from_file(args.network)
-    print(f"✓ Loaded network with {len(net.layers)} layers")
+    net = load_net_from_file(args.network)
+    print(f"Loaded network with {len(net.layers)} layers")
     
     # Select solver
     if args.solver == 'gurobi':
@@ -149,7 +149,7 @@ def run_network_info(args):
     from act.back_end.layer_schema import LayerKind
     
     print(f"Loading network from: {args.network}\n")
-    net, metadata = load_net_from_file(args.network)
+    net = load_net_from_file(args.network)
     
     # Basic info
     print(f"Network: {Path(args.network).stem}")
@@ -178,9 +178,7 @@ def run_network_info(args):
             print(f"  In vars: {layer.in_vars}")
             print(f"  Out vars: {layer.out_vars}")
             if layer.params:
-                print(f"  Params: {list(layer.params.keys())}")
-            if layer.meta:
-                print(f"  Meta: {layer.meta}")
+                print(f"  Params: {layer.params}")
             
             # Show predecessors
             preds = net.preds.get(layer.id, [])

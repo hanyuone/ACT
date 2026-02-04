@@ -13,8 +13,8 @@
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from dataclasses import dataclass
+from typing import Optional
 import torch
 
 class InKind:
@@ -73,7 +73,6 @@ class OutputSpec:
     margin: Optional[torch.Tensor] = None
     lb: Optional[torch.Tensor] = None
     ub: Optional[torch.Tensor] = None
-    meta: Dict[str, Any] = field(default_factory=dict)
     
     def __post_init__(self):
         """Ensure all numeric fields are tensors for batch-native architecture."""

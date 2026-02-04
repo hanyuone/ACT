@@ -152,17 +152,17 @@ def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> N
 def add_negated_assert_to_solver(solver: Solver, out_ids: List[int], assert_layer) -> None:
     """Add the negation of ASSERT property as constraints to solver."""
     from act.back_end.cons_exportor import to_numpy
-    k = assert_layer.meta.get("kind")
+    k = assert_layer.params.get("kind")
     
     if k == OutKind.LINEAR_LE:
         # Property: c·y ≤ d  →  Negation: c·y ≥ d + ε
         coeffs = list(to_numpy(assert_layer.params["c"]))
-        d = float(assert_layer.meta["d"])
+        d = float(assert_layer.params["d"])
         solver.add_lin_ge(out_ids, coeffs, d + 1e-6)
         
     elif k == OutKind.TOP1_ROBUST:
         # Property: y[t] > y[j] for all j≠t  →  Negation: ∃j: y[j] ≥ y[t]
-        t = int(assert_layer.meta["y_true"])
+        t = int(assert_layer.params["y_true"])
         v = solver.n
         solver.add_vars(1)
         for j, oj in enumerate(out_ids):
@@ -172,8 +172,8 @@ def add_negated_assert_to_solver(solver: Solver, out_ids: List[int], assert_laye
         
     elif k == OutKind.MARGIN_ROBUST:
         # Property: y[t] - y[j] > margin for all j≠t  →  Negation: ∃j: y[j] ≥ y[t] - margin
-        t = int(assert_layer.meta["y_true"])
-        margin = float(assert_layer.meta["margin"])
+        t = int(assert_layer.params["y_true"])
+        margin = float(assert_layer.params["margin"])
         v = solver.n
         solver.add_vars(1)
         for j, oj in enumerate(out_ids):
