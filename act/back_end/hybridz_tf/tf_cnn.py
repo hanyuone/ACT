@@ -26,17 +26,17 @@ def hybridz_tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     # Extract convolution parameters
     weight = L.params["weight"]  # (out_channels, in_channels, kernel_h, kernel_w)
     bias = L.params.get("bias", None)
-    stride = L.meta.get("stride", 1)
-    padding = L.meta.get("padding", 0)
-    dilation = L.meta.get("dilation", 1)
-    groups = L.meta.get("groups", 1)
+    stride = L.params.get("stride", 1)
+    padding = L.params.get("padding", 0)
+    dilation = L.params.get("dilation", 1)
+    groups = L.params.get("groups", 1)
     
     # Input shape: (batch, in_channels, height, width) - for bounds propagation batch=1
-    input_shape = L.meta.get("input_shape", None)  # (channels, height, width)
+    input_shape = L.params.get("input_shape", None)  # (channels, height, width)
     if Bin.lb.dim() == 1:
         # Flatten input needs to be reshaped
         if input_shape is None:
-            raise ValueError("CONV2D got flat bounds but meta.input_shape is missing")
+            raise ValueError("CONV2D got flat bounds but params.input_shape is missing")
 
         # input_shape may be (N,C,H,W) or (C,H,W)
         if len(input_shape) == 4:
@@ -86,7 +86,7 @@ def hybridz_tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     cons = ConSet()
     cons.add_op( f"conv2d:{L.id}", list(L.out_vars + L.in_vars), weight=weight, 
                 bias=bias if bias is not None else torch.zeros(weight.shape[0], device=weight.device, dtype=weight.dtype),
-                stride=stride, padding=padding, dilation=dilation, groups=groups, input_shape=L.meta.get("input_shape"), output_shape=L.meta.get("output_shape"),)
+                stride=stride, padding=padding, dilation=dilation, groups=groups, input_shape=L.params.get("input_shape"), output_shape=L.params.get("output_shape"),)
     
     return Fact(bounds=Bout, cons=cons)
 
@@ -94,12 +94,12 @@ def hybridz_tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
 @torch.no_grad()
 def hybridz_tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for 2D max pooling."""
-    kernel_size = L.meta.get("kernel_size", 2)
-    stride = L.meta.get("stride", kernel_size)
-    padding = L.meta.get("padding", 0)
+    kernel_size = L.params.get("kernel_size", 2)
+    stride = L.params.get("stride", kernel_size)
+    padding = L.params.get("padding", 0)
     
     # Reshape input if flattened
-    in_shape = L.meta.get("input_shape")  # (channels, height, width)
+    in_shape = L.params.get("input_shape")  # (channels, height, width)
     if len(Bin.lb.shape) == 1 and in_shape:
         Bin_lb = Bin.lb.view(1, *in_shape)
         Bin_ub = Bin.ub.view(1, *in_shape)
@@ -122,7 +122,7 @@ def hybridz_tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     cons = ConSet()
     # Max pooling generates max constraints
     cons.add_op( f"maxpool2d:{L.id}", list(L.out_vars + L.in_vars), kernel_size=kernel_size, 
-        stride=stride, padding=padding, input_shape=in_shape, output_shape=L.meta.get("output_shape"),)
+        stride=stride, padding=padding, input_shape=in_shape, output_shape=L.params.get("output_shape"),)
     
     return Fact(bounds=Bout, cons=cons)
 
@@ -130,12 +130,12 @@ def hybridz_tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
 @torch.no_grad()
 def hybridz_tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for 2D average pooling."""
-    kernel_size = L.meta.get("kernel_size", 2)
-    stride = L.meta.get("stride", kernel_size)
-    padding = L.meta.get("padding", 0)
+    kernel_size = L.params.get("kernel_size", 2)
+    stride = L.params.get("stride", kernel_size)
+    padding = L.params.get("padding", 0)
     
     # Reshape input if needed
-    in_shape = L.meta.get("input_shape")
+    in_shape = L.params.get("input_shape")
     if len(Bin.lb.shape) == 1 and in_shape:
         Bin_lb = Bin.lb.view(1, *in_shape)
         Bin_ub = Bin.ub.view(1, *in_shape)
@@ -155,7 +155,7 @@ def hybridz_tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
     cons = ConSet()
     cons.add_op(
         f"avgpool2d:{L.id}", list(L.out_vars + L.in_vars), kernel_size=kernel_size, stride=stride,
-        padding=padding, input_shape=in_shape, output_shape=L.meta.get("output_shape"),)
+        padding=padding, input_shape=in_shape, output_shape=L.params.get("output_shape"),)
     
     return Fact(bounds=Bout, cons=cons)
 
@@ -164,8 +164,8 @@ def hybridz_tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
 def hybridz_tf_flatten(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for tensor flattening."""
     # Flattening is just reshaping - bounds remain the same
-    start_dim = L.meta.get("start_dim", 1)
-    end_dim = L.meta.get("end_dim", -1)
+    start_dim = L.params.get("start_dim", 1)
+    end_dim = L.params.get("end_dim", -1)
     
     # Simple reshape - no change in bounds
     lb = Bin.lb.flatten()
@@ -173,7 +173,7 @@ def hybridz_tf_flatten(L: Layer, Bin: Bounds) -> Fact:
     Bout = Bounds(lb=lb, ub=ub)
     
     cons = ConSet()
-    cons.add_op(f"flatten:{L.id}", list(L.out_vars + L.in_vars), start_dim=start_dim, end_dim=end_dim, input_shape=L.meta.get("input_shape"), output_shape=L.meta.get("output_shape"))
+    cons.add_op(f"flatten:{L.id}", list(L.out_vars + L.in_vars), start_dim=start_dim, end_dim=end_dim, input_shape=L.params.get("input_shape"), output_shape=L.params.get("output_shape"))
     
     return Fact(bounds=Bout, cons=cons)
 
@@ -181,7 +181,7 @@ def hybridz_tf_flatten(L: Layer, Bin: Bounds) -> Fact:
 @torch.no_grad()
 def hybridz_tf_reshape(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for general tensor reshaping."""
-    target_shape = L.meta.get("target_shape")
+    target_shape = L.params.get("target_shape")
     
     # Reshape bounds preserving values
     lb = Bin.lb.reshape(target_shape) if target_shape else Bin.lb
@@ -193,6 +193,6 @@ def hybridz_tf_reshape(L: Layer, Bin: Bounds) -> Fact:
     Bout = Bounds(lb=lb, ub=ub)
     
     cons = ConSet()
-    cons.add_op(f"reshape:{L.id}", list(L.out_vars + L.in_vars), target_shape=target_shape, input_shape=L.meta.get("input_shape"), output_shape=L.meta.get("output_shape"))
+    cons.add_op(f"reshape:{L.id}", list(L.out_vars + L.in_vars), target_shape=target_shape, input_shape=L.params.get("input_shape"), output_shape=L.params.get("output_shape"))
     
     return Fact(bounds=Bout, cons=cons)

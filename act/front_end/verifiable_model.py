@@ -20,7 +20,7 @@
 # Core Layers:
 #
 #   InputLayer(labeled_input, shape=(N, C, H, W), dtype=...)
-#     Declares batched input with metadata. No-op at inference.
+#     Declares batched input with attributes. No-op at inference.
 #
 #   InputSpecLayer(spec=InputSpec(lb=(N,...), ub=(N,...)))
 #     Checks N input constraints. Returns (x, satisfied(N,), explanation).
@@ -179,7 +179,7 @@ class VerifiableModel(nn.Sequential):
 
 class InputLayer(nn.Module):
     """
-    Declares batched input with metadata. No-op during forward pass.
+    Declares batched input with attributes. No-op during forward pass.
     
     Batch Format:
         shape: (N, C, H, W) or (N, features) where N is batch size
@@ -190,10 +190,10 @@ class InputLayer(nn.Module):
         labeled_input: LabeledInputTensor with (N, ...) tensor and labels
         shape: Input shape including batch dimension
         dtype: REQUIRED - affects verification precision/range
-        dataset_name, layout, etc.: Optional metadata
+        dataset_name, layout, etc.: Optional attributes
     
     Forward:
-        x → x (pass-through, metadata only)
+        x → x (pass-through, attributes only)
     """
     def __init__(
         self,
@@ -201,15 +201,15 @@ class InputLayer(nn.Module):
         shape: Tuple[int, ...],
         dtype: torch.dtype,  # REQUIRED: Critical for verification soundness
         desc: str = "input",
-        # Tier 1: Essential metadata (strongly recommended)
+        # Tier 1: Essential attributes (strongly recommended)
         layout: Optional[str] = None,
         dataset_name: Optional[str] = None,
-        # Tier 2: Important metadata
+        # Tier 2: Important attributes
         num_classes: Optional[int] = None,
         value_range: Optional[Tuple[float, float]] = None,
         scale_hint: Optional[str] = None,
         distribution: Optional[str] = None,  # "uniform", "normal", "normalized", "unknown", or custom
-        # Tier 3: Optional metadata
+        # Tier 3: Optional attributes
         sample_id: Optional[Union[int, str]] = None,
         domain: Optional[str] = None,
         channels: Optional[int] = None,
@@ -225,17 +225,17 @@ class InputLayer(nn.Module):
         self.dtype = dtype  # REQUIRED
         self.desc = desc
         
-        # Tier 1: Essential metadata
+        # Tier 1: Essential attributes
         self.layout = layout
         self.dataset_name = dataset_name
         
-        # Tier 2: Important metadata
+        # Tier 2: Important attributes
         self.num_classes = num_classes
         self.value_range = tuple(value_range) if value_range else None
         self.scale_hint = scale_hint
         self.distribution = distribution
         
-        # Tier 3: Optional metadata
+        # Tier 3: Optional attributes
         self.sample_id = sample_id
         self.domain = domain
         self.channels = channels
@@ -281,54 +281,45 @@ class InputLayer(nn.Module):
         """Validate parameters against INPUT layer schema"""
         schema = REGISTRY[LayerKind.INPUT.value]
         
-        # Collect params (optional: labeled_input as unified object)
+        # Build unified params dict
         params = {
             "labeled_input": self.labeled_input,
-        }
-        
-        # Collect meta (everything else - dtype now REQUIRED)
-        meta = {
             "shape": self.shape,
-            "dtype": str(self.dtype)  # REQUIRED - must always be present
+            "dtype": str(self.dtype),  # REQUIRED
         }
         
         # Add non-default desc
         if self.desc != "input":
-            meta["desc"] = self.desc
+            params["desc"] = self.desc
         
-        # Add Tier 1-3 metadata (only if not None)
+        # Add optional fields (only if not None)
         if self.layout is not None:
-            meta["layout"] = self.layout
+            params["layout"] = self.layout
         if self.dataset_name is not None:
-            meta["dataset_name"] = self.dataset_name
+            params["dataset_name"] = self.dataset_name
         if self.num_classes is not None:
-            meta["num_classes"] = self.num_classes
+            params["num_classes"] = self.num_classes
         if self.value_range is not None:
-            meta["value_range"] = self.value_range
+            params["value_range"] = self.value_range
         if self.scale_hint is not None:
-            meta["scale_hint"] = self.scale_hint
+            params["scale_hint"] = self.scale_hint
         if self.distribution is not None:
-            meta["distribution"] = self.distribution
+            params["distribution"] = self.distribution
         if self.sample_id is not None:
-            meta["sample_id"] = self.sample_id
+            params["sample_id"] = self.sample_id
         if self.domain is not None:
-            meta["domain"] = self.domain
+            params["domain"] = self.domain
         if self.channels is not None:
-            meta["channels"] = self.channels
+            params["channels"] = self.channels
         
-        # Check required/optional params and meta
+        # Check required/optional params
         for key in schema["params_required"]:
             if key not in params:
                 raise ValueError(f"InputLayer missing required param: {key}")
+        allowed_params = schema["params_required"] + schema["params_optional"]
         for key in params:
-            if key not in schema["params_required"] + schema["params_optional"]:
+            if key not in allowed_params:
                 raise ValueError(f"InputLayer has unknown param: {key}")
-        for key in schema["meta_required"]:
-            if key not in meta:
-                raise ValueError(f"InputLayer missing required meta: {key}")
-        for key in meta:
-            if key not in schema["meta_required"] + schema["meta_optional"]:
-                raise ValueError(f"InputLayer has unknown meta: {key}")
 
     def to_act_layers(self, layer_id_start: int, in_vars: List[int]) -> Tuple[List, List[int]]:
         """Convert to ACT Layer(s) and return (layers, out_vars)
@@ -340,64 +331,59 @@ class InputLayer(nn.Module):
         N = batch_size * per_sample  # Total vars for all samples in batch
         out_vars = list(range(len(in_vars), len(in_vars) + N))
         
-        # Collect params (optional: labeled_input for ACT serialization)
+        # Build unified params dict
         params = {
             "labeled_input": self.labeled_input,
-        }
-        
-        # Collect meta (dtype is REQUIRED, always present)
-        meta = {
             "shape": self.shape,
             "dtype": str(self.dtype),  # REQUIRED
             "batch_size": batch_size,  # Track batch size for batched verification
         }
         
         if self.desc != "input":
-            meta["desc"] = self.desc
+            params["desc"] = self.desc
         
-        # Add all optional metadata fields (only if not None)
+        # Add all optional fields (only if not None)
         if self.layout is not None:
-            meta["layout"] = self.layout
+            params["layout"] = self.layout
         if self.dataset_name is not None:
-            meta["dataset_name"] = self.dataset_name
+            params["dataset_name"] = self.dataset_name
         if self.num_classes is not None:
-            meta["num_classes"] = self.num_classes
+            params["num_classes"] = self.num_classes
         if self.value_range is not None:
-            meta["value_range"] = self.value_range
+            params["value_range"] = self.value_range
         if self.scale_hint is not None:
-            meta["scale_hint"] = self.scale_hint
+            params["scale_hint"] = self.scale_hint
         if self.distribution is not None:
-            meta["distribution"] = self.distribution
+            params["distribution"] = self.distribution
         if self.sample_id is not None:
-            meta["sample_id"] = self.sample_id
+            params["sample_id"] = self.sample_id
         if self.domain is not None:
-            meta["domain"] = self.domain
+            params["domain"] = self.domain
         if self.channels is not None:
-            meta["channels"] = self.channels
+            params["channels"] = self.channels
         
         layer = create_layer(
             id=layer_id_start,
             kind=LayerKind.INPUT.value,
             params=params,
-            meta=meta,
             in_vars=in_vars,
             out_vars=out_vars
         )
         return [layer], out_vars
 
-    def get_metadata_summary(self) -> Dict[str, Any]:
-        """Return a summary of all metadata for debugging/logging"""
+    def get_attributes_summary(self) -> Dict[str, Any]:
+        """Return a summary of all attributes for debugging/logging."""
         return {
             "shape": self.shape,
             "desc": self.desc,
-            "dtype": str(self.dtype),  # Always present (required)
+            "dtype": str(self.dtype),
             "layout": self.layout,
             "dataset_name": self.dataset_name,
             "num_classes": self.num_classes,
             "value_range": self.value_range,
             "scale_hint": self.scale_hint,
             "distribution": self.distribution,
-            "label": self.label.tolist(),  # Convert tensor to list for readability
+            "label": self.label.tolist(),
             "sample_id": self.sample_id,
             "domain": self.domain,
             "channels": self.channels,
@@ -405,7 +391,7 @@ class InputLayer(nn.Module):
         }
 
     def __repr__(self) -> str:
-        """Enhanced string representation with key metadata"""
+        """Enhanced string representation with key attributes."""
         meta_str = f"shape={self.shape}"
         if self.dataset_name:
             meta_str += f", dataset={self.dataset_name}"
@@ -461,39 +447,36 @@ class InputSpecLayer(nn.Module):
     def _validate_schema(self):
         """Validate parameters against INPUT_SPEC layer schema"""
         schema = REGISTRY[LayerKind.INPUT_SPEC.value]
-        params = {}
+        params = {"kind": self.kind}  # kind is now in params
         for name in ("lb", "ub", "center", "A", "b"):
             val = getattr(self, name, None)
             if val is not None:
                 params[name] = val
-        meta = {"kind": self.kind}
         if self.eps is not None:
-            meta["eps"] = self.eps
+            params["eps"] = self.eps
         
         # Check schema compliance
-        for key in schema["meta_required"]:
-            if key not in meta:
-                raise ValueError(f"InputSpecLayer missing required meta: {key}")
-        for key in meta:
-            if key not in schema["meta_required"] + schema["meta_optional"]:
-                raise ValueError(f"InputSpecLayer has unknown meta: {key}")
+        for key in schema["params_required"]:
+            if key not in params:
+                raise ValueError(f"InputSpecLayer missing required param: {key}")
+        for key in params:
+            if key not in schema["params_required"] + schema["params_optional"]:
+                raise ValueError(f"InputSpecLayer has unknown param: {key}")
 
     def to_act_layers(self, layer_id_start: int, in_vars: List[int]) -> Tuple[List, List[int]]:
         """Convert to ACT Layer(s) - INPUT_SPEC doesn't create new vars"""
-        params = {}
+        params = {"kind": self.kind}  # kind is now in params
         for name in ("lb", "ub", "center", "A", "b"):
             val = getattr(self, name, None)
             if val is not None:
                 params[name] = val
-        meta = {"kind": self.kind}
         if self.eps is not None:
-            meta["eps"] = self.eps
+            params["eps"] = self.eps
         
         layer = create_layer(
             id=layer_id_start,
             kind=LayerKind.INPUT_SPEC.value,
             params=params,
-            meta=meta,
             in_vars=in_vars,
             out_vars=in_vars  # INPUT_SPEC doesn't change variables
         )
@@ -591,7 +574,6 @@ class OutputSpecLayer(nn.Module):
         self.spec = spec or OutputSpec(**kwargs)
         self.kind = self.spec.kind
         self.d = self.spec.d
-        self.meta = dict(self.spec.meta)
         
         # register as buffer for device mobility
         if self.spec.y_true is not None:
@@ -615,44 +597,42 @@ class OutputSpecLayer(nn.Module):
     def _validate_schema(self):
         """Validate parameters against ASSERT layer schema"""
         schema = REGISTRY[LayerKind.ASSERT.value]
-        params = {}
+        params = {"kind": self.kind}
         for name in ("c", "lb", "ub"):
             val = getattr(self, name, None)
             if val is not None:
                 params[name] = val
-        meta = {"kind": self.kind}
         if self.y_true is not None:
-            meta["y_true"] = self.y_true
+            params["y_true"] = self.y_true
         if self.margin is not None:
-            meta["margin"] = self.margin
+            params["margin"] = self.margin
         if self.d is not None:
-            meta["d"] = self.d
+            params["d"] = self.d
         
         # Check schema compliance
-        for key in schema["meta_required"]:
-            if key not in meta:
-                raise ValueError(f"OutputSpecLayer missing required meta: {key}")
+        for key in schema["params_required"]:
+            if key not in params:
+                raise ValueError(f"OutputSpecLayer missing required param: {key}")
 
     def to_act_layers(self, layer_id_start: int, in_vars: List[int]) -> Tuple[List, List[int]]:
         """Convert to ACT Layer(s) - ASSERT doesn't create new vars"""
-        params = {}
+        # Build unified params dict
+        params = {"kind": self.kind}
         for name in ("c", "lb", "ub"):
             val = getattr(self, name, None)
             if val is not None:
                 params[name] = val
-        meta = {"kind": self.kind}
         if self.y_true is not None:
-            meta["y_true"] = self.y_true
+            params["y_true"] = self.y_true
         if self.margin is not None:
-            meta["margin"] = self.margin
+            params["margin"] = self.margin
         if self.d is not None:
-            meta["d"] = self.d
+            params["d"] = self.d
         
         layer = create_layer(
             id=layer_id_start,
             kind=LayerKind.ASSERT.value,
             params=params,
-            meta=meta,
             in_vars=in_vars,
             out_vars=in_vars  # ASSERT doesn't change variables
         )

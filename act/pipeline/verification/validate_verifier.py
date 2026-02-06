@@ -212,7 +212,7 @@ class VerificationValidator:
             if act_net is not None:
                 for layer in getattr(act_net, "layers", []):
                     if getattr(layer, "kind", None) == "INPUT":
-                        shp = (layer.meta or {}).get("shape", None)
+                        shp = (layer.params or {}).get("shape", None)
                         if (isinstance(shp, (list, tuple)) and shp and all(isinstance(x, int) and x > 0 for x in shp)):
                             input_shape = tuple(shp)
                             shape_prod = int(torch.tensor(input_shape).prod().item())
@@ -386,7 +386,7 @@ class VerificationValidator:
                 input_shape = None
                 for layer in act_net.layers:
                     if getattr(layer, "kind", None) == "INPUT":
-                        input_shape = layer.meta.get("shape")
+                        input_shape = layer.params.get("shape")
                         break
                 try:
                     if input_shape is not None:
@@ -600,7 +600,6 @@ class VerificationValidator:
                     continue
 
                 params = layer.params or {}
-                meta = layer.meta or {}
 
                 # 1) Prefer BOX
                 if "lb" in params and "ub" in params:
@@ -610,9 +609,9 @@ class VerificationValidator:
                     )
 
                 # 2) LINF_BALL: center + eps
-                if "center" in params and "eps" in meta:
+                if "center" in params and "eps" in params:
                     center = params["center"].flatten().to(device=self.device, dtype=self.dtype)
-                    eps = meta["eps"]
+                    eps = params["eps"]
                     if not torch.is_tensor(eps):
                         eps = torch.tensor(eps, device=self.device, dtype=self.dtype)
                     else:

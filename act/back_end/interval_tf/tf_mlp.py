@@ -20,11 +20,11 @@ from act.back_end.utils import affine_bounds, pwl_meta
 
 # -------- MLP Basics --------
 def tf_dense(L: Layer, Bin: Bounds) -> Fact:
-    # Handle parameter compatibility: schema defines W, but optimization uses W_pos/W_neg
-    W = L.params["W"]
-    W_pos = L.params.get("W_pos", torch.clamp(W, min=0))
-    W_neg = L.params.get("W_neg", torch.clamp(W, max=0))
-    b = L.params.get("b", torch.zeros(W.shape[0], device=W.device, dtype=W.dtype))
+    # Parameter names aligned with PyTorch: weight, bias, weight_pos, weight_neg
+    W = L.params["weight"]
+    W_pos = L.params.get("weight_pos", torch.clamp(W, min=0))
+    W_neg = L.params.get("weight_neg", torch.clamp(W, max=0))
+    b = L.params.get("bias", torch.zeros(W.shape[0], device=W.device, dtype=W.dtype))
     
     B = affine_bounds(W_pos, W_neg, b, Bin)
     C = ConSet(); C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"dense:{L.id}", "W": W, "b": b}))
@@ -57,7 +57,7 @@ def tf_relu(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_lrelu(L: Layer, Bin: Bounds) -> Fact:
-    a=float(L.meta["alpha"]); l,u=Bin.lb,Bin.ub; on=l>=0; off=u<=0; amb=~(on|off)
+    a=float(L.params["alpha"]); l,u=Bin.lb,Bin.ub; on=l>=0; off=u<=0; amb=~(on|off)
     lb=torch.minimum(a*torch.minimum(l,0.0), torch.maximum(l,0.0))
     ub=torch.maximum(a*torch.maximum(u,0.0), torch.maximum(u,0.0))
     if torch.any(amb):
@@ -89,7 +89,7 @@ def tf_clip(L: Layer, Bin: Bounds) -> Fact:
 
 def tf_add(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
     B=Bounds(Bx.lb+By.lb, Bx.ub+By.ub); C=ConSet()
-    C.replace(Con("EQ", tuple(L.out_vars + L.meta["x_vars"] + L.meta["y_vars"]), {"tag":f"add:{L.id}"}))
+    C.replace(Con("EQ", tuple(L.out_vars + L.params["x_vars"] + L.params["y_vars"]), {"tag":f"add:{L.id}"}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
     
 def tf_sub(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
@@ -97,14 +97,14 @@ def tf_sub(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
     assert B.lb.numel() == len(L.out_vars), f"sub out_vars length {len(L.out_vars)} != output elements {B.lb.numel()}"
     assert torch.all(B.lb <= B.ub), "sub produced invalid bounds (lb > ub)"
     C = ConSet()
-    C.replace(Con("EQ", tuple(L.out_vars + L.meta["x_vars"] + L.meta["y_vars"]), {"tag": f"sub:{L.id}"}))
+    C.replace(Con("EQ", tuple(L.out_vars + L.params["x_vars"] + L.params["y_vars"]), {"tag": f"sub:{L.id}"}))
     C.add_box(L.id, L.out_vars, B)
     return Fact(B, C)
 
 def tf_mul(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
     cand=torch.stack([Bx.lb*By.lb, Bx.lb*By.ub, Bx.ub*By.lb, Bx.ub*By.ub], dim=0)
     B=Bounds(torch.min(cand,0).values, torch.max(cand,0).values); C=ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars + L.meta["x_vars"] + L.meta["y_vars"]),
+    C.replace(Con("INEQ", tuple(L.out_vars + L.params["x_vars"] + L.params["y_vars"]),
         {"tag":f"mcc:{L.id}","lx":Bx.lb,"ux":Bx.ub,"ly":By.lb,"uy":By.ub}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
     
@@ -128,14 +128,14 @@ def tf_div(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
     assert torch.all(torch.isfinite(B.lb) & torch.isfinite(B.ub)), "div produced non-finite bounds"
     assert torch.all(B.lb <= B.ub), "div produced invalid bounds (lb > ub)"
     C = ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars + L.meta["x_vars"] + L.meta["y_vars"]), {"tag": f"div:{L.id}", "safe": not torch.any(crosses_zero).item()}))
+    C.replace(Con("INEQ", tuple(L.out_vars + L.params["x_vars"] + L.params["y_vars"]), {"tag": f"div:{L.id}", "safe": not torch.any(crosses_zero).item()}))
     C.add_box(L.id, L.out_vars, B)
     return Fact(B, C)
 
 def tf_matmul(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
-    x_shape = L.meta["x_shape"]      # (m, k)
-    y_shape = L.meta["y_shape"]      # (k, n)
-    out_shape = L.meta["output_shape"]  # (m, n)
+    x_shape = L.params["x_shape"]      # (m, k)
+    y_shape = L.params["y_shape"]      # (k, n)
+    out_shape = L.params["output_shape"]  # (m, n)
 
     m, k = x_shape
     k2, n = y_shape
@@ -175,7 +175,7 @@ def tf_matmul(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
     C = ConSet()
 
     C.replace(Con("INEQ",
-                  tuple(L.out_vars + L.meta["x_vars"] + L.meta["y_vars"]),
+                  tuple(L.out_vars + L.params["x_vars"] + L.params["y_vars"]),
                   {"tag": f"matmul:{L.id}",
                    "x_shape": x_shape,
                    "y_shape": y_shape,
@@ -218,13 +218,13 @@ def tf_silu(L: Layer, Bin: Bounds) -> Fact:
 
 def tf_max(L: Layer, By_list: List[Bounds]) -> Fact:
     lb=torch.maximum.reduce([b.lb for b in By_list]); ub=torch.maximum.reduce([b.ub for b in By_list])
-    B=Bounds(lb,ub); all_y=sum((L.meta["y_vars_list"][i] for i in range(len(By_list))), [])
+    B=Bounds(lb,ub); all_y=sum((L.params["y_vars_list"][i] for i in range(len(By_list))), [])
     C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+all_y), {"tag":f"max:{L.id}","k":len(By_list),"mode":"convex"}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_min(L: Layer, By_list: List[Bounds]) -> Fact:
     lb=torch.minimum.reduce([b.lb for b in By_list]); ub=torch.minimum.reduce([b.ub for b in By_list])
-    B=Bounds(lb,ub); all_y=sum((L.meta["y_vars_list"][i] for i in range(len(By_list))), [])
+    B=Bounds(lb,ub); all_y=sum((L.params["y_vars_list"][i] for i in range(len(By_list))), [])
     C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+all_y), {"tag":f"min:{L.id}","k":len(By_list),"mode":"convex"}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
@@ -235,7 +235,7 @@ def tf_square(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_power(L: Layer, Bin: Bounds) -> Fact:
-    p=float(L.meta["p"]); f=lambda x: torch.pow(torch.clamp(x,min=0.0), p)
+    p=float(L.params["p"]); f=lambda x: torch.pow(torch.clamp(x,min=0.0), p)
     B=Bounds(f(Bin.lb), f(Bin.ub)); C=ConSet()
     C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"power:{L.id}","p":p,"segs":pwl_meta(Bin.lb,Bin.ub,2)}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
@@ -252,8 +252,8 @@ def tf_relu6(L: Layer, Bin: Bounds) -> Fact:
 
 def tf_hardtanh(L: Layer, Bin: Bounds) -> Fact:
     """HardTanh: clamp(x, min_val, max_val)"""
-    min_val = float(L.meta.get("min_val", -1.0))
-    max_val = float(L.meta.get("max_val", 1.0))
+    min_val = float(L.params.get("min_val", -1.0))
+    max_val = float(L.params.get("max_val", 1.0))
     l, u = Bin.lb, Bin.ub
     lb = torch.clamp(l, min=min_val, max=max_val)
     ub = torch.clamp(u, min=min_val, max=max_val)
@@ -263,8 +263,8 @@ def tf_hardtanh(L: Layer, Bin: Bounds) -> Fact:
 
 def tf_hardsigmoid(L: Layer, Bin: Bounds) -> Fact:
     """HardSigmoid: clamp(alpha * x + beta, 0, 1)"""
-    alpha = float(L.meta.get("alpha", 1/6))
-    beta = float(L.meta.get("beta", 0.5))
+    alpha = float(L.params.get("alpha", 1/6))
+    beta = float(L.params.get("beta", 0.5))
     l, u = Bin.lb, Bin.ub
     # Apply linear transformation then clamp
     l_linear = alpha * l + beta
@@ -311,7 +311,7 @@ def tf_reshape(L: Layer, Bin: Bounds) -> Fact:
     # Reshape doesn't change the values, only the tensor shape
     B = Bounds(Bin.lb.clone(), Bin.ub.clone())
     C = ConSet()
-    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"reshape:{L.id}", "target_shape": L.meta.get("target_shape")}))
+    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"reshape:{L.id}", "target_shape": L.params.get("target_shape")}))
     C.add_box(L.id, L.out_vars, B); return Fact(B, C)
 
 def tf_transpose(L: Layer, Bin: Bounds) -> Fact:
@@ -319,28 +319,28 @@ def tf_transpose(L: Layer, Bin: Bounds) -> Fact:
     # Transpose doesn't change the values, only the dimension order
     B = Bounds(Bin.lb.clone(), Bin.ub.clone())
     C = ConSet()
-    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"transpose:{L.id}", "perm": L.meta.get("perm")}))
+    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"transpose:{L.id}", "perm": L.params.get("perm")}))
     C.add_box(L.id, L.out_vars, B); return Fact(B, C)
 
 def tf_squeeze(L: Layer, Bin: Bounds) -> Fact:
     """Squeeze: remove singleton dimensions (identity for bounds)"""
     B = Bounds(Bin.lb.clone(), Bin.ub.clone())
     C = ConSet()
-    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"squeeze:{L.id}", "dims": L.meta.get("dims")}))
+    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"squeeze:{L.id}", "dims": L.params.get("dims")}))
     C.add_box(L.id, L.out_vars, B); return Fact(B, C)
 
 def tf_unsqueeze(L: Layer, Bin: Bounds) -> Fact:
     """Unsqueeze: add singleton dimensions (identity for bounds)"""
     B = Bounds(Bin.lb.clone(), Bin.ub.clone())
     C = ConSet()
-    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"unsqueeze:{L.id}", "dims": L.meta.get("dims")}))
+    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"unsqueeze:{L.id}", "dims": L.params.get("dims")}))
     C.add_box(L.id, L.out_vars, B); return Fact(B, C)
 
 def tf_tile(L: Layer, Bin: Bounds) -> Fact:
     """Tile: repeat tensor along dimensions"""
     # Conservative bounds: same as input for each repetition
-    repeats = L.meta.get("repeats")
-    inp_shape = tuple(L.meta["input_shape"])
+    repeats = L.params.get("repeats")
+    inp_shape = tuple(L.params["input_shape"])
     x_lb = Bin.lb.view(*inp_shape)
     x_ub = Bin.ub.view(*inp_shape)
     out_lb = x_lb.repeat(*repeats)
@@ -355,18 +355,18 @@ def tf_expand(L: Layer, Bin: Bounds) -> Fact:
     # Broadcasting doesn't change values, only shape
     B = Bounds(Bin.lb.clone(), Bin.ub.clone())
     C = ConSet()
-    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"expand:{L.id}", "shape": L.meta.get("shape")}))
+    C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"expand:{L.id}", "shape": L.params.get("shape")}))
     C.add_box(L.id, L.out_vars, B); return Fact(B, C)
     
 def tf_slice(L: Layer, Bin: Bounds) -> Fact:
-    inp_shape = tuple(L.meta["input_shape"])  # e.g. (1, 3, 32, 32)
+    inp_shape = tuple(L.params["input_shape"])  # e.g. (1, 3, 32, 32)
     x_lb = Bin.lb.view(*inp_shape)
     x_ub = Bin.ub.view(*inp_shape)
 
-    starts = L.meta.get("starts", [])
-    ends   = L.meta.get("ends", [])
-    axes   = L.meta.get("axes", list(range(len(inp_shape))))
-    steps  = L.meta.get("steps", [1] * len(axes))
+    starts = L.params.get("starts", [])
+    ends   = L.params.get("ends", [])
+    axes   = L.params.get("axes", list(range(len(inp_shape))))
+    steps  = L.params.get("steps", [1] * len(axes))
 
     # Build slice objects for each dimension
     slices = [slice(None)] * len(inp_shape)
@@ -400,12 +400,12 @@ def tf_slice(L: Layer, Bin: Bounds) -> Fact:
 
 def tf_gather(L: Layer, Bin: Bounds) -> Fact:
 
-    inp_shape = tuple(L.meta["input_shape"])
-    axis = int(L.meta.get("axis", 0))
+    inp_shape = tuple(L.params["input_shape"])
+    axis = int(L.params.get("axis", 0))
     x_lb = Bin.lb.view(*inp_shape)
     x_ub = Bin.ub.view(*inp_shape)
 
-    raw_idx = L.meta["indices"]
+    raw_idx = L.params["indices"]
     if isinstance(raw_idx, (list, tuple)):
         indices = torch.tensor(raw_idx, dtype=torch.long, device=x_lb.device)
     else:
@@ -429,13 +429,13 @@ def tf_gather(L: Layer, Bin: Bounds) -> Fact:
 
 def tf_index_select(L: Layer, Bin: Bounds) -> Fact:
 
-    inp_shape = tuple(L.meta["input_shape"])
-    dim = int(L.meta["dim"])
+    inp_shape = tuple(L.params["input_shape"])
+    dim = int(L.params["dim"])
     assert 0 <= dim < len(inp_shape), f"index_select dim {dim} out of range for input shape {inp_shape}"
     x_lb = Bin.lb.view(*inp_shape)
     x_ub = Bin.ub.view(*inp_shape)
 
-    raw_idx = L.meta["indices"]
+    raw_idx = L.params["indices"]
     if isinstance(raw_idx, (list, tuple)):
         indices = torch.tensor(raw_idx, dtype=torch.long, device=x_lb.device)
     else:
@@ -462,7 +462,7 @@ def tf_index_select(L: Layer, Bin: Bounds) -> Fact:
 
 def tf_permute(L, ctx):
     (lx, ux) = ctx.get_predecessor_bounds(L.id, 0)
-    perm = L.meta["perm"]    
+    perm = L.params["perm"]    
     assert len(perm) == lx.dim(), f"permute length {len(perm)} != tensor dim {lx.dim()}"
     lx = lx.permute(*perm)
     ux = ux.permute(*perm)
@@ -471,12 +471,12 @@ def tf_permute(L, ctx):
 
 def tf_reorder(L, ctx):
     (lx, ux) = ctx.get_predecessor_bounds(L.id, 0)
-    raw_order = L.meta["order"]
+    raw_order = L.params["order"]
     order = raw_order if torch.is_tensor(raw_order) else torch.tensor(raw_order, device=lx.device, dtype=torch.long)
-    dim = L.meta.get("dim", 0)
+    dim = L.params.get("dim", 0)
     assert order.numel() == lx.shape[dim], f"reorder order length {order.numel()} != dim size {lx.shape[dim]}"
-    lx = lx.index_select(L.meta.get("dim", 0), order)
-    ux = ux.index_select(L.meta.get("dim", 0), order)
+    lx = lx.index_select(L.params.get("dim", 0), order)
+    ux = ux.index_select(L.params.get("dim", 0), order)
     assert lx.shape == ux.shape, "reorder produced mismatched bound shapes"
     return lx, ux
 
@@ -497,7 +497,7 @@ def tf_stack(L, ctx):
     for i in range(len(L.inputs)):
         lb, ub = ctx.get_predecessor_bounds(L.id, i)
         lbs.append(lb); ubs.append(ub)
-    dim = L.meta.get("axis", 0)
+    dim = L.params.get("axis", 0)
     stacked_lb = torch.stack(lbs, dim=dim)
     stacked_ub = torch.stack(ubs, dim=dim)
     assert stacked_lb.shape == stacked_ub.shape, "stack produced mismatched bound shapes"

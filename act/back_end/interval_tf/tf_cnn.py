@@ -26,10 +26,10 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     # Extract convolution parameters
     weight = L.params["weight"]  # [out_channels, in_channels, kernel_h, kernel_w]
     bias = L.params.get("bias", None)
-    stride = L.meta.get("stride", 1)
-    padding = L.meta.get("padding", 0)
-    dilation = L.meta.get("dilation", 1)
-    groups = L.meta.get("groups", 1)
+    stride = L.params.get("stride", 1)
+    padding = L.params.get("padding", 0)
+    dilation = L.params.get("dilation", 1)
+    groups = L.params.get("groups", 1)
     
     # Normalize stride/padding/dilation to tuples
     if isinstance(stride, int):
@@ -115,13 +115,13 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B_output, C)
 
 def tf_maxpool1d(L: Layer, Bin: Bounds) -> Fact:
-    kernel_size = L.meta["kernel_size"]
-    stride = L.meta.get("stride", kernel_size)
-    padding = L.meta.get("padding", 0)
-    dilation = L.meta.get("dilation", 1)
+    kernel_size = L.params["kernel_size"]
+    stride = L.params.get("stride", kernel_size)
+    padding = L.params.get("padding", 0)
+    dilation = L.params.get("dilation", 1)
 
-    input_shape = L.meta["input_shape"]   # [batch, channels, width]
-    output_shape = L.meta["output_shape"] # [batch, channels, out_w]
+    input_shape = L.params["input_shape"]   # [batch, channels, width]
+    output_shape = L.params["output_shape"] # [batch, channels, out_w]
 
     b, c, w = input_shape
     _, _, out_w = output_shape
@@ -157,14 +157,14 @@ def tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     Uses interval arithmetic to bound the max pooling operation.
     """
     # Extract pooling parameters
-    kernel_size = L.meta["kernel_size"]
-    stride = L.meta.get("stride", kernel_size)
-    padding = L.meta.get("padding", 0)
-    dilation = L.meta.get("dilation", 1)
+    kernel_size = L.params["kernel_size"]
+    stride = L.params.get("stride", kernel_size)
+    padding = L.params.get("padding", 0)
+    dilation = L.params.get("dilation", 1)
     
     # Shape information
-    input_shape = L.meta["input_shape"]  # [batch, channels, height, width]
-    output_shape = L.meta["output_shape"]  # [batch, channels, out_h, out_w]
+    input_shape = L.params["input_shape"]  # [batch, channels, height, width]
+    output_shape = L.params["output_shape"]  # [batch, channels, out_h, out_w]
     
     batch_size, channels, in_h, in_w = input_shape
     _, _, out_h, out_w = output_shape
@@ -201,12 +201,12 @@ def tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B_output, C)
 
 def tf_avgpool1d(L: Layer, Bin: Bounds) -> Fact:
-    kernel_size = L.meta["kernel_size"]
-    stride = L.meta.get("stride", kernel_size)
-    padding = L.meta.get("padding", 0)
+    kernel_size = L.params["kernel_size"]
+    stride = L.params.get("stride", kernel_size)
+    padding = L.params.get("padding", 0)
 
-    input_shape = L.meta["input_shape"]
-    output_shape = L.meta["output_shape"]
+    input_shape = L.params["input_shape"]
+    output_shape = L.params["output_shape"]
 
     b, c, w = input_shape
     lb_in = Bin.lb.view(b, c, w)
@@ -229,13 +229,13 @@ def tf_avgpool1d(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B_output, C)
 
 def tf_maxpool3d(L: Layer, Bin: Bounds) -> Fact:
-    kernel_size = L.meta["kernel_size"]
-    stride = L.meta.get("stride", kernel_size)
-    padding = L.meta.get("padding", 0)
-    dilation = L.meta.get("dilation", 1)
+    kernel_size = L.params["kernel_size"]
+    stride = L.params.get("stride", kernel_size)
+    padding = L.params.get("padding", 0)
+    dilation = L.params.get("dilation", 1)
 
-    input_shape = L.meta["input_shape"]   # [b, c, d, h, w]
-    output_shape = L.meta["output_shape"] # [b, c, od, oh, ow]
+    input_shape = L.params["input_shape"]   # [b, c, d, h, w]
+    output_shape = L.params["output_shape"] # [b, c, od, oh, ow]
 
     b, c, d, h, w = input_shape
     lb_in = Bin.lb.view(b, c, d, h, w)
@@ -262,17 +262,17 @@ def tf_maxpool3d(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B, C)
 
 def tf_pad(L: Layer, Bin: Bounds) -> Fact:
-    pads = L.meta.get("pad", None)
+    pads = L.params.get("pad", None)
     if pads is None:
-        pads = L.meta.get("pads", None)
+        pads = L.params.get("pads", None)
     if pads is None:
-        raise KeyError(f"pad/pads not found in meta for PAD layer {L.id}")
+        raise KeyError(f"pad/pads not found in params for PAD layer {L.id}")
     assert len(pads) % 2 == 0, f"pad expects pairs, got pads={pads}"
 
-    mode = L.meta.get("mode", "constant")
-    value = float(L.meta.get("value", 0.0))
+    mode = L.params.get("mode", "constant")
+    value = float(L.params.get("value", 0.0))
 
-    in_shape = tuple(L.meta["input_shape"])
+    in_shape = tuple(L.params["input_shape"])
     lb_in = Bin.lb.view(*in_shape)
     ub_in = Bin.ub.view(*in_shape)
 
@@ -296,24 +296,24 @@ def tf_flatten(L: Layer, Bin: Bounds) -> Fact:
     lb = Bin.lb
     ub = Bin.ub
 
-    if "input_shape" in L.meta:
-        input_shape = tuple(L.meta["input_shape"])
+    if "input_shape" in L.params:
+        input_shape = tuple(L.params["input_shape"])
     else:
         input_shape = (int(lb.numel()),)
 
-    if "output_shape" in L.meta:
-        output_shape = tuple(L.meta["output_shape"])
+    if "output_shape" in L.params:
+        output_shape = tuple(L.params["output_shape"])
     else:
         output_shape = (int(lb.numel()),)
 
-    axis      = L.meta.get("axis", None)        # ONNX Flatten(axis=...)
-    start_dim = L.meta.get("start_dim", None)   # torch.flatten(start_dim, end_dim)
-    end_dim   = L.meta.get("end_dim", None)
+    axis      = L.params.get("axis", None)        # ONNX Flatten(axis=...)
+    start_dim = L.params.get("start_dim", None)   # torch.flatten(start_dim, end_dim)
+    end_dim   = L.params.get("end_dim", None)
 
     lb_flat = lb.view(-1)
     ub_flat = ub.view(-1)
     assert lb_flat.numel() == len(L.out_vars), f"flatten out_vars length {len(L.out_vars)} != output elements {lb_flat.numel()}"
-    if "output_shape" in L.meta:
+    if "output_shape" in L.params:
         expected = int(torch.tensor(output_shape).prod().item())
         assert lb_flat.numel() == expected, f"flatten output numel {lb_flat.numel()} != expected {expected}"
     B_out = Bounds(lb_flat, ub_flat)
@@ -402,13 +402,13 @@ def tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
     Uses linear transformation to handle average pooling.
     """
     # Extract pooling parameters
-    kernel_size = L.meta["kernel_size"]
-    stride = L.meta.get("stride", kernel_size)
-    padding = L.meta.get("padding", 0)
+    kernel_size = L.params["kernel_size"]
+    stride = L.params.get("stride", kernel_size)
+    padding = L.params.get("padding", 0)
     
     # Input/output shape information
-    input_shape = L.meta["input_shape"]
-    output_shape = L.meta["output_shape"]
+    input_shape = L.params["input_shape"]
+    output_shape = L.params["output_shape"]
     
     batch_size, channels, in_h, in_w = input_shape
     _, _, out_h, out_w = output_shape
@@ -512,14 +512,14 @@ def tf_conv1d(L: Layer, Bin: Bounds) -> Fact:
     # Extract convolution parameters
     weight = L.params["weight"]  # [out_channels, in_channels, kernel_w]
     bias = L.params.get("bias", None)
-    stride = L.meta.get("stride", 1)
-    padding = L.meta.get("padding", 0)
-    dilation = L.meta.get("dilation", 1)
-    groups = L.meta.get("groups", 1)
+    stride = L.params.get("stride", 1)
+    padding = L.params.get("padding", 0)
+    dilation = L.params.get("dilation", 1)
+    groups = L.params.get("groups", 1)
     
     # Input/output shape information
-    input_shape = L.meta["input_shape"]   # [batch, channels, width]
-    output_shape = L.meta["output_shape"] # [batch, out_channels, out_w]
+    input_shape = L.params["input_shape"]   # [batch, channels, width]
+    output_shape = L.params["output_shape"] # [batch, out_channels, out_w]
     
     # Convert to equivalent linear transformation matrix
     W_equiv = _conv1d_to_linear_matrix(
@@ -561,14 +561,14 @@ def tf_conv3d(L: Layer, Bin: Bounds) -> Fact:
     # Extract convolution parameters
     weight = L.params["weight"]  # [out_channels, in_channels, kernel_d, kernel_h, kernel_w]
     bias = L.params.get("bias", None)
-    stride = L.meta.get("stride", 1)
-    padding = L.meta.get("padding", 0)
-    dilation = L.meta.get("dilation", 1)
-    groups = L.meta.get("groups", 1)
+    stride = L.params.get("stride", 1)
+    padding = L.params.get("padding", 0)
+    dilation = L.params.get("dilation", 1)
+    groups = L.params.get("groups", 1)
     
     # Input/output shape information
-    input_shape = L.meta["input_shape"]   # [batch, channels, depth, height, width]
-    output_shape = L.meta["output_shape"] # [batch, out_channels, out_d, out_h, out_w]
+    input_shape = L.params["input_shape"]   # [batch, channels, depth, height, width]
+    output_shape = L.params["output_shape"] # [batch, out_channels, out_d, out_h, out_w]
     
     # Convert to equivalent linear transformation matrix
     W_equiv = _conv3d_to_linear_matrix(
@@ -610,15 +610,15 @@ def tf_convtranspose2d(L: Layer, Bin: Bounds) -> Fact:
     # Extract parameters
     weight = L.params["weight"]  # [in_channels, out_channels, kernel_h, kernel_w]
     bias = L.params.get("bias", None)
-    stride = L.meta.get("stride", 1)
-    padding = L.meta.get("padding", 0)
-    output_padding = L.meta.get("output_padding", 0)
-    dilation = L.meta.get("dilation", 1)
-    groups = L.meta.get("groups", 1)
+    stride = L.params.get("stride", 1)
+    padding = L.params.get("padding", 0)
+    output_padding = L.params.get("output_padding", 0)
+    dilation = L.params.get("dilation", 1)
+    groups = L.params.get("groups", 1)
     
     # Input/output shape information
-    input_shape = L.meta["input_shape"]
-    output_shape = L.meta["output_shape"]
+    input_shape = L.params["input_shape"]
+    output_shape = L.params["output_shape"]
     
     # Convert to equivalent linear transformation matrix
     W_equiv = _convtranspose2d_to_linear_matrix(
@@ -656,14 +656,14 @@ def tf_convtranspose2d(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B_output, C)
 
 def tf_upsample(L: Layer, Bin: Bounds) -> Fact:
-    in_shape = tuple(L.meta["input_shape"])
+    in_shape = tuple(L.params["input_shape"])
     x_lb = Bin.lb.view(*in_shape)
     x_ub = Bin.ub.view(*in_shape)
 
-    size = L.meta.get("size", None)
-    scale_factor = L.meta.get("scale_factor", None)
-    mode = L.meta.get("mode", "nearest")
-    align_corners = bool(L.meta.get("align_corners", False))
+    size = L.params.get("size", None)
+    scale_factor = L.params.get("scale_factor", None)
+    mode = L.params.get("mode", "nearest")
+    align_corners = bool(L.params.get("align_corners", False))
     assert size is not None or scale_factor is not None, "upsample requires size or scale_factor"
 
     # F.interpolate scale_factor must be float or tuple of float
@@ -682,8 +682,8 @@ def tf_upsample(L: Layer, Bin: Bounds) -> Fact:
         align_corners=align_corners if "linear" in mode else None,
     )
 
-    if "output_shape" in L.meta:
-        expected_shape = tuple(L.meta["output_shape"])
+    if "output_shape" in L.params:
+        expected_shape = tuple(L.params["output_shape"])
         assert tuple(y_lb.shape) == expected_shape, f"upsample output shape mismatch: got {tuple(y_lb.shape)}, expected {expected_shape}"
     assert y_lb.numel() == len(L.out_vars), f"upsample out_vars length {len(L.out_vars)} != output elements {y_lb.numel()}"
 

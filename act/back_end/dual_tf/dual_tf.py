@@ -153,7 +153,7 @@ class DualTF(TransferFunction):
     
     # -------- Backward Handlers --------
     def _backward_dense(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return dual_dense_backward(nu, L.params["W"], L.params.get("b"))
+        return dual_dense_backward(nu, L.params["weight"], L.params.get("bias"))
     
     def _backward_relu(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         bounds = self._bounds_dict.get(L.id)
@@ -169,13 +169,13 @@ class DualTF(TransferFunction):
         return dual_bn_backward(nu, L.params["A"], L.params["c"])
     
     def _backward_conv2d(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        stride, padding = L.meta.get("stride", 1), L.meta.get("padding", 0)
+        stride, padding = L.params.get("stride", 1), L.params.get("padding", 0)
         if isinstance(stride, (list, tuple)): stride = stride[0]
         if isinstance(padding, (list, tuple)): padding = padding[0]
         return dual_conv2d_backward(nu, L.params["weight"], L.params.get("bias"),
                                     stride=stride, padding=padding,
-                                    input_shape=L.meta.get("input_shape"),
-                                    output_shape=L.meta.get("output_shape"))
+                                    input_shape=L.params.get("input_shape"),
+                                    output_shape=L.params.get("output_shape"))
     
     def _backward_identity(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         return dual_identity_backward(nu)

@@ -32,8 +32,7 @@ from act.back_end.core import Layer, Net
 from act.back_end.layer_schema import REGISTRY, LayerKind
 from act.back_end.layer_util import validate_layer
 
-# Version for format compatibility
-SERIALIZATION_VERSION = "1.0"
+SERIALIZATION_VERSION = "2.0"
 
 class ACTSerializationError(Exception):
     """Custom exception for serialization errors."""
@@ -123,7 +122,6 @@ class LayerSerializer:
             "id": layer.id,
             "kind": layer.kind,
             "params": params_encoded,
-            "meta": layer.meta,  # Meta should be JSON-serializable already
             "in_vars": layer.in_vars,
             "out_vars": layer.out_vars,
             "cache": cache_encoded
@@ -131,7 +129,7 @@ class LayerSerializer:
     
     @staticmethod
     def deserialize_layer(layer_dict: Dict[str, Any], target_device: Optional[str] = None) -> Layer:
-        """Convert JSON dictionary to Layer object with proper validation."""
+        """Convert JSON dictionary to Layer object."""
         # Decode tensor parameters
         params_decoded = {}
         for name, value in layer_dict.get("params", {}).items():
@@ -152,13 +150,11 @@ class LayerSerializer:
                 # This is a regular value
                 cache_decoded[name] = value
         
-        # Create Layer object with validation using the schema
         try:
             layer = Layer(
                 id=layer_dict["id"],
                 kind=layer_dict["kind"],
                 params=params_decoded,
-                meta=layer_dict["meta"],
                 in_vars=layer_dict["in_vars"],
                 out_vars=layer_dict["out_vars"],
                 cache=cache_decoded
@@ -174,7 +170,6 @@ class LayerSerializer:
                 layer.id = layer_dict["id"]
                 layer.kind = layer_dict["kind"]
                 layer.params = params_decoded
-                layer.meta = layer_dict["meta"]
                 layer.in_vars = layer_dict["in_vars"]
                 layer.out_vars = layer_dict["out_vars"]
                 layer.cache = cache_decoded
@@ -189,22 +184,11 @@ class NetSerializer:
     """Handles Net serialization/deserialization."""
     
     @staticmethod
-    def serialize_net(net: Net, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def serialize_net(net: Net) -> Dict[str, Any]:
         """Convert Net to JSON-serializable dictionary."""
-        # Serialize all layers
         layers_serialized = []
         for layer in net.layers:
             layers_serialized.append(LayerSerializer.serialize_layer(layer))
-        
-        # Create metadata
-        net_metadata = {
-            "creation_time": datetime.now().isoformat(),
-            "framework_version": f"ACT-{SERIALIZATION_VERSION}",
-            "layer_count": len(net.layers),
-            "layer_kinds": [layer.kind for layer in net.layers]
-        }
-        if metadata:
-            net_metadata.update(metadata)
         
         return {
             "format_version": SERIALIZATION_VERSION,
@@ -213,18 +197,16 @@ class NetSerializer:
                 "graph": {
                     "preds": {str(k): v for k, v in net.preds.items()},
                     "succs": {str(k): v for k, v in net.succs.items()}
-                },
-                "metadata": net_metadata
+                }
             }
         }
     
     @staticmethod
-    def deserialize_net(net_dict: Dict[str, Any], target_device: Optional[str] = None) -> Tuple[Net, Dict[str, Any]]:
-        """Convert JSON dictionary to Net object and metadata with validation."""
-        # Version check
+    def deserialize_net(net_dict: Dict[str, Any], target_device: Optional[str] = None) -> Net:
+        """Convert JSON dictionary to Net object."""
         format_version = net_dict.get("format_version", "unknown")
         if format_version != SERIALIZATION_VERSION:
-            print(f"Warning: Format version mismatch. Expected {SERIALIZATION_VERSION}, got {format_version}")
+            raise ValueError(f"Unsupported format version: {format_version}. Expected {SERIALIZATION_VERSION}")
         
         act_net = net_dict["act_net"]
         
@@ -239,36 +221,22 @@ class NetSerializer:
         preds = {int(k): v for k, v in graph.get("preds", {}).items()}
         succs = {int(k): v for k, v in graph.get("succs", {}).items()}
         
-        # Extract metadata
-        metadata = act_net.get("metadata", {})
-        
         # Create Net object with validation
         try:
-            net = Net(layers=layers, preds=preds, succs=succs)
+            return Net(layers=layers, preds=preds, succs=succs)
         except ValueError as e:
             # If validation fails during deserialization, create the Net
             # without validation for template/example usage
             if "schema violation" in str(e) or "validation" in str(e).lower():
-                print(f"⚠️  Creating example/template net without validation")
-                
-                # Create Net without triggering validation
+                print(f"Warning: Creating net without validation")
                 net = object.__new__(Net)
                 net.layers = layers
                 net.preds = preds
                 net.succs = succs
                 net.by_id = {L.id: L for L in layers}
+                return net
             else:
-                # Re-raise for other types of errors
                 raise
-        
-        # Attach metadata if present
-        if hasattr(net, 'meta'):
-            net.meta = metadata
-        else:
-            # Store metadata in a way that won't interfere with Net structure
-            net._serialization_metadata = metadata
-
-        return net, metadata
 
 class ACTJSONEncoder(json.JSONEncoder):
     """Custom JSON encoder for ACT objects."""
@@ -279,33 +247,25 @@ class ACTJSONEncoder(json.JSONEncoder):
         return super().default(obj)
 
 # High-level API functions
-def save_net_to_file(net: Net, filepath: str, metadata: Optional[Dict[str, Any]] = None, 
-                     indent: int = 2) -> None:
+def save_net_to_file(net: Net, filepath: str, indent: int = 2) -> None:
     """Save ACT Net to JSON file."""
-    net_dict = NetSerializer.serialize_net(net, metadata)
-    
+    net_dict = NetSerializer.serialize_net(net)
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(net_dict, f, indent=indent, ensure_ascii=False, cls=ACTJSONEncoder)
-    
-    print(f"✅ Net saved to {filepath}")
 
-def load_net_from_file(filepath: str, target_device: Optional[str] = None) -> Tuple[Net, Dict[str, Any]]:
-    """Load ACT Net from JSON file with metadata."""
+def load_net_from_file(filepath: str, target_device: Optional[str] = None) -> Net:
+    """Load ACT Net from JSON file."""
     with open(filepath, 'r', encoding='utf-8') as f:
         net_dict = json.load(f)
-    
-    net, metadata = NetSerializer.deserialize_net(net_dict, target_device)
-    print(f"✅ Net loaded from {filepath}")
-    return net, metadata
+    return NetSerializer.deserialize_net(net_dict, target_device)
 
-def save_net_to_string(net: Net, metadata: Optional[Dict[str, Any]] = None, 
-                       indent: int = 2) -> str:
+def save_net_to_string(net: Net, indent: int = 2) -> str:
     """Serialize ACT Net to JSON string."""
-    net_dict = NetSerializer.serialize_net(net, metadata)
+    net_dict = NetSerializer.serialize_net(net)
     return json.dumps(net_dict, indent=indent, ensure_ascii=False, cls=ACTJSONEncoder)
 
-def load_net_from_string(json_str: str, target_device: Optional[str] = None) -> Tuple[Net, Dict[str, Any]]:
-    """Deserialize ACT Net from JSON string with metadata."""
+def load_net_from_string(json_str: str, target_device: Optional[str] = None) -> Net:
+    """Deserialize ACT Net from JSON string."""
     net_dict = json.loads(json_str)
     return NetSerializer.deserialize_net(net_dict, target_device)
 
@@ -336,7 +296,7 @@ def validate_json_schema(net_dict: Dict[str, Any]) -> List[str]:
             errors.append(f"Layer {i} must be a dictionary")
             continue
             
-        required_fields = ["id", "kind", "params", "meta", "in_vars", "out_vars"]
+        required_fields = ["id", "kind", "params", "in_vars", "out_vars"]
         for field in required_fields:
             if field not in layer:
                 errors.append(f"Layer {i} missing required field '{field}'")

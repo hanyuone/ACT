@@ -99,22 +99,22 @@ def seed_from_input_specs(spec_layers) -> Bounds:
     """
     # BOX first
     for L in spec_layers:
-        if L.meta.get("kind") == InKind.BOX and "lb" in L.params and "ub" in L.params:
+        if L.params.get("kind") == InKind.BOX and "lb" in L.params and "ub" in L.params:
             return Bounds(L.params["lb"].clone(), L.params["ub"].clone())
     
     # LINF_BALL next
     for L in spec_layers:
-        if L.meta.get("kind") == InKind.LINF_BALL:
+        if L.params.get("kind") == InKind.LINF_BALL:
             if "lb" in L.params and "ub" in L.params:
                 return Bounds(L.params["lb"].clone(), L.params["ub"].clone())
             center = L.params.get("center")
-            eps = L.meta.get("eps")
+            eps = L.params.get("eps")
             if center is not None and eps is not None:
                 e = torch.tensor(eps, dtype=center.dtype)
                 return Bounds(center - e, center + e)
     
     # LIN_POLY only -> error
-    if any(L.meta.get("kind") == InKind.LIN_POLY for L in spec_layers):
+    if any(L.params.get("kind") == InKind.LIN_POLY for L in spec_layers):
         raise ValueError("LIN_POLY requires a seed box (BOX or LINF_BALL).")
     
     raise ValueError("No valid input specification found for seeding.")
@@ -132,7 +132,7 @@ def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> N
     exported to the solver via export_to_solver() in cons_exportor.py.
     """
     for L in spec_layers:
-        k = L.meta.get("kind")
+        k = L.params.get("kind")
         if k == InKind.BOX:
             globalC.add_box(-1, input_ids, Bounds(L.params["lb"], L.params["ub"]))
         elif k == InKind.LINF_BALL:
@@ -140,7 +140,7 @@ def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> N
                 globalC.add_box(-1, input_ids, Bounds(L.params["lb"], L.params["ub"]))
             else:
                 center = L.params["center"]
-                eps = L.meta["eps"]
+                eps = L.params["eps"]
                 e = torch.tensor(eps, dtype=center.dtype)
                 globalC.add_box(-1, input_ids, Bounds(center - e, center + e))
         elif k == InKind.LIN_POLY:
@@ -152,17 +152,17 @@ def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> N
 def add_negated_assert_to_solver(solver: Solver, out_ids: List[int], assert_layer) -> None:
     """Add the negation of ASSERT property as constraints to solver."""
     from act.back_end.cons_exportor import to_numpy
-    k = assert_layer.meta.get("kind")
+    k = assert_layer.params.get("kind")
     
     if k == OutKind.LINEAR_LE:
         # Property: c·y ≤ d  →  Negation: c·y ≥ d + ε
         coeffs = list(to_numpy(assert_layer.params["c"]))
-        d = float(assert_layer.meta["d"])
+        d = float(assert_layer.params["d"])
         solver.add_lin_ge(out_ids, coeffs, d + 1e-6)
         
     elif k == OutKind.TOP1_ROBUST:
         # Property: y[t] > y[j] for all j≠t  →  Negation: ∃j: y[j] ≥ y[t]
-        t = int(assert_layer.meta["y_true"])
+        t = int(assert_layer.params["y_true"])
         v = solver.n
         solver.add_vars(1)
         for j, oj in enumerate(out_ids):
@@ -172,8 +172,8 @@ def add_negated_assert_to_solver(solver: Solver, out_ids: List[int], assert_laye
         
     elif k == OutKind.MARGIN_ROBUST:
         # Property: y[t] - y[j] > margin for all j≠t  →  Negation: ∃j: y[j] ≥ y[t] - margin
-        t = int(assert_layer.meta["y_true"])
-        margin = float(assert_layer.meta["margin"])
+        t = int(assert_layer.params["y_true"])
+        margin = float(assert_layer.params["margin"])
         v = solver.n
         solver.add_vars(1)
         for j, oj in enumerate(out_ids):

@@ -21,9 +21,9 @@ from act.back_end.core import Bounds, Fact, Layer, ConSet
 @torch.no_grad()
 def hybridz_tf_dense(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for dense/linear layers with zonotope precision."""
-    # Extract parameters
-    W = L.params["W"]  # (out_features, in_features)
-    b = L.params.get("b", None)
+    # Extract parameters (names aligned with PyTorch)
+    W = L.params["weight"]  # (out_features, in_features)
+    b = L.params.get("bias", None)
     
     # Apply linear transformation with HybridZ operations
     # For now, use interval arithmetic as base implementation
@@ -126,7 +126,7 @@ def hybridz_tf_relu(L: Layer, Bin: Bounds) -> Fact:
 @torch.no_grad()
 def hybridz_tf_lrelu(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for LeakyReLU."""
-    alpha = float(L.meta.get("negative_slope", 0.01))
+    alpha = float(L.params.get("negative_slope", 0.01))
 
     # Determine phases
     idx_on = torch.where(Bin.lb >= 0)[0]
