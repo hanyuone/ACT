@@ -60,6 +60,11 @@ jobs:
           python -m act.front_end --list-downloads
           python -m act.front_end --synthesis --creator torchvision
 
+      - name: Generate Networks for Testing
+        run: |
+          cd ${{ github.workspace }}
+          python -m act.back_end --generate --device cpu --dtype float64
+
       - name: Run ACT2Torch Pipeline Tests
         run: |
           cd ${{ github.workspace }}

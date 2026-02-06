@@ -180,19 +180,19 @@ def check_violation_at_point(net, x_np: np.ndarray, assert_layer) -> bool:
     y_mid = ((y_bounds.lb + y_bounds.ub) / 2).cpu().numpy()
     
     # Check violation
-    k = assert_layer.meta.get("kind")
+    k = assert_layer.params.get("kind")
     if k == OutKind.TOP1_ROBUST:
-        t = int(assert_layer.meta["y_true"])
+        t = int(assert_layer.params["y_true"])
         others = [i for i in range(len(y_mid)) if i != t]
         return (y_mid[others] - y_mid[t]).max() >= 0.0
     elif k == OutKind.MARGIN_ROBUST:
-        t = int(assert_layer.meta["y_true"])
-        margin = float(assert_layer.meta["margin"])
+        t = int(assert_layer.params["y_true"])
+        margin = float(assert_layer.params["margin"])
         others = [i for i in range(len(y_mid)) if i != t]
         return (y_mid[others] - y_mid[t]).max() >= margin
     elif k == OutKind.LINEAR_LE:
         c = np.asarray(assert_layer.params["c"], dtype=float)
-        d = float(assert_layer.meta["d"])
+        d = float(assert_layer.params["d"])
         return float(np.dot(c, y_mid)) >= d + 1e-8
     elif k == OutKind.RANGE:
         lb = assert_layer.params.get("lb")

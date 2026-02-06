@@ -184,7 +184,6 @@ def parse_vnnlib_to_specs(
                 kind=OutKind.LINEAR_LE,
                 c=torch.tensor(c, dtype=get_default_dtype()),
                 d=torch.tensor(float(d), dtype=get_default_dtype()),
-                meta={'all_constraints': output_constraints}
             )
         else:
             # If true_label is provided, promote to TOP1_ROBUST
@@ -194,7 +193,6 @@ def parse_vnnlib_to_specs(
                 output_spec = OutputSpec(
                     kind=OutKind.TOP1_ROBUST,
                     y_true=true_label.clone() if isinstance(true_label, torch.Tensor) else torch.tensor([int(true_label)], dtype=torch.int64),
-                    meta={'promoted_from': OutKind.RANGE}
                 )
             else:
                 output_spec = OutputSpec(

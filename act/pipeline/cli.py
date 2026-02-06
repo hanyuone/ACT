@@ -361,7 +361,6 @@ def cmd_fuzz(args):
     overrides = dict(
         max_iterations=args.iterations,
         timeout_seconds=args.timeout,
-        device=args.device,
         save_counterexamples=not args.no_save,
         output_dir=Path(args.output),
         report_interval=args.report_interval,
@@ -371,8 +370,6 @@ def cmd_fuzz(args):
         trace_storage=args.trace_storage,
         trace_output=Path(args.trace_output) if args.trace_output else None,
     )
-    if args.batch_size is not None:
-        overrides['batch_size'] = args.batch_size
     config = FuzzingConfig.from_yaml(**overrides)
     
     # Create spec creator and load data-model pairs
@@ -854,12 +851,6 @@ Examples:
         type=int,
         default=100,
         help="Report progress every N iterations (default: 100)"
-    )
-    fuzz_group.add_argument(
-        "--batch-size",
-        type=int,
-        default=None,
-        help="Fuzzing batch size: number of seeds per iteration (default: from config.yaml)"
     )
     fuzz_group.add_argument(
         "--strict-mode",

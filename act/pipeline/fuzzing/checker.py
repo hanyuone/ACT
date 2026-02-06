@@ -9,7 +9,7 @@ License: AGPLv3+
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional, List, Tuple
 import time
 import torch
 
@@ -32,8 +32,8 @@ class Counterexample:
         kind: Type of violation (TOP1_ROBUST, MARGIN_ROBUST, etc.)
         confidence: Confidence score of the prediction
         timestamp: When the counterexample was found
-        seed_index: Index of the original seed (optional, for tracking)
-        seed_input: Original unperturbed input (optional, for visualization)
+        seed_index: Which VNNLib instance (0..N-1) this counterexample belongs to
+        seed_input: Original unperturbed input (L∞ projection anchor and visualization baseline)
     """
     input: torch.Tensor
     output: torch.Tensor
@@ -116,43 +116,34 @@ class PropertyChecker:
         self,
         inputs: torch.Tensor,
         outputs: torch.Tensor,
-        labels: List[Optional[int]],
-        seed_tensors: Optional[List[torch.Tensor]] = None,
-        seed_indices: Optional[List[int]] = None
-    ) -> List[Optional[Counterexample]]:
+        seeds: 'FuzzingSeed'
+    ) -> Tuple[torch.Tensor, List[Counterexample]]:
         """
         Check B samples for violations in parallel.
         
         Args:
             inputs: Input tensors [B, C, H, W] or [B, D]
             outputs: Model outputs [B, num_classes]
-            labels: List of B ground truth labels (None entries skip checking)
-            seed_tensors: Optional list of original seed tensors
-            seed_indices: Optional list of seed indices
+            seeds: FuzzingSeed batch with labels, original tensors, and indices
         
         Returns:
-            List of B elements, each Counterexample or None
+            Tuple of (violations_mask BoolTensor[B], List[Counterexample] for violations only)
         """
         B = inputs.shape[0]
+        device = outputs.device
         
         if self.spec is None:
-            return [None] * B
+            return (torch.zeros(B, dtype=torch.bool, device=device), [])
         
         handler = self._dispatch.get(self.spec.kind)
         if handler is None:
-            return [None] * B
+            return (torch.zeros(B, dtype=torch.bool, device=device), [])
         
         # Pre-compute label tensors (used by all check methods)
-        device = outputs.device
-        y_true = torch.tensor(
-            [l if l is not None else -1 for l in labels],
-            dtype=torch.long, device=device
-        )
+        y_true = seeds.label.to(device)
         valid_mask = (y_true >= 0)
         
-        return handler(inputs, outputs, y_true, valid_mask,
-                       labels=labels, seed_tensors=seed_tensors,
-                       seed_indices=seed_indices)
+        return handler(inputs, outputs, y_true, valid_mask, seeds=seeds)
     
     def _build_results(
         self,
@@ -162,32 +153,29 @@ class PropertyChecker:
         kind: str,
         actual_values: torch.Tensor,
         confidence_values: torch.Tensor,
-        labels: List[Optional[int]],
-        seed_tensors: Optional[List[torch.Tensor]],
-        seed_indices: Optional[List[int]],
-    ) -> List[Optional[Counterexample]]:
-        """Build Counterexample list from violation mask."""
-        B = inputs.shape[0]
+        seeds: 'FuzzingSeed',
+    ) -> Tuple[torch.Tensor, List[Counterexample]]:
+        """Build Counterexample list from violation mask and return (mask, list)."""
         timestamp = time.time()
         violation_indices = violations_mask.nonzero(as_tuple=True)[0]
         
-        results: List[Optional[Counterexample]] = [None] * B
+        counterexamples: List[Counterexample] = []
         
         for idx in violation_indices:
             i = idx.item()
-            results[i] = Counterexample(
+            counterexamples.append(Counterexample(
                 input=inputs[i].detach().cpu(),
                 output=outputs[i].detach().cpu(),
-                expected=labels[i],
+                expected=int(seeds.label[i].item()),
                 actual=int(actual_values[i].item()),
                 kind=kind,
                 confidence=float(confidence_values[i].item()),
                 timestamp=timestamp,
-                seed_index=seed_indices[i] if seed_indices else None,
-                seed_input=seed_tensors[i].detach().cpu() if seed_tensors else None,
-            )
+                seed_index=int(seeds.original_index[i].item()),
+                seed_input=seeds.original_tensor[i].detach().cpu(),
+            ))
         
-        return results
+        return violations_mask, counterexamples
     
     def _check_top1(
         self,
@@ -195,8 +183,8 @@ class PropertyChecker:
         outputs: torch.Tensor,
         y_true: torch.Tensor,
         valid_mask: torch.Tensor,
-        **kw,
-    ) -> List[Optional[Counterexample]]:
+        seeds: 'FuzzingSeed' = None,
+    ) -> Tuple[torch.Tensor, List[Counterexample]]:
         """Check if top prediction != y_true for B samples."""
         pred_classes = outputs.argmax(dim=1)
         violations_mask = valid_mask & (pred_classes != y_true)
@@ -206,7 +194,7 @@ class PropertyChecker:
         
         return self._build_results(
             inputs, outputs, violations_mask, "TOP1_ROBUST",
-            pred_classes, confidences, **kw)
+            pred_classes, confidences, seeds=seeds)
     
     def _check_margin(
         self,
@@ -215,7 +203,7 @@ class PropertyChecker:
         y_true: torch.Tensor,
         valid_mask: torch.Tensor,
         **kw,
-    ) -> List[Optional[Counterexample]]:
+    ) -> Tuple[torch.Tensor, List[Counterexample]]:
         """Check if margin(y_true) < threshold for B samples."""
         B = inputs.shape[0]
         device = outputs.device
@@ -244,13 +232,13 @@ class PropertyChecker:
         y_true: torch.Tensor,
         valid_mask: torch.Tensor,
         **kw,
-    ) -> List[Optional[Counterexample]]:
+    ) -> Tuple[torch.Tensor, List[Counterexample]]:
         """Check if outputs are outside [lb, ub] bounds for B samples."""
         B = inputs.shape[0]
         device = outputs.device
         
         if self.spec.lb is None or self.spec.ub is None:
-            return [None] * B
+            return (torch.zeros(B, dtype=torch.bool, device=device), [])
         
         lb = self._to_tensor(self.spec.lb, device)
         ub = self._to_tensor(self.spec.ub, device)
@@ -273,13 +261,13 @@ class PropertyChecker:
         y_true: torch.Tensor,
         valid_mask: torch.Tensor,
         **kw,
-    ) -> List[Optional[Counterexample]]:
+    ) -> Tuple[torch.Tensor, List[Counterexample]]:
         """Check if linear constraint c^T y <= d is violated for B samples."""
         B = inputs.shape[0]
         device = outputs.device
         
         if self.spec.c is None or self.spec.d is None:
-            return [None] * B
+            return (torch.zeros(B, dtype=torch.bool, device=device), [])
         
         c = self.spec.c.to(device)
         d = float(self.spec.d)

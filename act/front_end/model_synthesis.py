@@ -240,8 +240,7 @@ def synthesize_models_from_specs(
     # even when model_name differs per instance (e.g., VNNLib prop_idx names).
     # -------------------------------------------------------------------------
     groups: Dict[Tuple, List] = defaultdict(list)
-    models: Dict[int, nn.Module] = {}            # id(model) -> model
-    model_names: Dict[int, str] = {}             # id(model) -> representative name
+    models: Dict[int, Tuple[nn.Module, str]] = {}  # id(model) -> (model, model's representative_name)
     
     for data_source, model_name, pytorch_model, labeled_tensors, spec_pairs in spec_results:
         if not labeled_tensors or not spec_pairs:
@@ -249,9 +248,8 @@ def synthesize_models_from_specs(
         
         # Group by model identity (id(pytorch_model)) instead of model_name
         mid = id(pytorch_model)
-        models[mid] = pytorch_model
-        if mid not in model_names:
-            model_names[mid] = model_name  # keep first name as representative
+        if mid not in models:
+            models[mid] = (pytorch_model, model_name)  # keep first name as representative
         sps = len(spec_pairs) // len(labeled_tensors) if labeled_tensors else 1
         
         for idx, (in_spec, out_spec) in enumerate(spec_pairs):
@@ -265,9 +263,9 @@ def synthesize_models_from_specs(
     synthesis_models: Dict[Tuple[str, str, str, str], nn.Module] = {}
     for gkey, grouped_specs in groups.items():
         data_src, mid, in_kind, out_kind = gkey
-        pytorch_model = models[mid]
+        pytorch_model, rep_name = models[mid]
         # Use representative model_name for the display key
-        display_key = (data_src, model_names[mid], in_kind, out_kind)
+        display_key = (data_src, rep_name, in_kind, out_kind)
         vm = _build_batched_model(display_key, grouped_specs, pytorch_model)
         synthesis_models[display_key] = vm
     

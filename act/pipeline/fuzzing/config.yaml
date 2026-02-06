@@ -4,7 +4,6 @@ fuzzing:
   # Execution parameters
   max_iterations: 10000
   timeout_seconds: 3600.0  # 1 hour
-  batch_size: 32  # Number of seeds processed per fuzzing iteration
   
   coverage_strategy: "BestInputCov"  # "BestInputCov: Best-input coverage" or "GlobalCov: global coverage"
   activation_threshold: 0.1  # Neuron activation threshold
@@ -47,9 +46,6 @@ fuzzing:
   
   # Seed selection
   seed_selection_strategy: "energy"  # or "random"
-  
-  # Device
-  device: "cuda"  # or "cpu"
   
   # Output
   save_counterexamples: true

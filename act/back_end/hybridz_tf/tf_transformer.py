@@ -23,8 +23,8 @@ from act.back_end.core import Bounds, Fact, Layer, ConSet
 def hybridz_tf_layernorm(L: Layer, Bin: Bounds) -> Fact:
     """HybridZ transfer function for layer normalization with enhanced precision."""
     # Layer norm parameters
-    normalized_shape = L.meta.get("normalized_shape")
-    eps = float(L.meta.get("eps", 1e-5))
+    normalized_shape = L.params.get("normalized_shape")
+    eps = float(L.params.get("eps", 1e-5))
     weight = L.params.get("weight")
     bias = L.params.get("bias")
     
@@ -176,8 +176,8 @@ def hybridz_tf_posenc(L: Layer, Bin: Bounds) -> Fact:
     # PE(pos, 2i) = sin(pos / 10000^(2i/d_model))
     # PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
     
-    max_len = L.meta.get("max_len", 1000)
-    d_model = L.meta.get("d_model", Bin.lb.shape[-1])
+    max_len = L.params.get("max_len", 1000)
+    d_model = L.params.get("d_model", Bin.lb.shape[-1])
     
     # Positional encoding values are bounded by [-1, 1] (sin/cos range)
     # Adding to input bounds
@@ -196,7 +196,7 @@ def hybridz_tf_posenc(L: Layer, Bin: Bounds) -> Fact:
 @torch.no_grad()
 def hybridz_tf_attention_scores(L: Layer, Q_bounds: Bounds, K_bounds: Bounds) -> Fact:
     """HybridZ transfer function for attention score computation: Q @ K^T / sqrt(d_k)."""
-    d_k = L.meta.get("d_k", Q_bounds.lb.shape[-1])
+    d_k = L.params.get("d_k", Q_bounds.lb.shape[-1])
     scale = 1.0 / math.sqrt(d_k)
     
     # Attention scores: QK^T / sqrt(d_k)
