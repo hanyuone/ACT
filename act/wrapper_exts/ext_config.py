@@ -337,12 +337,10 @@ class Dataset:
         
         print(f"[ACT] Data directory: {data_root}")
 
+        from act.util.torchvision_urls import configure_mirror_urls
+        configure_mirror_urls()
+
         if name == 'mnist':
-            # Patch MNIST mirrors: yann.lecun.com is unreliable; use S3 mirror instead.
-            torchvision.datasets.MNIST.mirrors = [
-                "https://ossci-datasets.s3.amazonaws.com/mnist/",
-                "https://storage.googleapis.com/cvdf-datasets/mnist/",
-            ]
             dataset = torchvision.datasets.MNIST(
                 root=data_root, train=False, download=True,
                 transform=transforms.ToTensor())

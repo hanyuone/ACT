@@ -40,6 +40,11 @@ import numpy as np
 from collections import defaultdict
 from act.util.path_config import get_abcrown_path
 
+# Apply MNIST mirrors early: yann.lecun.com is no longer reliably reachable.
+# Must run before any abcrown data-loading code touches torchvision.
+from act.util.torchvision_urls import configure_mirror_urls
+configure_mirror_urls()
+
 # Import ABCrown modules from external library
 sys.path.insert(0, os.path.join(get_abcrown_path(), 'complete_verifier'))
 import arguments
