@@ -235,36 +235,39 @@ def synthesize_models_from_specs(
     print(f"\n🧬 Synthesizing models from {len(spec_results)} spec result(s)...")
     
     # -------------------------------------------------------------------------
-    # Grouping specs by (data_source, model_name, input_kind, output_kind)
+    # Grouping specs by (data_source, model_identity, input_kind, output_kind)
+    # Uses id(pytorch_model) to group instances sharing the same model object,
+    # even when model_name differs per instance (e.g., VNNLib prop_idx names).
     # -------------------------------------------------------------------------
     groups: Dict[Tuple, List] = defaultdict(list)
-    models: Dict[str, nn.Module] = {}
+    models: Dict[int, Tuple[nn.Module, str]] = {}  # id(model) -> (model, model's representative_name)
     
     for data_source, model_name, pytorch_model, labeled_tensors, spec_pairs in spec_results:
         if not labeled_tensors or not spec_pairs:
             continue
         
-        mkey = f"{data_source}:{model_name}"
-        models[mkey] = pytorch_model
+        # Group by model identity (id(pytorch_model)) instead of model_name
+        mid = id(pytorch_model)
+        if mid not in models:
+            models[mid] = (pytorch_model, model_name)  # keep first name as representative
         sps = len(spec_pairs) // len(labeled_tensors) if labeled_tensors else 1
         
         for idx, (in_spec, out_spec) in enumerate(spec_pairs):
             lt = labeled_tensors[min(idx // sps if sps > 0 else 0, len(labeled_tensors) - 1)] 
-            gkey = (data_source, model_name, in_spec.kind, out_spec.kind)  # Batching key to group specs
-            groups[gkey].append((lt, in_spec, out_spec, f"{mkey}:s{idx}"))
+            gkey = (data_source, mid, in_spec.kind, out_spec.kind)
+            groups[gkey].append((lt, in_spec, out_spec, f"{data_source}:{model_name}:s{idx}"))
     
     # -------------------------------------------------------------------------
     # Synthesis Loop: Build batched models from grouped specs
     # -------------------------------------------------------------------------
     synthesis_models: Dict[Tuple[str, str, str, str], nn.Module] = {}
     for gkey, grouped_specs in groups.items():
-        # Extract the specific PyTorch model needed for this group
-        data_src, model_name, in_kind, out_kind = gkey
-        mkey = f"{data_src}:{model_name}"
-        pytorch_model = models[mkey]
-        # Build VerifiableModel
-        vm = _build_batched_model(gkey, grouped_specs, pytorch_model)
-        synthesis_models[gkey] = vm
+        data_src, mid, in_kind, out_kind = gkey
+        pytorch_model, rep_name = models[mid]
+        # Use representative model_name for the display key
+        display_key = (data_src, rep_name, in_kind, out_kind)
+        vm = _build_batched_model(display_key, grouped_specs, pytorch_model)
+        synthesis_models[display_key] = vm
     
     # -------------------------------------------------------------------------
     # Summary: Print statistics and return results

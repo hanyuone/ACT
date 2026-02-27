@@ -358,20 +358,19 @@ def cmd_fuzz(args):
     print()
     
     # Load configuration from YAML with CLI overrides
-    config = FuzzingConfig.from_yaml(
+    overrides = dict(
         max_iterations=args.iterations,
         timeout_seconds=args.timeout,
-        device=args.device,
         save_counterexamples=not args.no_save,
         output_dir=Path(args.output),
         report_interval=args.report_interval,
-        # mutation_weights now loaded from config.yaml
         # Tracing configuration
         trace_level=args.trace_level,
         trace_sample_rate=args.trace_sample,
         trace_storage=args.trace_storage,
-        trace_output=Path(args.trace_output) if args.trace_output else None
+        trace_output=Path(args.trace_output) if args.trace_output else None,
     )
+    config = FuzzingConfig.from_yaml(**overrides)
     
     # Create spec creator and load data-model pairs
     print(f"{'='*80}")

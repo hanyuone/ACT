@@ -2,9 +2,39 @@
 Coverage tracking for ACTFuzzer.
 
 Tracks neuron coverage (method-level metrics) during fuzzing to guide exploration.
-Implements two coverage strategies:
-1. BestInputCov (BIC): per-input mutation threshold coverage (stores only per-input coverage values; a neuron is marked covered once |activation| > threshold. Coverage = (#covered) / (#total neurons)).
-2. GlobalCov (GLC): global union threshold coverage (a neuron stays covered once it exceeds the threshold across all mutated inputs).
+
+## How Coverage Is Collected
+
+1. **Activation Capture**: MutationEngine registers forward hooks on computational layers
+   (ReLU, Linear, Conv2d). During inference, these hooks capture layer activations into
+   an activation_map dict keyed by layer name.
+
+2. **Coverage Update**: After inference, ACTFuzzer calls CoverageTracker.update() with the
+   mutated input and the activation_map. The tracker delegates to the active CoverageStrategy.
+
+3. **Neuron Firing**: A neuron is considered "fired" (covered) if |activation| > threshold.
+   For multi-dimensional activations (e.g., Conv2d [N,C,H,W]), spatial dims are max-pooled
+   to produce per-channel coverage: one neuron per channel.
+
+4. **Coverage Delta**: update() returns (global_delta, interesting_mask) — the coverage
+   improvement and a per-sample BoolTensor marking which samples are interesting.
+   ACTFuzzer uses these for energy computation and corpus scheduling.
+
+## Coverage Strategies
+
+1. **BestInputCov (BIC)**: Per-input coverage tracking. Each input gets its own coverage
+   score (fraction of neurons fired). get_coverage() returns the best (max) per-input
+   coverage seen so far. Does NOT maintain a global union — only individual input scores.
+
+2. **GlobalCov (GLC)**: Global union coverage. A neuron is covered once it fires in ANY
+   input across ALL iterations (monotonic). Coverage state is stored as per-layer
+   BoolTensors on the activation device for O(1) vectorized lookup.
+
+## Statistics
+
+get_stats() returns strategy-specific metrics:
+- BestInputCov: coverage, inputs_seen, last/best/avg input coverage, total neurons, layers
+- GlobalCov: coverage, covered/total neurons, last newly covered count, layers
 
 Copyright (C) 2025 SVF-tools/ACT
 License: AGPLv3+
@@ -12,7 +42,7 @@ License: AGPLv3+
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Set, Tuple, List
+from typing import Any, Dict, Optional, Set, Tuple
 import torch
 import torch.nn as nn
 
@@ -33,8 +63,20 @@ class CoverageStrategy(ABC):
         self.threshold = threshold
 
     @abstractmethod
-    def update(self, input_tensor: torch.Tensor, activations: Dict[str, torch.Tensor]) -> float:
-        """Update coverage with new activations; returns coverage delta (0..1)."""
+    def update(
+        self, input_tensor: torch.Tensor, activations: Dict[str, torch.Tensor]
+    ) -> Tuple[float, torch.Tensor]:
+        """
+        Update coverage with batch activations.
+        
+        Batch-native: processes all N samples in one vectorized call.
+        
+        Returns:
+            (global_delta, interesting_mask) where:
+            - global_delta: overall coverage improvement (float, 0..1)
+            - interesting_mask: BoolTensor of shape (N,), True for samples that
+              contributed to coverage improvement (should be added to corpus)
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -60,26 +102,19 @@ class CoverageStrategy(ABC):
         raise NotImplementedError
 
 
-def _activation_to_neuron_vector(activation: torch.Tensor) -> torch.Tensor:
+def _activation_to_neuron_matrix(activation: torch.Tensor) -> torch.Tensor:
     """
-    Flatten multi-dimensional activations (batch/spatial dims) into 1D vectors,
-    We convert an activation tensor into a per-"neuron" 1D vector (batch=first sample) for coverage calculation.
-    - Linear/ReLU typical: (B, N) -> (N,)
-    - Conv typical: (B, C, H, W) -> (C,) via max abs over spatial dims
-    - Other: flatten (first sample) -> (K,)
+    Convert (N,...) activation tensor to (N, neurons) matrix for coverage.
+    
+    - (N, neurons) [dim==2]: already correct → return as-is
+    - (N, C, H, W) [dim==4]: max-pool spatial dims → (N, C)
+    - Other: flatten all but batch dim → (N, K)
     """
-    a = activation
-    if a.dim() >= 1 and a.size(0) > 0:
-        a0 = a[0]
-    else:
-        a0 = a
-
-    if a.dim() == 4:
-        # a0: (C, H, W)
-        return a0.abs().amax(dim=(1, 2))
-    if a.dim() == 2:
-        return a0.flatten()
-    return a0.flatten()
+    if activation.dim() == 2:
+        return activation  # (N, neurons)
+    if activation.dim() == 4:
+        return activation.abs().amax(dim=(2, 3))  # (N, C)
+    return activation.flatten(start_dim=1)  # (N, K)
 
 
 class BestInputCov(CoverageStrategy):
@@ -87,69 +122,75 @@ class BestInputCov(CoverageStrategy):
     Per-input neuron coverage.
 
     - Each update() computes coverage for that specific input only.
-    - We store per-input coverage values (history), not a global union of covered neurons.
     - get_coverage() returns the best (max) per-input coverage seen so far (monotonic).
     """
 
     def __init__(self, model: nn.Module, threshold: float = 0.1):
         super().__init__(model, threshold)
         self._layer_neuron_counts: Dict[str, int] = {}
-        self.coverage_history: List[float] = []
+        self._inputs_seen: int = 0
+        self._sum_coverage: float = 0.0
         self.last_input_coverage: float = 0.0
         self.best_input_coverage: float = 0.0
 
-    def update(self, input_tensor: torch.Tensor, activations: Dict[str, torch.Tensor]) -> float:
+    def update(
+        self, input_tensor: torch.Tensor, activations: Dict[str, torch.Tensor]
+    ) -> Tuple[float, torch.Tensor]:
         """
-        Update **per-input** neuron coverage (BestInputCov / BIC).
-
-        Conceptually, for the given input we mark a neuron as "covered" if its
-        activation magnitude exceeds `self.threshold` at least once.
-
-        Notes:
-        - `input_tensor` is currently unused by this strategy; it is kept in the
-          interface for future strategies that may need the raw input.
-        - This strategy does NOT maintain a global union of covered neurons.
-          Instead, it computes coverage for this mutated input only, and tracks the best
-          (max) per-input coverage seen so far.
-
+        Update per-input neuron coverage with batch activations.
+        
+        Batch-native: computes coverage for all N samples in one vectorized call.
+        A sample is "interesting" if its individual coverage exceeds the pre-batch best.
+        
         Returns:
-            Coverage delta in [0, 1], defined as:
-            max(0, new_best_input_coverage - old_best_input_coverage).
+            (global_delta, interesting_mask):
+            - global_delta: improvement in best_input_coverage (float)
+            - interesting_mask: BoolTensor (N,), True for samples exceeding previous best
         """
-        covered_this_input: Set[NeuronId] = set()
-
         for layer_name, activation in activations.items():
-            # Convert potentially high-dimensional activation into a 1D neuron vector.
-            vec = _activation_to_neuron_vector(activation)
-            if vec.numel() == 0:
+            mat = _activation_to_neuron_matrix(activation)
+            if mat.numel() == 0:
                 continue
-            # Record total neuron count for this layer (first time we see it).
-            self._layer_neuron_counts.setdefault(layer_name, int(vec.numel()))
-            # Fired neurons are those whose |activation| larger than the threshold.
-            fired = (vec.abs() > float(self.threshold)).nonzero(as_tuple=True)[0].tolist()
-            for idx in fired:
-                covered_this_input.add((layer_name, int(idx)))
-
-        # Coverage for THIS input only: (#covered neurons for this input) / (#total neurons seen so far).
+            self._layer_neuron_counts.setdefault(layer_name, mat.shape[1])
+        
         total_neurons = int(sum(self._layer_neuron_counts.values()))
-        self.last_input_coverage = (len(covered_this_input) / total_neurons) if total_neurons > 0 else 0.0
-        self.coverage_history.append(float(self.last_input_coverage))
-
-        # Track best (max) per-input coverage.
+        if total_neurons == 0:
+            N = input_tensor.shape[0]
+            return 0.0, torch.zeros(N, dtype=torch.bool, device=input_tensor.device)
+        
         old_best = float(self.best_input_coverage)
-        if self.last_input_coverage > self.best_input_coverage:
-            self.best_input_coverage = float(self.last_input_coverage)
-        return max(0.0, float(self.best_input_coverage) - old_best)
+        N = input_tensor.shape[0]
+        
+        total_fired = torch.zeros(N, device=input_tensor.device)
+        for layer_name, activation in activations.items():
+            mat = _activation_to_neuron_matrix(activation)
+            if mat.numel() == 0:
+                continue
+            total_fired += (mat.abs() > float(self.threshold)).sum(dim=1).float()
+        
+        sample_covs = total_fired / total_neurons  # (N,)
+        
+        interesting_mask = sample_covs > old_best
+        
+        # Running stats — single .sum()/.max() reductions, no per-sample .tolist()
+        self._inputs_seen += N
+        self._sum_coverage += float(sample_covs.sum())
+        self.last_input_coverage = float(sample_covs[-1])
+        batch_best = float(sample_covs.max())
+        if batch_best > self.best_input_coverage:
+            self.best_input_coverage = batch_best
+        
+        global_delta = max(0.0, float(self.best_input_coverage) - old_best)
+        return global_delta, interesting_mask
 
     def get_coverage(self) -> float:
         return float(self.best_input_coverage)
 
     def get_stats(self) -> Dict[str, Any]:
-        n = len(self.coverage_history)
-        avg = (sum(self.coverage_history) / n) if n else 0.0
+        avg = (self._sum_coverage / self._inputs_seen) if self._inputs_seen else 0.0
         return {
             "coverage": float(self.get_coverage()),
-            "inputs_seen": int(n),
+            "inputs_seen": self._inputs_seen,
             "last_input_coverage": float(self.last_input_coverage),
             "best_input_coverage": float(self.best_input_coverage),
             "avg_input_coverage": float(avg),
@@ -159,7 +200,8 @@ class BestInputCov(CoverageStrategy):
 
     def reset(self) -> None:
         self._layer_neuron_counts.clear()
-        self.coverage_history.clear()
+        self._inputs_seen = 0
+        self._sum_coverage = 0.0
         self.last_input_coverage = 0.0
         self.best_input_coverage = 0.0
 
@@ -169,94 +211,127 @@ class GlobalCov(CoverageStrategy):
     Global union neuron coverage.
 
     A neuron is covered if it has fired at least once across all inputs.
+    Coverage state is stored as per-layer BoolTensors on the same device as
+    activations, enabling O(1) vectorized lookup instead of Python set iteration.
     """
 
     def __init__(self, model: nn.Module, threshold: float = 0.1):
         super().__init__(model, threshold)
 
-        self.all_neurons: Set[NeuronId] = set()
         self._layer_neuron_counts: Dict[str, int] = {}
-        self.covered_neurons: Set[NeuronId] = set()
+        self._covered_masks: Dict[str, torch.Tensor] = {}
         self.last_newly_covered_count: int = 0
 
-    def _ensure_layer_registered(self, layer_name: str, neuron_count: int) -> None:
+    def _ensure_layer_registered(
+        self, layer_name: str, neuron_count: int, device: torch.device
+    ) -> None:
         neuron_count = int(neuron_count)
         if neuron_count <= 0:
             return
         if layer_name in self._layer_neuron_counts:
             return
         self._layer_neuron_counts[layer_name] = neuron_count
-        for idx in range(neuron_count):
-            self.all_neurons.add((layer_name, idx))
+        self._covered_masks[layer_name] = torch.zeros(
+            neuron_count, dtype=torch.bool, device=device
+        )
 
-    def update(self, input_tensor: torch.Tensor, activations: Dict[str, torch.Tensor]) -> float:
+    def update(
+        self, input_tensor: torch.Tensor, activations: Dict[str, torch.Tensor]
+    ) -> Tuple[float, torch.Tensor]:
         """
-        Update **global union** neuron coverage (GlobalCov / GLC).
-
-        A neuron is considered covered if it has fired at least once across ALL
-        inputs seen so far. Coverage is monotonic non-decreasing.
-
-        Notes:
-        - `input_tensor` is currently unused by this strategy; it is kept in the
-          interface for future strategies that may need the raw input.
-        - We lazily "register" neurons the first time we see a layer, based on
-          the observed activation vector length for that layer.
-
+        Update global union neuron coverage with batch activations.
+        
+        Batch-native: processes all N samples in one call. A sample is "interesting"
+        if it fires any neuron not covered before this batch (AFL-style: any input
+        hitting a new edge is interesting, multiple samples can share credit).
+        
+        All tensor operations stay on input_tensor.device 
+        
         Returns:
-            Coverage delta in [0, 1], defined as:
-            (#newly covered neurons introduced by this update) / (#total registered neurons).
+            (global_delta, interesting_mask):
+            - global_delta: fraction of newly covered neurons (float)
+            - interesting_mask: BoolTensor (N,), True for samples that fire
+              at least one previously-uncovered neuron
         """
-        old_count = len(self.covered_neurons)
-
+        N = input_tensor.shape[0]
+        old_covered = self._total_covered()
+        interesting_mask = torch.zeros(N, dtype=torch.bool, device=input_tensor.device)
+        
         for layer_name, activation in activations.items():
-            # Convert activation into a 1D neuron vector; its length defines neuron_count for this layer.
-            vec = _activation_to_neuron_vector(activation)
-            if vec.numel() == 0:
+            mat = _activation_to_neuron_matrix(activation)  # (N, neurons)
+            if mat.numel() == 0:
                 continue
-            # Register all neurons for this layer on first sight (for total coverage denominator).
-            self._ensure_layer_registered(layer_name, int(vec.numel()))
-            # Add fired neurons to the global covered set (union across all inputs).
-            fired_indices = (vec.abs() > float(self.threshold)).nonzero(as_tuple=True)[0].tolist()
-            for idx in fired_indices:
-                self.covered_neurons.add((layer_name, int(idx)))
+            n_neurons = mat.shape[1]
+            self._ensure_layer_registered(layer_name, n_neurons, device=mat.device)
+            
+            fired_mask = mat.abs() > float(self.threshold)  # (N, neurons)
+            already_covered = self._covered_masks[layer_name]  # (neurons,)
+            
+            fired_any = fired_mask.any(dim=0)  # (neurons,)
+            newly_covered = fired_any & ~already_covered  # (neurons,)
+            
+            if newly_covered.any():
+                # (N, neurons) & (1, neurons) → (N, neurons) → any(dim=1) → (N,)
+                interesting_mask |= (fired_mask & newly_covered.unsqueeze(0)).any(dim=1)
+            
+            # Update coverage mask in-place (bitwise OR)
+            self._covered_masks[layer_name] = already_covered | fired_any
+        
+        new_covered = self._total_covered()
+        self.last_newly_covered_count = new_covered - old_covered
+        total_neurons = self._total_neurons()
+        global_delta = (self.last_newly_covered_count / total_neurons) if total_neurons > 0 else 0.0
+        return global_delta, interesting_mask
 
-        new_count = len(self.covered_neurons)
-        # Newly covered neurons introduced by this update (used for delta).
-        self.last_newly_covered_count = new_count - old_count
-        total_neurons = len(self.all_neurons)
-        return (self.last_newly_covered_count / total_neurons) if total_neurons > 0 else 0.0
+    def _total_covered(self) -> int:
+        return sum(int(m.sum()) for m in self._covered_masks.values())
+
+    def _total_neurons(self) -> int:
+        return sum(self._layer_neuron_counts.values())
 
     def get_coverage(self) -> float:
-        total_neurons = len(self.all_neurons)
-        if total_neurons == 0:
+        total = self._total_neurons()
+        if total == 0:
             return 0.0
-        return len(self.covered_neurons) / total_neurons
+        return self._total_covered() / total
 
     def get_uncovered_neurons(self) -> Set[NeuronId]:
-        return self.all_neurons - self.covered_neurons
+        result: Set[NeuronId] = set()
+        for layer_name, mask in self._covered_masks.items():
+            for idx in (~mask).nonzero(as_tuple=True)[0].tolist():
+                result.add((layer_name, int(idx)))
+        return result
 
     def get_covered_neurons(self) -> Set[NeuronId]:
-        return self.covered_neurons.copy()
+        result: Set[NeuronId] = set()
+        for layer_name, mask in self._covered_masks.items():
+            for idx in mask.nonzero(as_tuple=True)[0].tolist():
+                result.add((layer_name, int(idx)))
+        return result
 
     def get_stats(self) -> Dict[str, Any]:
         return {
             "coverage": float(self.get_coverage()),
-            "covered_neurons": int(len(self.covered_neurons)),
-            "total_neurons": int(len(self.all_neurons)),
+            "covered_neurons": self._total_covered(),
+            "total_neurons": self._total_neurons(),
             "last_newly_covered": int(self.last_newly_covered_count),
             "layers_seen": int(len(self._layer_neuron_counts)),
         }
 
     def reset(self) -> None:
-        self.covered_neurons.clear()
-        self.all_neurons.clear()
+        self._covered_masks.clear()
         self._layer_neuron_counts.clear()
         self.last_newly_covered_count = 0
 
 class CoverageTracker:
     """
-    Coverage "engine" that owns multiple coverage strategies `CoverageTracker` delegates to a chosen strategy.
+    Coverage engine that delegates to coverage strategies.
+    
+    Supports runtime strategy switching via update(strategy=...).
+    Strategies are lazily initialized on first use.
     """
+
+    _REGISTRY = {"BestInputCov": BestInputCov, "GlobalCov": GlobalCov}
 
     def __init__(
         self,
@@ -266,47 +341,58 @@ class CoverageTracker:
     ):
         self.model = model
         self.threshold = threshold
-
-        # Initialize coverage strategies
-        bic = BestInputCov(model=model, threshold=threshold)
-        glc = GlobalCov(model=model, threshold=threshold)
-
-        # Canonical strategy names, a placeholder for future dynamic strategy registration
-        self.strategies: Dict[str, CoverageStrategy] = {"BestInputCov": bic, "GlobalCov": glc}
-
-        if strategy not in self.strategies:
-            raise ValueError(f"Unknown coverage strategy '{strategy}'. Valid: {list(self.strategies.keys())}")
         self.strategy = strategy
+        self._strategies: Dict[str, CoverageStrategy] = {}
+        
+        if strategy not in self._REGISTRY:
+            raise ValueError(f"Unknown coverage strategy '{strategy}'. Valid: {list(self._REGISTRY.keys())}")
+
+    def _get_strategy(self, name: str) -> CoverageStrategy:
+        """Get or create strategy by name (lazy init)."""
+        if name not in self._strategies:
+            if name not in self._REGISTRY:
+                raise ValueError(f"Unknown coverage strategy '{name}'. Valid: {list(self._REGISTRY.keys())}")
+            self._strategies[name] = self._REGISTRY[name](model=self.model, threshold=self.threshold)
+        return self._strategies[name]
 
     def update(
         self,
         input_tensor: torch.Tensor,
         activations: Dict[str, torch.Tensor],
-        strategy: Optional[str] = None,
+        strategy: Optional[str] = None
+    ) -> Tuple[float, torch.Tensor]:
+        """
+        Update coverage with activations from a fuzzing iteration.
         
-    ) -> float:
+        Batch-native: processes all N samples in one vectorized call.
+        Called by ACTFuzzer after each inference.
         
-        s = self.strategy if strategy is None else strategy
-        if s not in self.strategies:
-            raise ValueError(f"Unknown coverage strategy '{s}'. Valid: {list(self.strategies.keys())}")
-        return self.strategies[s].update(input_tensor, activations)
+        Args:
+            input_tensor: Mutated input batch [N, ...]
+            activations: Dict of layer activations from MutationEngine hooks
+            strategy: Override default strategy for this call (optional)
+        
+        Returns:
+            (global_delta, interesting_mask):
+            - global_delta: overall coverage improvement (float, 0..1)
+            - interesting_mask: BoolTensor (N,), True for interesting samples
+        """
+        s = strategy if strategy is not None else self.strategy
+        return self._get_strategy(s).update(input_tensor, activations)
 
-    def get_coverage(self) -> float:
-        return self.strategies[self.strategy].get_coverage()
+    def get_coverage(self, strategy: Optional[str] = None) -> float:
+        s = strategy if strategy is not None else self.strategy
+        return self._get_strategy(s).get_coverage()
 
-    def get_stats(self) -> Dict[str, Any]:
-        base = {
-            "strategy": self.strategy,
-            "available_strategies": ["BestInputCov", "GlobalCov"],
-        }
-        return {**base, **self.strategies[self.strategy].get_stats()}
+    def get_stats(self, strategy: Optional[str] = None) -> Dict[str, Any]:
+        s = strategy if strategy is not None else self.strategy
+        return {"strategy": s, **self._get_strategy(s).get_stats()}
 
-    # Convenience delegation for strategies that support uncovered/covered queries
-    def get_uncovered_neurons(self) -> Set[NeuronId]:
-        strat = self.strategies[self.strategy]
-        return strat.get_uncovered_neurons()
+    def get_uncovered_neurons(self, strategy: Optional[str] = None) -> Set[NeuronId]:
+        s = strategy if strategy is not None else self.strategy
+        return self._get_strategy(s).get_uncovered_neurons()
 
-    def get_covered_neurons(self) -> Set[NeuronId]:
-        strat = self.strategies[self.strategy]
-        return strat.get_covered_neurons()
+    def get_covered_neurons(self, strategy: Optional[str] = None) -> Set[NeuronId]:
+        s = strategy if strategy is not None else self.strategy
+        return self._get_strategy(s).get_covered_neurons()
 

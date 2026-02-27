@@ -8,6 +8,16 @@ Gradient-guided now accommodates two mutated input generation methods: FGSM (Fas
     1) FGSM: single-step gradient-based perturbation.
     2) PGD: iterative gradient-based perturbation.
 
+## Batch Tensor-Based Mutation
+
+All mutation strategies operate on batched inputs [B, C, H, W] for GPU parallelism.
+The MutationEngine selects a single strategy per batch and applies it to all seeds
+simultaneously, enabling efficient gradient computation (FGSM/PGD) across the batch.
+The batch size is aligned with model synthesis (N VNNLib instances), so InputSpec bounds
+are already [N, ...] and match the batch dimension directly. After mutation, projection
+ensures each sample respects its InputSpec bounds (BOX per-sample bounds via original_index,
+or LINF_BALL eps-ball around each seed's original_tensor).
+
 ## Adaptive Perturbation Sizing
 
 NOTE: We use "perturb_size" (not "epsilon") to avoid confusion with InputSpec.eps (L∞ radius).
@@ -63,15 +73,17 @@ License: AGPLv3+
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import Dict, Optional, Union, TYPE_CHECKING
+from typing import Dict, List, Optional, Union, TYPE_CHECKING
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
 from act.front_end.specs import InputSpec, InKind
-from act.front_end.spec_creator_base import LabeledInputTensor
 from act.util.device_manager import get_default_device
+
+if TYPE_CHECKING:
+    from act.pipeline.fuzzing.corpus import FuzzingSeed
 
 
 class MutationStrategy(ABC):
@@ -190,15 +202,17 @@ class PGDMutation(MutationStrategy):
         """Apply PGD mutation.
         
         Args:
-            input_tensor: Seed input tensor
+            input_tensor: Seed input tensor [B, C, H, W] or [1, C, H, W]
             model: Model for gradient computation
             activations: Activations from previous inference (unused by PGD)
-            label: Ground truth label for cross-entropy loss (if None, uses variance loss)
+            label: Tensor[B] int64, -1 = no label. Uses cross-entropy loss when
+                   any label >= 0, otherwise maximizes output variance.
         
         Returns:
-            Adversarially perturbed input tensor
+            Adversarially perturbed input tensor [B, C, H, W]
         """
         x0 = input_tensor.detach()
+        B = x0.shape[0]
 
         perturb_size = self.perturb_size.to(input_tensor.device) if isinstance(self.perturb_size, torch.Tensor) else self.perturb_size
         x_low = x0 - perturb_size
@@ -232,16 +246,16 @@ class PGDMutation(MutationStrategy):
                 output = output['output']
 
             # Loss selection based on label availability
-            if label is not None:
+            # label is a Tensor[B] int64, -1 = no label
+            has_labels = label is not None and (label >= 0).any()
+            if has_labels:
                 # Cross-entropy loss: maximize CE to flip prediction (adversarial attack)
-                # Output should have batch dimension from model forward pass
                 assert output.dim() >= 2, (
                     f"Model output should have batch dimension, got shape {output.shape}. "
                     f"Ensure model outputs include batch dimension."
                 )
-                # Extract scalar from label tensor (batch-native: label is now 1-D tensor)
-                label_scalar = int(label[0]) if isinstance(label, torch.Tensor) else int(label)
-                target = torch.full((output.shape[0],), label_scalar, dtype=torch.long, device=get_default_device())
+                # Replace -1 (no label) with 0 (won't affect gradient much in a batch)
+                target = label.clamp(min=0).to(output.device)
                 loss = F.cross_entropy(output, target)
             else:
                 # If no label is provided, maximize output variance
@@ -368,10 +382,11 @@ class MutationEngine:
     - Weighted random strategy selection
     - Automatic InputSpec projection
     - Activation capture via forward hooks
+    - Single strategy per mutation call for GPU parallelism
     
     Example:
-        >>> engine = MutationEngine(model, input_spec, weights, device)
-        >>> mutated = engine.mutate(seed_tensor)
+        >>> engine = MutationEngine(model, input_spec, weights)
+        >>> mutated = engine.mutate([seed1, seed2])
         >>> activations = engine.get_activation_map()
     """
     
@@ -379,23 +394,21 @@ class MutationEngine:
                  model: nn.Module,
                  input_spec: Optional[InputSpec],
                  weights: Dict[str, float],
-                 device: torch.device,
                  perturb_mode: str = "fixed",
                  perturb_scale: float = 0.1):
         """
         Initialize mutation engine.
         
         Args:
-            model: Model for gradient computation
-            input_spec: InputSpec for constraint projection
+            model: VerifiableModel (or core model) for gradient computation
+            input_spec: InputSpec for constraint projection (batched bounds from model synthesis)
             weights: Strategy weights (e.g., {"gradient": 0.4, "random": 0.1})
-            device: Torch device
             perturb_mode: Perturbation size computation mode ("adaptive_scalar", "adaptive_perdim", "fixed")
             perturb_scale: Fraction of range per mutation perturbation (e.g., 0.1 = 10% = ~10 steps to traverse)
         """
         self.model = model
         self.input_spec = input_spec
-        self.device = device
+        self.device = get_default_device()
         self.perturb_mode = perturb_mode
         self.perturb_scale = perturb_scale
         
@@ -426,9 +439,9 @@ class MutationEngine:
         # Statistics
         self.total_mutations = 0
         self.activation_map: Dict[str, torch.Tensor] = {}
-        self.last_strategy: Optional[str] = None  # NEW: track last mutation strategy
-        self.last_gradients: Optional[Dict[str, torch.Tensor]] = None  # NEW: for Level 3 tracing
-        self.last_loss: Optional[float] = None  # NEW: for Level 3 tracing
+        self.last_strategy: Optional[str] = None  # Track last mutation strategy for tracing
+        self.last_gradients: Optional[Dict[str, torch.Tensor]] = None  # For Level 3 tracing: gradient capture
+        self.last_loss: Optional[float] = None  # For Level 3 tracing: loss value capture
         
         # Setup hooks for activation capture
         self._setup_hooks()
@@ -465,40 +478,41 @@ class MutationEngine:
                 - perturb_scale=0.2  → 20% per perturbation → ~5 steps to traverse
                 - perturb_scale=0.05 → 5% per perturbation  → ~20 steps to traverse
         """
+        # Legacy fixed perturbation sizes (backward compatibility)
         if self.perturb_mode == "fixed":
-            # Legacy fixed perturbation sizes (backward compatibility)
             print(f"[MutationEngine] Using fixed perturb_size mode (legacy)")
             print(f"  - Gradient/Activation perturb_size: 0.01")
             print(f"  - Boundary/Random perturb_size: 0.005")
-            return 0.01  # Default for gradient/activation (will be halved for boundary/random)
+            return 0.01
         
         if self.input_spec is None:
             print(f"[MutationEngine] No InputSpec provided, falling back to fixed perturb_size=0.01")
             return 0.01
         
         # Extract bounds based on InputSpec kind
+        # BOX: explicit lb/ub bounds define the feasible region directly
+        # LINF_BALL: feasible region is [center - eps, center + eps] (L∞ ball around center)
         if self.input_spec.kind == InKind.BOX:
+            # BOX constraints: lb and ub are directly specified
             lb = self.input_spec.lb
             ub = self.input_spec.ub
         elif self.input_spec.kind == InKind.LINF_BALL:
-            # For L∞ ball, range is 2*eps around center
-            # Note: InputSpec.eps is the L∞ radius (constraint boundary), different from mutation perturb_size
+            # L∞ ball constraints: range is 2*eps around center point
+            # The feasible region is all points x such that ||x - center||_∞ <= eps
             lb = self.input_spec.center - self.input_spec.eps
             ub = self.input_spec.center + self.input_spec.eps
         else:
-            # LIN_POLY or other unsupported kinds
             print(f"[MutationEngine] Unsupported InputSpec kind '{self.input_spec.kind}', falling back to fixed perturb_size=0.01")
             return 0.01
         
-        # Compute range
-        range_tensor = ub - lb  # Shape: same as input tensor
+        # Compute range for perturbation scaling
+        range_tensor = ub - lb
         
+        # Compute single perturb_size from mean range
         if self.perturb_mode == "adaptive_scalar":
-            # Compute single perturb_size from mean range
             mean_range = range_tensor.mean().item()
             perturb_size = mean_range * self.perturb_scale
             
-            # Diagnostic output
             print(f"[MutationEngine] Adaptive Scalar Perturbation Size:")
             print(f"  - perturb_scale: {self.perturb_scale} (fraction of range per perturbation)")
             print(f"  - mean_range: {mean_range:.6f}")
@@ -508,11 +522,10 @@ class MutationEngine:
             
             return perturb_size
         
+        # Compute per-dimension perturb_size tensor
         elif self.perturb_mode == "adaptive_perdim":
-            # Compute per-dimension perturb_size tensor
             perturb_size_tensor = range_tensor * self.perturb_scale
             
-            # Diagnostic output
             print(f"[MutationEngine] Adaptive Per-Dimension Perturbation Size:")
             print(f"  - perturb_scale: {self.perturb_scale} (fraction of range per perturbation)")
             print(f"  - range shape: {range_tensor.shape}")
@@ -540,103 +553,119 @@ class MutationEngine:
             
             return hook
         
-        # Register hooks on computational layers
+        # Register hooks on computational layers (ReLU, Linear, Conv2d)
         for name, module in self.model.named_modules():
             if isinstance(module, (nn.ReLU, nn.Linear, nn.Conv2d)):
                 module.register_forward_hook(make_hook(name))
                 
-    def mutate(self, labeled_tensor: 'LabeledInputTensor') -> torch.Tensor:
+    def mutate(self, seeds: 'FuzzingSeed') -> torch.Tensor:
         """
-        Apply random mutation strategy and project to InputSpec.
+        Apply mutation to seeds.
+        
+        A single strategy is selected for all seeds, enabling GPU parallelism
+        for gradient-based strategies (FGSM/PGD).
         
         Args:
-            labeled_tensor: LabeledInputTensor containing input tensor and ground truth label.
-                           Label is used for targeted attacks (e.g., PGD with cross-entropy loss).
+            seeds: FuzzingSeed batch with .tensor [B,C,H,W] and .label [B] int64 (-1=no label)
         
         Returns:
-            Mutated input satisfying InputSpec constraints
+            Mutated tensor [B, C, H, W] satisfying InputSpec constraints
         """
-        # Extract tensor and label from labeled_tensor
-        input_tensor = labeled_tensor.tensor
-        label = labeled_tensor.label
+        if not seeds:
+            raise ValueError("Empty seed batch")
         
-        # Select strategy
+        B = len(seeds)
+        
+        # Use batch tensor directly: [B, C, H, W]
+        batch_input = seeds.tensor.to(self.device)
+        labels = seeds.label.to(self.device)
+        
+        # Select strategy (same for all samples)
         strategy_names = list(self.weights.keys())
         strategy_probs = list(self.weights.values())
         strategy_name = np.random.choice(strategy_names, p=strategy_probs)
         strategy = self.strategies[strategy_name]
         
-        # NEW: Store strategy for tracing
+        # Store strategy for tracing
         self.last_strategy = strategy_name
         
-        # Apply mutation (pass label for strategies that support it, e.g., PGD)
-        input_device = input_tensor.to(self.device)
+        # Apply mutation
         mutated = strategy.mutate(
-            input_device,
+            batch_input,
             self.model,
             self.activation_map,
-            label=label
+            label=labels
         )
         
         # Project to InputSpec constraints
-        mutated = self._project(mutated)
+        mutated = self._project(mutated, seeds)
         
-        self.total_mutations += 1
+        self.total_mutations += B
         return mutated
     
-    def _project(self, tensor: torch.Tensor) -> torch.Tensor:
+    def _project(self, tensor: torch.Tensor, seeds: 'Optional[FuzzingSeed]' = None) -> torch.Tensor:
         """
-        Project tensor to satisfy InputSpec constraints.
+        Project mutated tensor back into the feasible region defined by InputSpec constraints.
         
-        Supports:
-        - BOX: Clip to [lb, ub]
-        - LINF_BALL: Clamp to L∞ ball around center
-        - LIN_POLY: (TODO) Project to linear polytope
+        Since fuzzing batch size is aligned with model synthesis (N VNNLib instances),
+        the InputSpec bounds (lb/ub) are already [N, ...] and match the batch dimension directly.
         
-        Note: InputSpec bounds should always match tensor shape (enforced by spec creators).
+        **BOX (InKind.BOX)**:
+            Clamps to per-sample lb/ub bounds from InputSpec (already batch-aligned).
+            Uses seeds.original_index tensor to gather correct per-sample bounds.
+        
+        **LINF_BALL (InKind.LINF_BALL)**:
+            Clamps perturbation delta to [-eps, +eps] around each seed's ORIGINAL input,
+            preserving the L∞ distance invariant across mutation chains.
+        
+        **LIN_POLY (InKind.LIN_POLY)**:
+            Not yet implemented — returns tensor unchanged.
+        
+        Args:
+            tensor: Mutated input tensor [B, ...] to project
+            seeds: FuzzingSeed batch with original_index [B] and original_tensor [B, ...]
+        
+        Returns:
+            Projected tensor [B, ...] satisfying InputSpec constraints
         """
         if self.input_spec is None:
             return tensor
         
+        B = tensor.shape[0]
+        
         if self.input_spec.kind == InKind.BOX:
-            # Box constraints: clip to bounds
             lb = self.input_spec.lb.to(tensor.device)
             ub = self.input_spec.ub.to(tensor.device)
             
-            # Verify shape consistency (should be guaranteed by spec creators)
-            assert lb.shape == tensor.shape, (
-                f"Shape mismatch in BOX projection: "
-                f"input_spec.lb.shape={lb.shape} != tensor.shape={tensor.shape}. "
-                f"This indicates a bug in the spec creator - bounds should be reshaped during spec creation."
-            )
-            assert ub.shape == tensor.shape, (
-                f"Shape mismatch in BOX projection: "
-                f"input_spec.ub.shape={ub.shape} != tensor.shape={tensor.shape}. "
-                f"This indicates a bug in the spec creator - bounds should be reshaped during spec creation."
-            )
+            # bounds: use seeds.original_index to gather correct bounds
+            if lb.shape[0] > 1 and seeds is not None:
+                indices = seeds.original_index.clamp(max=lb.shape[0] - 1).to(lb.device)
+                lb = lb[indices]  # (B, ...) vectorized gather
+                ub = ub[indices]
+            elif lb.shape[0] == 1 and B > 1:
+                lb = lb.expand(B, *lb.shape[1:])
+                ub = ub.expand(B, *ub.shape[1:])
+            else:
+                lb = lb[:B]
+                ub = ub[:B]
             
             return torch.clamp(tensor, lb, ub)
         
         elif self.input_spec.kind == InKind.LINF_BALL:
-            # L∞ ball: clamp perturbation to epsilon
-            center = self.input_spec.center.to(tensor.device)
             eps = self.input_spec.eps
             
-            # Verify shape consistency (center has batch dimension matching tensor)
-            assert center.shape == tensor.shape, (
-                f"Shape mismatch in LINF_BALL projection: "
-                f"input_spec.center.shape={center.shape} != tensor.shape={tensor.shape}. "
-                f"This indicates a bug in the spec creator - center should have batch dimension."
-            )
+            assert seeds is not None and len(seeds) == B, \
+                f"LINF_BALL projection requires seeds (got {len(seeds) if seeds else 0}, expected {B})"
+            
+            # Use original_tensor as center to maintain L∞ distance from original
+            center = seeds.original_tensor.to(tensor.device)
             
             delta = tensor - center
             delta = torch.clamp(delta, -eps, eps)
             return center + delta
         
         elif self.input_spec.kind == InKind.LIN_POLY:
-            # Linear polytope: Ax <= b
             # TODO: Implement quadratic programming projection
-            # For now, just return the tensor
             return tensor
         
         return tensor
@@ -656,7 +685,6 @@ class MutationEngine:
     
     def get_stats(self) -> Dict:
         """Get mutation statistics."""
-        # Extract perturb_size info
         perturb_size_info = {}
         for strategy_name, strategy in self.strategies.items():
             perturb_size = strategy.perturb_size

@@ -9,7 +9,7 @@ License: AGPLv3+
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List, Tuple
 import time
 import torch
 
@@ -25,13 +25,15 @@ class Counterexample:
     This is the primary output of ACTFuzzer.
     
     Attributes:
-        input: Input tensor that caused violation
+        input: Input tensor that caused violation (perturbed)
         output: Model's output on this input
         expected: Expected value (e.g., true label)
         actual: Actual value (e.g., predicted label)
         kind: Type of violation (TOP1_ROBUST, MARGIN_ROBUST, etc.)
         confidence: Confidence score of the prediction
         timestamp: When the counterexample was found
+        seed_index: Which VNNLib instance (0..N-1) this counterexample belongs to
+        seed_input: Original unperturbed input (L∞ projection anchor and visualization baseline)
     """
     input: torch.Tensor
     output: torch.Tensor
@@ -40,6 +42,8 @@ class Counterexample:
     kind: str
     confidence: float
     timestamp: float
+    seed_index: Optional[int] = None
+    seed_input: Optional[torch.Tensor] = None
     
     def summary(self) -> str:
         """One-line summary of the counterexample."""
@@ -55,6 +59,8 @@ class Counterexample:
             "kind": self.kind,
             "confidence": self.confidence,
             "timestamp": self.timestamp,
+            "seed_index": self.seed_index,
+            "seed_input": self.seed_input,
         }, path)
     
     @staticmethod
@@ -68,13 +74,19 @@ class Counterexample:
             actual=data["actual"],
             kind=data["kind"],
             confidence=data["confidence"],
-            timestamp=data["timestamp"]
+            timestamp=data["timestamp"],
+            seed_index=data.get("seed_index"),
+            seed_input=data.get("seed_input")
         )
 
 
+# =============================================================================
+# Property Checking
+# =============================================================================
+
 class PropertyChecker:
     """
-    Check OutputSpec violations and record counterexamples.
+    Vectorized property checker for violation detection.
     
     Supports all OutKind types:
     - TOP1_ROBUST: Top prediction must equal true label
@@ -84,181 +96,194 @@ class PropertyChecker:
     
     Example:
         >>> checker = PropertyChecker(output_spec)
-        >>> violation = checker.check(input_tensor, output, label=5)
-        >>> if violation:
-        ...     print(f"Found counterexample: {violation.summary()}")
-        ...     violation.save("counterexample.pt")
+        >>> violations = checker.check(inputs, outputs, labels)
+        >>> # violations is List[Counterexample | None] of length B
     """
     
     def __init__(self, output_spec: Optional[OutputSpec]):
-        """
-        Initialize property checker.
-        
-        Args:
-            output_spec: OutputSpec to check against (None = no checking)
-        """
+        """Initialize property checker."""
         self.spec = output_spec
+        
+        # Dispatch table for spec kinds
+        self._dispatch = {
+            OutKind.TOP1_ROBUST: self._check_top1,
+            OutKind.MARGIN_ROBUST: self._check_margin,
+            OutKind.RANGE: self._check_range,
+            OutKind.LINEAR_LE: self._check_linear,
+        }
     
-    def check(self,
-              input_tensor: torch.Tensor,
-              output: torch.Tensor,
-              label: Optional[int],
-              seed_tensor: Optional[torch.Tensor] = None
-             ) -> Optional[Counterexample]:
+    def check(
+        self,
+        inputs: torch.Tensor,
+        outputs: torch.Tensor,
+        seeds: 'FuzzingSeed'
+    ) -> Tuple[torch.Tensor, List[Counterexample]]:
         """
-        Check if output violates OutputSpec.
+        Check B samples for violations in parallel.
         
         Args:
-            input_tensor: Input that was tested
-            output: Model's output on input_tensor
-            label: Ground truth label (if available)
-            seed_tensor: Original unperturbed input (for distance computation)
+            inputs: Input tensors [B, C, H, W] or [B, D]
+            outputs: Model outputs [B, num_classes]
+            seeds: FuzzingSeed batch with labels, original tensors, and indices
         
         Returns:
-            Counterexample if violation found, None otherwise
+            Tuple of (violations_mask BoolTensor[B], List[Counterexample] for violations only)
         """
-        if self.spec is None or label is None:
-            return None
+        B = inputs.shape[0]
+        device = outputs.device
         
-        # Check based on spec kind
-        if self.spec.kind == OutKind.TOP1_ROBUST:
-            return self._check_top1(input_tensor, output, label)
-        elif self.spec.kind == OutKind.MARGIN_ROBUST:
-            return self._check_margin(input_tensor, output, label)
-        elif self.spec.kind == OutKind.RANGE:
-            return self._check_range(input_tensor, output, label)
-        elif self.spec.kind == OutKind.LINEAR_LE:
-            return self._check_linear(input_tensor, output, label)
+        if self.spec is None:
+            return (torch.zeros(B, dtype=torch.bool, device=device), [])
         
-        return None
+        handler = self._dispatch.get(self.spec.kind)
+        if handler is None:
+            return (torch.zeros(B, dtype=torch.bool, device=device), [])
+        
+        # Pre-compute label tensors (used by all check methods)
+        y_true = seeds.label.to(device)
+        valid_mask = (y_true >= 0)
+        
+        return handler(inputs, outputs, y_true, valid_mask, seeds=seeds)
     
-    def _check_top1(self, 
-                   input_tensor: torch.Tensor,
-                   output: torch.Tensor, 
-                   y_true: int
-                  ) -> Optional[Counterexample]:
-        """
-        Check if top prediction != y_true (misclassification).
+    def _build_results(
+        self,
+        inputs: torch.Tensor,
+        outputs: torch.Tensor,
+        violations_mask: torch.Tensor,
+        kind: str,
+        actual_values: torch.Tensor,
+        confidence_values: torch.Tensor,
+        seeds: 'FuzzingSeed',
+    ) -> Tuple[torch.Tensor, List[Counterexample]]:
+        """Build Counterexample list from violation mask and return (mask, list)."""
+        timestamp = time.time()
+        violation_indices = violations_mask.nonzero(as_tuple=True)[0]
         
-        This is a counterexample for robustness: the model changed its
-        prediction from the true label to a different class.
-        """
-        # Handle both batched and unbatched outputs
-        if output.dim() > 1:
-            pred_class = output.argmax(dim=1).item()
-            logits = output[0]
-        else:
-            pred_class = output.argmax().item()
-            logits = output
+        counterexamples: List[Counterexample] = []
         
-        if pred_class != y_true:
-            # Compute confidence
-            probs = torch.softmax(logits, dim=0)
-            confidence = probs[pred_class].item()
-            
-            return Counterexample(
-                input=input_tensor.detach().cpu(),
-                output=output.detach().cpu(),
-                expected=y_true,
-                actual=pred_class,
-                kind="TOP1_ROBUST",
-                confidence=confidence,
-                timestamp=time.time()
-            )
+        for idx in violation_indices:
+            i = idx.item()
+            counterexamples.append(Counterexample(
+                input=inputs[i].detach().cpu(),
+                output=outputs[i].detach().cpu(),
+                expected=int(seeds.label[i].item()),
+                actual=int(actual_values[i].item()),
+                kind=kind,
+                confidence=float(confidence_values[i].item()),
+                timestamp=timestamp,
+                seed_index=int(seeds.original_index[i].item()),
+                seed_input=seeds.original_tensor[i].detach().cpu(),
+            ))
         
-        return None
+        return violations_mask, counterexamples
     
-    def _check_margin(self,
-                     input_tensor: torch.Tensor,
-                     output: torch.Tensor,
-                     y_true: int
-                    ) -> Optional[Counterexample]:
-        """
-        Check if margin(y_true) < threshold.
+    def _check_top1(
+        self,
+        inputs: torch.Tensor,
+        outputs: torch.Tensor,
+        y_true: torch.Tensor,
+        valid_mask: torch.Tensor,
+        seeds: 'FuzzingSeed' = None,
+    ) -> Tuple[torch.Tensor, List[Counterexample]]:
+        """Check if top prediction != y_true for B samples."""
+        pred_classes = outputs.argmax(dim=1)
+        violations_mask = valid_mask & (pred_classes != y_true)
         
-        Margin = logit[y_true] - max(logit[i] for i != y_true)
-        Counterexample if margin is too small (model not confident enough).
-        """
-        # Handle batched output
-        if output.dim() > 1:
-            logits = output[0]
-        else:
-            logits = output
+        probs = torch.softmax(outputs, dim=1)
+        confidences = probs.gather(1, pred_classes.unsqueeze(1)).squeeze(1)
         
-        true_logit = logits[y_true]
-        
-        # Find runner-up (max logit excluding true class)
-        mask = torch.ones_like(logits, dtype=torch.bool)
-        mask[y_true] = False
-        runner_up_logit = logits[mask].max()
-        
-        margin = (true_logit - runner_up_logit).item()
-        
-        if margin < self.spec.margin:
-            return Counterexample(
-                input=input_tensor.detach().cpu(),
-                output=output.detach().cpu(),
-                expected=y_true,
-                actual=-1,  # Not misclassified, just low margin
-                kind="MARGIN_ROBUST",
-                confidence=margin,
-                timestamp=time.time()
-            )
-        
-        return None
+        return self._build_results(
+            inputs, outputs, violations_mask, "TOP1_ROBUST",
+            pred_classes, confidences, seeds=seeds)
     
-    def _check_range(self,
-                    input_tensor: torch.Tensor,
-                    output: torch.Tensor,
-                    y_true: int
-                   ) -> Optional[Counterexample]:
-        """Check if output is outside [lb, ub] bounds."""
+    def _check_margin(
+        self,
+        inputs: torch.Tensor,
+        outputs: torch.Tensor,
+        y_true: torch.Tensor,
+        valid_mask: torch.Tensor,
+        **kw,
+    ) -> Tuple[torch.Tensor, List[Counterexample]]:
+        """Check if margin(y_true) < threshold for B samples."""
+        B = inputs.shape[0]
+        device = outputs.device
+        num_classes = outputs.shape[1]
+        y_safe = y_true.clamp(min=0)
+        
+        true_logits = outputs.gather(1, y_safe.unsqueeze(1)).squeeze(1)
+        
+        mask = torch.ones(B, num_classes, dtype=torch.bool, device=device)
+        mask.scatter_(1, y_safe.unsqueeze(1), False)
+        runner_up_logits = outputs.masked_fill(~mask, float('-inf')).max(dim=1).values
+        
+        margins = true_logits - runner_up_logits
+        threshold = getattr(self.spec, 'margin', 0.0) or 0.0
+        violations_mask = valid_mask & (margins < threshold)
+        
+        actual = torch.full((B,), -1, dtype=torch.long, device=device)
+        return self._build_results(
+            inputs, outputs, violations_mask, "MARGIN_ROBUST",
+            actual, margins, **kw)
+    
+    def _check_range(
+        self,
+        inputs: torch.Tensor,
+        outputs: torch.Tensor,
+        y_true: torch.Tensor,
+        valid_mask: torch.Tensor,
+        **kw,
+    ) -> Tuple[torch.Tensor, List[Counterexample]]:
+        """Check if outputs are outside [lb, ub] bounds for B samples."""
+        B = inputs.shape[0]
+        device = outputs.device
+        
         if self.spec.lb is None or self.spec.ub is None:
-            return None
+            return (torch.zeros(B, dtype=torch.bool, device=device), [])
         
-        # Check if any output element violates bounds
-        below_lb = (output < self.spec.lb).any()
-        above_ub = (output > self.spec.ub).any()
+        lb = self._to_tensor(self.spec.lb, device)
+        ub = self._to_tensor(self.spec.ub, device)
         
-        if below_lb or above_ub:
-            return Counterexample(
-                input=input_tensor.detach().cpu(),
-                output=output.detach().cpu(),
-                expected=y_true,
-                actual=-1,
-                kind="RANGE",
-                confidence=0.0,
-                timestamp=time.time()
-            )
+        violations_mask = ((outputs < lb) | (outputs > ub)).any(dim=1)
         
-        return None
+        lb_viol = (lb - outputs).clamp(min=0).max(dim=1).values
+        ub_viol = (outputs - ub).clamp(min=0).max(dim=1).values
+        confidences = torch.maximum(lb_viol, ub_viol)
+        
+        actual = torch.full((B,), -1, dtype=torch.long, device=device)
+        return self._build_results(
+            inputs, outputs, violations_mask, "RANGE",
+            actual, confidences, **kw)
     
-    def _check_linear(self,
-                     input_tensor: torch.Tensor,
-                     output: torch.Tensor,
-                     y_true: int
-                    ) -> Optional[Counterexample]:
-        """Check if linear constraint c^T y <= d is violated."""
+    def _check_linear(
+        self,
+        inputs: torch.Tensor,
+        outputs: torch.Tensor,
+        y_true: torch.Tensor,
+        valid_mask: torch.Tensor,
+        **kw,
+    ) -> Tuple[torch.Tensor, List[Counterexample]]:
+        """Check if linear constraint c^T y <= d is violated for B samples."""
+        B = inputs.shape[0]
+        device = outputs.device
+        
         if self.spec.c is None or self.spec.d is None:
-            return None
+            return (torch.zeros(B, dtype=torch.bool, device=device), [])
         
-        # Compute c^T y
-        if output.dim() > 1:
-            y = output[0]
-        else:
-            y = output
+        c = self.spec.c.to(device)
+        d = float(self.spec.d)
         
-        value = torch.dot(self.spec.c.to(y.device), y).item()
+        values = (outputs * c).sum(dim=1)
+        violations_mask = (values > d)
+        confidences = values - d
         
-        if value > self.spec.d:
-            return Counterexample(
-                input=input_tensor.detach().cpu(),
-                output=output.detach().cpu(),
-                expected=y_true,
-                actual=-1,
-                kind="LINEAR_LE",
-                confidence=value - self.spec.d,
-                timestamp=time.time()
-            )
-        
-        return None
+        actual = torch.full((B,), -1, dtype=torch.long, device=device)
+        return self._build_results(
+            inputs, outputs, violations_mask, "LINEAR_LE",
+            actual, confidences, **kw)
+    
+    @staticmethod
+    def _to_tensor(val, device: torch.device) -> torch.Tensor:
+        """Convert value to tensor on device."""
+        if isinstance(val, torch.Tensor):
+            return val.to(device)
+        return torch.tensor(val, device=device)

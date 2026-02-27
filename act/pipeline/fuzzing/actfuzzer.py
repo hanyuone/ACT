@@ -24,8 +24,9 @@ from act.front_end.verifiable_model import InputSpecLayer, OutputSpecLayer
 from act.pipeline.fuzzing.mutations import MutationEngine
 from act.pipeline.fuzzing.coverage import CoverageTracker
 from act.pipeline.fuzzing.corpus import SeedCorpus, FuzzingSeed
-from act.pipeline.fuzzing.checker import PropertyChecker, Counterexample
+from act.pipeline.fuzzing.checker import Counterexample, PropertyChecker
 from act.util.path_config import get_pipeline_log_dir, get_project_root
+from act.util.device_manager import get_default_device
 
 
 @dataclass
@@ -42,7 +43,6 @@ class FuzzingConfig:
         activation_threshold: Neuron activation threshold for coverage tracking
         perturb_mode: Perturbation size computation mode ("adaptive_scalar", "adaptive_perdim", "fixed")
         perturb_scale: Fraction of range per mutation perturbation (e.g., 0.1 = 10% = ~10 steps to traverse)
-        device: Torch device ("cuda" or "cpu")
         save_counterexamples: Whether to save counterexamples incrementally
         output_dir: Output directory for results
         report_interval: Print progress every N iterations
@@ -51,6 +51,9 @@ class FuzzingConfig:
         trace_sample_rate: Capture every Nth iteration (1=all iterations)
         trace_storage: Storage backend ("hdf5" or "json")
         trace_output: Trace output path (None=auto-generate)
+    
+    Device Management:
+        Device is controlled by act.util.device_manager (the single source of truth for the entire ACT pipeline).
     
     Perturbation Size Configuration:
         NOTE: We use "perturb_size" (not "epsilon") to avoid confusion with InputSpec.eps (L∞ radius).
@@ -71,8 +74,8 @@ class FuzzingConfig:
         - steps_to_traverse = 1 / perturb_scale
         - Example: perturb_scale=0.1 → 10% per perturbation → ~10 steps to traverse from lb to ub
     """
-    # NOTE: All configuration values are loaded from config.yaml via from_yaml() class method.
-    # Direct instantiation without from_yaml() is not supported.
+    # All configuration values are loaded from config.yaml via from_yaml().
+    # from_yaml() is the single source of configuration truth.
     max_iterations: int
     timeout_seconds: float
     seed_selection_strategy: str
@@ -81,15 +84,16 @@ class FuzzingConfig:
     activation_threshold: float
     perturb_mode: str
     perturb_scale: float
-    device: str
     save_counterexamples: bool
     output_dir: Path
     report_interval: int
     verbose: int
+    
+    # Tracing configuration
     trace_level: int
     trace_sample_rate: int
     trace_storage: str
-    trace_output: Optional[Path] = None
+    trace_output: Optional[Path]
     
     def __post_init__(self):
         """Normalize output_dir to Path object."""
@@ -171,7 +175,7 @@ class FuzzingReport:
     total_mutations: int
     seeds_explored: int
     num_of_never_activated_neurons: int = 0
-    never_activated_neurons: List[Dict[str, Any]] = field(default_factory=list)
+    never_activated_neurons: List[Tuple[str, int]] = field(default_factory=list)
     
     def save(self, output_dir: Path):
         """Save report and counterexamples to disk."""
@@ -217,10 +221,11 @@ class ACTFuzzer:
     3. Return report with counterexamples
     
     Example:
+        >>> config = FuzzingConfig.from_yaml(max_iterations=5000)
         >>> fuzzer = ACTFuzzer(
         ...     wrapped_model=model,
         ...     initial_seeds=labeled_tensors,
-        ...     config=FuzzingConfig(max_iterations=5000)
+        ...     config=config
         ... )
         >>> report = fuzzer.fuzz()
         >>> print(f"Found {len(report.counterexamples)} violations")
@@ -234,29 +239,45 @@ class ACTFuzzer:
         Initialize ACTFuzzer.
         
         Args:
-            wrapped_model: VerifiableModel from model_synthesis
-                          (contains InputSpecLayer and OutputSpecLayer)
+            wrapped_model: VerifiableModel from model_synthesis.
+                          Contains InputSpecLayer and OutputSpecLayer with batched specs
+                          sized for N VNNLib instances.
             initial_seeds: List of LabeledInputTensor from spec creators
-            config: Fuzzing configuration (uses defaults if None)
+            config: Fuzzing configuration (uses from_yaml() defaults if None)
+        
+        Initialization Steps:
+            1. Load config → from_yaml() or provided FuzzingConfig
+            2. Get device from device_manager → get_default_device()
+            3. Use wrapped model directly → self.model (no spec layer stripping)
+            4. Extract specs → _extract_spec(InputSpecLayer), _extract_spec(OutputSpecLayer)
+            5. Determine batch size → from InputSpec bounds shape[0] (model synthesis N)
+            6. Initialize components → MutationEngine, CoverageTracker, PropertyChecker, SeedCorpus
+            7. Setup tracer → ExecutionTracer (if trace_level > 0)
         """
         self.config = config or FuzzingConfig.from_yaml()
-        self.model = wrapped_model.to(self.config.device)
-        self.device = torch.device(self.config.device)
+        self.device = get_default_device()
         
-        # Extract specs from model
+        # Use wrapped model directly (already on correct device from model_synthesis).
+        # VerifiableModel supports batch inference natively — spec layers check constraints
+        # without modifying tensors, so the batch dimension is consistent throughout.
+        self.model = wrapped_model
+        
+        # Extract specs for MutationEngine (projection) and PropertyChecker (violation detection).
         self.input_spec = self._extract_spec(InputSpecLayer)
         self.output_spec = self._extract_spec(OutputSpecLayer)
+        
+        # Batch size is determined by model synthesis (number of VNNLib instances).
+        self.batch_size = self.input_spec.lb.shape[0] if self.input_spec and self.input_spec.lb is not None else len(initial_seeds)
         
         # Initialize components
         self.mutation_engine = MutationEngine(
             model=self.model,
             input_spec=self.input_spec,
             weights=self.config.mutation_weights,
-            device=self.device,
             perturb_mode=self.config.perturb_mode,
-            perturb_scale=self.config.perturb_scale
+            perturb_scale=self.config.perturb_scale,
         )
-        self.coverage_tracker = CoverageTracker(model=self.model,threshold=self.config.activation_threshold, strategy=self.config.coverage_strategy)
+        self.coverage_tracker = CoverageTracker(model=self.model, threshold=self.config.activation_threshold, strategy=self.config.coverage_strategy)
         self.property_checker = PropertyChecker(self.output_spec)
         self.seed_corpus = SeedCorpus(
             initial_seeds=initial_seeds,
@@ -268,9 +289,17 @@ class ACTFuzzer:
             from act.pipeline.fuzzing.tracer import ExecutionTracer
             
             # Auto-generate trace output path if not specified
-            trace_output = self.config.trace_output or (
-                self.config.output_dir / f"traces.{self._get_trace_ext()}"
-            )
+            # Class-level counter for unique trace filenames across multiple ACTFuzzer instances.
+            # When fuzzing multiple VNNLib instances (one ACTFuzzer per instance), each needs a
+            # distinct trace file (traces_0.json, traces_1.json, ...) to avoid overwriting.
+            if self.config.trace_output is not None:
+                trace_output = self.config.trace_output
+            else:
+                if not hasattr(ACTFuzzer, '_trace_counter'):
+                    ACTFuzzer._trace_counter = 0
+                ext = self._get_trace_ext()
+                trace_output = self.config.output_dir / f"traces_{ACTFuzzer._trace_counter}.{ext}"
+                ACTFuzzer._trace_counter += 1
             
             self.tracer = ExecutionTracer(
                 level=self.config.trace_level,
@@ -289,7 +318,7 @@ class ACTFuzzer:
         self.counterexamples: List[Counterexample] = []
         self.iterations = 0
         self.start_time = 0.0
-        self.never_activated_neurons: List[Dict[str, Any]] = []
+        self.never_activated_neurons: List[Tuple[str, int]] = []
         self.last_report_ce_count = 0  # Track counterexamples count at last report
     
     def _get_trace_ext(self) -> str:
@@ -297,7 +326,7 @@ class ACTFuzzer:
         return {"hdf5": "h5", "json": "json"}[self.config.trace_storage]
     
     def _extract_spec(self, layer_type) -> Optional[InputSpec | OutputSpec]:
-        """Extract spec from wrapper layer."""
+        """Extract spec from wrapper layer by type."""
         for layer in self.model.children():
             if isinstance(layer, layer_type):
                 return layer.spec
@@ -315,126 +344,134 @@ class ACTFuzzer:
         print(f"Inference-based whitebox fuzzing for neural network verification")
         print(f"{'='*80}\n")
         
+        batch_size = self.batch_size
+        
         print(f"🚀 Starting ACTFuzzer with {len(self.seed_corpus)} seeds")
         print(f"   Device: {self.device}")
+        print(f"   Batch size: {batch_size} (from model synthesis)")
         print(f"   Max iterations: {self.config.max_iterations}")
         print(f"   Timeout: {self.config.timeout_seconds}s\n")
         
         self.start_time = time.time()
+        iteration = 0
         
-        for iteration in range(self.config.max_iterations):
-            # Check timeout
+        while iteration < self.config.max_iterations:
             if time.time() - self.start_time > self.config.timeout_seconds:
                 print(f"⏱️  Timeout reached after {iteration} iterations")
                 break
             
-            # Fuzzing iteration
-            self._fuzz_iteration(iteration)
+            # Always use full batch size to match VerifiableModel's spec layer dimensions.
+            # The wrapped model's InputSpecLayer has bounds sized [N, ...] from model synthesis,
+            # so every forward pass must use exactly N inputs.
+            self._fuzz_iteration(iteration, batch_size)
+            iteration += batch_size
             
-            # Periodic reporting
-            if iteration > 0 and iteration % self.config.report_interval == 0:
+            if iteration > 0 and iteration % self.config.report_interval < batch_size:
                 self._print_progress(iteration)
         
         return self._generate_report()
     
-    def _fuzz_iteration(self, iteration: int):
-        """Single fuzzing iteration with optional tracing."""
-        # 1. Select seed
-        seed = self.seed_corpus.select()
+    def _fuzz_iteration(self, start_iteration: int, batch_size: int):
+        """
+        Run one batch-native fuzzing iteration over batch_size samples.
         
-        # 2. Get seed tensor (already has batch dimension)
-        seed_tensor = seed.tensor  # Already (1, C, H, W)
+        All operations use FuzzingSeed batch tensors
         
-        # 3. Mutate with feedback (pass labeled_tensor)
-        candidate = self.mutation_engine.mutate(seed)
-        mutation_strategy = self.mutation_engine.last_strategy
+        Args:
+            start_iteration: Starting iteration number
+            batch_size: Number of samples to process
+        """
+        # 1. select — returns FuzzingSeed batch (B=batch_size)
+        seeds: FuzzingSeed = self.seed_corpus.select(batch_size)
         
-        # 4. Run inference
+        # 2. mutate — takes FuzzingSeed, returns Tensor[B, ...]
+        inputs = self.mutation_engine.mutate(seeds)
+        
+        # 3. inference
         with torch.no_grad():
-            output_dict = self.model(candidate)
+            output = self.model(inputs)
+        outputs = output['output'] if isinstance(output, dict) else output
         
-        # Handle VerifiableModel output (dict) or plain tensor
-        if isinstance(output_dict, dict):
-            output = output_dict['output']
-        else:
-            output = output_dict
-        
-        # 5. Check violation
-        violation = self.property_checker.check(
-            input_tensor=candidate,
-            output=output,
-            label=seed.label,
-            seed_tensor=seed.tensor
+        # 4. violation check — returns (BoolTensor[B], List[Counterexample])
+        violation_mask, counterexamples = self.property_checker.check(
+            inputs=inputs,
+            outputs=outputs,
+            seeds=seeds,
         )
         
-        # 6. Update coverage
+        # 5. coverage update — returns per-sample interestingness mask
         activations = self.mutation_engine.get_activation_map()
-
+        global_delta, cov_interesting = self.coverage_tracker.update(inputs, activations)
         
-        coverage_delta = self.coverage_tracker.update(candidate, activations)
-        coverage = self.coverage_tracker.get_coverage()
+        # 6. energy computation (fully vectorized)
+        interesting_mask = violation_mask | cov_interesting
+        energies = cov_interesting.float() * 10.0 + violation_mask.float() * 100.0
+        energies = torch.clamp(energies, min=0.1)
         
-        # 7. Compute energy
-        if violation or coverage_delta > 0:
-            energy = self._compute_energy(coverage_delta, violation is not None)
-        else:
-            energy = 0.0
+        # 7. counterexamples — already sparse list from checker
+        for ce in counterexamples:
+            self.counterexamples.append(ce)
+            if self.config.verbose >= 2:
+                print(f"🚨 Counterexample #{len(self.counterexamples)}: {ce.summary()}")
+            if self.config.save_counterexamples:
+                self.config.output_dir.mkdir(parents=True, exist_ok=True)
+                ce.save(self.config.output_dir / f"ce_{len(self.counterexamples)}.pt")
         
-        # 8. UNIFIED TRACING HOOK (all levels)
-        if self.tracer and self.tracer.should_trace(iteration):
-            # Collect gradients only if Level 3
+        # 8. Corpus add — batch add with mask (no per-sample loop)
+        child_seeds = FuzzingSeed(
+            tensor=inputs,
+            original_tensor=seeds.original_tensor,
+            original_index=seeds.original_index,
+            label=seeds.label,
+            energy=energies,
+            depth=seeds.depth + 1,
+            parent_id=seeds.id,
+        )
+        self.seed_corpus.add(child_seeds, interesting_mask)
+        
+        # 9. Tracing ( per-sample for detail)
+        if self.tracer:
+            coverage = self.coverage_tracker.get_coverage()
+            mutation_strategy = self.mutation_engine.last_strategy or "unknown"
             gradients = None
             loss_value = None
             if self.config.trace_level >= 3:
                 gradients = self.mutation_engine.get_last_gradients()
                 loss_value = self.mutation_engine.get_last_loss()
             
-            # Single tracing call - tracer handles level-specific storage
-            self.tracer.record_iteration(
-                iteration=iteration,
-                timestamp=time.time(),
-                mutation_strategy=mutation_strategy,
-                violation=violation,
-                coverage=coverage,
-                coverage_delta=coverage_delta,
-                energy=energy,
-                seed_id=seed.id,
-                # Level 1+ data
-                input_before=seed_tensor,
-                input_after=candidate,
-                parent_id=seed.parent_id,
-                depth=seed.depth,
-                # Level 2+ data
-                activations=activations,
-                # Level 3+ data
-                gradients=gradients,
-                loss_value=loss_value
-            )
+            for i in range(batch_size):
+                iteration = start_iteration + i
+                if self.tracer.should_trace(iteration):
+                    # Build per-sample violation for tracer (None if no violation at this index)
+                    violation_at_i = None
+                    if violation_mask[i]:
+                        # Find the counterexample for this index (sparse search)
+                        seed_idx_val = int(seeds.original_index[i].item())
+                        for ce in counterexamples:
+                            if ce.seed_index == seed_idx_val:
+                                violation_at_i = ce
+                                break
+                    
+                    self.tracer.record_iteration(
+                        iteration=iteration,
+                        timestamp=time.time(),
+                        mutation_strategy=mutation_strategy,
+                        violation=violation_at_i,
+                        coverage=coverage,
+                        coverage_delta=global_delta / batch_size,
+                        energy=float(energies[i]),
+                        seed_id=int(seeds.id[i].item()),
+                        input_before=seeds.tensor[i:i+1],
+                        input_after=inputs[i:i+1],
+                        parent_id=int(seeds.parent_id[i].item()),
+                        depth=int(seeds.depth[i].item()),
+                        activations=activations,
+                        gradients=gradients,
+                        loss_value=loss_value,
+                    )
         
-        # 9. Handle results
-        if violation:
-            self.counterexamples.append(violation)
-            # Only print individual counterexamples in debug mode (verbose >= 2)
-            # Regular reporting happens every report_interval in _print_progress
-            if self.config.verbose >= 2:
-                print(f"🚨 Counterexample #{len(self.counterexamples)}: {violation.summary()}")
-            
-            if self.config.save_counterexamples:
-                self.config.output_dir.mkdir(parents=True, exist_ok=True)
-                violation.save(self.config.output_dir / f"ce_{len(self.counterexamples)}.pt")
-        
-        # 10. Add to corpus if interesting
-        if violation or coverage_delta > 0:
-            new_seed = FuzzingSeed(
-                tensor=candidate.cpu(),
-                label=seed.label,
-                energy=energy,
-                depth=seed.depth + 1,
-                parent_id=seed.id
-            )
-            self.seed_corpus.add(new_seed)
-        
-        self.iterations = iteration + 1
+        self.iterations = start_iteration + batch_size
+    
     
     def _compute_energy(self, coverage_delta: float, found_violation: bool) -> float:
         """Compute seed energy (higher = more interesting)."""
@@ -454,17 +491,18 @@ class ACTFuzzer:
         ce_new = ce_total - self.last_report_ce_count
         self.last_report_ce_count = ce_total
         
+        samples_per_sec = iter_per_sec * self.batch_size
         print(f"📊 Iteration {iteration:6d} | "
               f"Coverage: {coverage:6.2%} | "
               f"Seeds: {len(self.seed_corpus):4d} | "
               f"Violations: {ce_total:3d} (+{ce_new}) | "
-              f"Speed: {iter_per_sec:5.1f} it/s")
+              f"Speed: {iter_per_sec:5.1f} it/s ({samples_per_sec:.0f} samples/s)")
     
     def _generate_report(self) -> FuzzingReport:
         """Generate final report."""
         total_time = time.time() - self.start_time
 
-        # Neurons that were never activated across all iterations (per coverage tracker definition)
+        # Neurons that were never activated across all iterations
         never_activated_neurons: List[Tuple[str, int]] = []
         never_activated_count = 0
         try:
@@ -473,7 +511,6 @@ class ACTFuzzer:
             # Deterministic small sample for logs/report
             never_activated_neurons = sorted(list(uncovered))[:20]
         except Exception:
-            # Fallback if tracker doesn't support uncovered queries
             never_activated_count = 0
             never_activated_neurons = []
         

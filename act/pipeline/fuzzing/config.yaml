@@ -47,9 +47,6 @@ fuzzing:
   # Seed selection
   seed_selection_strategy: "energy"  # or "random"
   
-  # Device
-  device: "cuda"  # or "cpu"
-  
   # Output
   save_counterexamples: true
   output_dir: "fuzzing_results"
