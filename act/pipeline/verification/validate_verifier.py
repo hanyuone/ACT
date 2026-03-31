@@ -345,7 +345,7 @@ class VerificationValidator:
         Validate verifier correctness for a single network (Level 1).
         
         Args:
-            name: Network name from examples_config.yaml
+            name: Network name (stem of .json file in nets/)
             solver: 'gurobi' or 'torchlp'
             
         Returns:
@@ -662,11 +662,39 @@ class VerificationValidator:
                         'violated_layers': violated_layers,
                     }
                     violations.append(violation_info)
-                    logger.error(
-                        "  ❌ Bounds violation at sample %d: %d violating neurons",
-                        sample_idx,
-                        int(check.get("violations_total", 0)),
-                    )
+                    top1 = (check.get("violations_topk", []) or [None])[0]
+                    if isinstance(top1, dict):
+                        concrete = float(top1.get("concrete", 0.0))
+                        lb = float(top1.get("lb", 0.0))
+                        ub = float(top1.get("ub", 0.0))
+                        if concrete < lb:
+                            violation_dir = "below_lb"
+                        elif concrete > ub:
+                            violation_dir = "above_ub"
+                        else:
+                            violation_dir = "outside_bounds"
+                        logger.error(
+                            "  ❌ Bounds violation at sample %d: %d violating neurons | "
+                            "worst_gap=%.6g | layer_id=%s kind=%s neuron=%s dir=%s | "
+                            "concrete=%.6g lb=%.6g ub=%.6g",
+                            sample_idx,
+                            int(check.get("violations_total", 0)),
+                            float(check.get("worst_gap", 0.0)),
+                            top1.get("layer_id", "?"),
+                            top1.get("kind", "?"),
+                            top1.get("neuron_index", "?"),
+                            violation_dir,
+                            concrete,
+                            lb,
+                            ub,
+                        )
+                    else:
+                        logger.error(
+                            "  ❌ Bounds violation at sample %d: %d violating neurons | worst_gap=%.6g",
+                            sample_idx,
+                            int(check.get("violations_total", 0)),
+                            float(check.get("worst_gap", 0.0)),
+                        )
 
             except Exception as e:
                 logger.error(f"  ⚠️ Abstract analysis failed for sample {sample_idx}: {e}")

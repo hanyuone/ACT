@@ -281,7 +281,7 @@ class ACTToTorch:
         elif kind in ("DENSE", "CONV1D", "CONV2D", "CONV3D"):
             kwargs["bias"] = False
         # Pass through common kwargs from params
-        for key in ("stride", "padding", "dilation", "groups", "start_dim"):
+        for key in ("stride", "padding", "dilation", "groups", "start_dim", "negative_slope"):
             if key in params:
                 kwargs[key] = params[key]
 

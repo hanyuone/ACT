@@ -106,26 +106,36 @@ def run_verification(args):
 
 
 def run_network_factory(args):
-    """Generate example networks from YAML configuration."""
+    """Generate example networks using TF-aware NetFactory."""
     print(f"\n{'='*80}")
     print(f"ACT NETWORK FACTORY")
     print(f"{'='*80}\n")
     
     from act.back_end.net_factory import NetFactory
-    
-    config_file = args.config if args.config else "act/back_end/examples/examples_config.yaml"
-    
-    print(f"Configuration: {config_file}")
-    print(f"Output directory: act/back_end/examples/nets (fixed)\n")
-    
+
+    config_file = args.config if args.config else None
+    tf_targets = getattr(args, "tf_targets", None)
+    registry_mode = getattr(args, "registry_mode", "intersection")
+
+    if tf_targets:
+        print(f"TF targets: {tf_targets} (mode: {registry_mode})")
+    if config_file:
+        print(f"Config: {config_file}")
     if args.output:
-        print(f"⚠️  Note: Custom output directory not supported by NetFactory")
-        print(f"   Networks will be saved to: act/back_end/examples/nets\n")
-    
+        print(f"Output: {args.output}")
+    print()
+
     try:
-        factory = NetFactory(config_file)
-        factory.generate_all()
-        
+        factory = NetFactory(
+            gen_config_path=config_file,
+            output_dir=args.output,
+            base_seed=getattr(args, "base_seed", None),
+            num_instances=getattr(args, "num", None),
+            name_prefix=getattr(args, "name_prefix", None),
+            tf_targets=tf_targets,
+            registry_mode=registry_mode,
+        )
+        factory.generate()
         print(f"\n{'='*80}")
         print(f"✓ Network generation complete")
         print(f"{'='*80}\n")
@@ -221,48 +231,37 @@ def list_examples(args):
     print(f"\n{'='*80}")
     print(f"AVAILABLE EXAMPLE NETWORKS")
     print(f"{'='*80}\n")
-    
-    import yaml
-    from pathlib import Path
-    
-    config_file = "act/back_end/examples/examples_config.yaml"
-    
-    if not Path(config_file).exists():
-        print(f"❌ Configuration file not found: {config_file}")
-        return 1
-    
-    with open(config_file, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    networks = config.get('networks', {})
-    
-    print(f"Total networks: {len(networks)}\n")
-    
-    # Group by category
-    categories = {}
-    for net_name, net_config in networks.items():
-        desc = net_config.get('description', 'No description')
-        # Try to infer category from name
-        if 'mnist' in net_name.lower():
-            cat = 'MNIST Classification'
-        elif 'cifar' in net_name.lower():
-            cat = 'CIFAR Classification'
-        elif 'control' in net_name.lower():
-            cat = 'Control Systems'
-        elif 'reachability' in net_name.lower():
-            cat = 'Reachability Analysis'
+
+    from act.pipeline.verification.model_factory import ModelFactory
+
+    factory = ModelFactory()
+    names = factory.list_networks()
+    print(f"Total networks: {len(names)}\n")
+
+    # Group by category (inferred from filename)
+    categories: dict = {}
+    for name in names:
+        info = factory.get_network_info(name)
+        nl = name.lower()
+        if "mnist" in nl:
+            cat = "MNIST Classification"
+        elif "cifar" in nl:
+            cat = "CIFAR Classification"
+        elif "control" in nl:
+            cat = "Control Systems"
+        elif "reachability" in nl:
+            cat = "Reachability Analysis"
         else:
-            cat = 'Other'
-        
-        if cat not in categories:
-            categories[cat] = []
-        categories[cat].append((net_name, desc))
-    
-    for category, nets in sorted(categories.items()):
-        print(f"{category} ({len(nets)} networks):")
-        print("-" * 80)
-        for net_name, desc in sorted(nets):
-            print(f"  {net_name:30s} - {desc}")
+            cat = "Generated"
+        categories.setdefault(cat, []).append((name, info))
+
+    for cat, nets in sorted(categories.items()):
+        print(f"{cat} ({len(nets)} networks):")
+        print("-" * 70)
+        for name, info in sorted(nets):
+            shape = info.get("input_shape", "?")
+            layers = info.get("num_layers", "?")
+            print(f"  {name:40s}  shape={shape}  layers={layers}")
         print()
     
     print(f"{'='*80}")
@@ -375,12 +374,45 @@ Examples:
     factory_group.add_argument(
         "--config", "-c",
         type=str,
-        help="Path to YAML configuration file (default: act/back_end/examples/examples_config.yaml)"
+        help="Path to YAML configuration file"
     )
     factory_group.add_argument(
         "--output", "-o",
         type=str,
         help="Output directory for generated networks (default: act/back_end/examples/nets)"
+    )
+    factory_group.add_argument(
+        "--num",
+        type=int,
+        help="Number of networks to generate (generate mode)"
+    )
+    factory_group.add_argument(
+        "--base-seed",
+        type=int,
+        dest="base_seed",
+        help="Base seed for reproducible generation"
+    )
+    factory_group.add_argument(
+        "--name-prefix",
+        type=str,
+        dest="name_prefix",
+        help="Filename prefix for generated networks"
+    )
+    factory_group.add_argument(
+        "--tf-targets",
+        type=str,
+        nargs="+",
+        dest="tf_targets",
+        choices=["interval", "hybridz", "dual"],
+        help="Target TFs for layer filtering (generate mode)"
+    )
+    factory_group.add_argument(
+        "--registry-mode",
+        type=str,
+        dest="registry_mode",
+        choices=["intersection", "union"],
+        default="intersection",
+        help="How to combine TF layer sets: 'intersection' (default) or 'union'"
     )
     
     # Verification options

@@ -277,8 +277,9 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
         "params_optional": ["input_shape","output_shape"],
     },
     LayerKind.LRELU.value: {
+        "torch_module": "torch.nn.LeakyReLU",
         "params_required": [],
-        "params_optional": ["negative_slope"],
+        "params_optional": ["negative_slope","alpha"],
     },
     LayerKind.PRELU.value: {
         "params_required": ["weight"],
@@ -295,38 +296,47 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
         "params_optional": ["input_shape","output_shape"],
     },
     LayerKind.SOFTPLUS.value: {
+        "torch_module": "torch.nn.Softplus",
         "params_required": [],
         "params_optional": ["input_shape","output_shape"],
     },
     LayerKind.SILU.value: {
+        "torch_module": "torch.nn.SiLU",
         "params_required": [],
         "params_optional": ["input_shape","output_shape"],
     },
     LayerKind.GELU.value: {
+        "torch_module": "torch.nn.GELU",
         "params_required": [],
         "params_optional": ["approximate"],
     },
     LayerKind.RELU6.value: {
+        "torch_module": "torch.nn.ReLU6",
         "params_required": [],
         "params_optional": ["input_shape","output_shape"],
     },
     LayerKind.HARDTANH.value: {
+        "torch_module": "torch.nn.Hardtanh",
         "params_required": [],
         "params_optional": ["min_val","max_val"],
     },
     LayerKind.HARDSIGMOID.value: {
+        "torch_module": "torch.nn.Hardsigmoid",
         "params_required": [],
         "params_optional": ["alpha","beta"],
     },
     LayerKind.HARDSWISH.value: {
+        "torch_module": "torch.nn.Hardswish",
         "params_required": [],
         "params_optional": ["input_shape","output_shape"],
     },
     LayerKind.MISH.value: {
+        "torch_module": "torch.nn.Mish",
         "params_required": [],
         "params_optional": ["input_shape","output_shape"],
     },
     LayerKind.SOFTSIGN.value: {
+        "torch_module": "torch.nn.Softsign",
         "params_required": [],
         "params_optional": ["input_shape","output_shape"],
     },
@@ -344,27 +354,27 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     LayerKind.SUB.value: {
         "params_required": [],
-        "params_optional": ["broadcast","axis"],
+        "params_optional": ["broadcast","axis","x_vars","y_vars"],
     },
     LayerKind.MUL.value: {
         "params_required": [],
-        "params_optional": ["scale","broadcast","axis","input_shape","output_shape","original_shape","requires_graph_restoration","input_node_ids"],
+        "params_optional": ["scale","broadcast","axis","input_shape","output_shape","original_shape","requires_graph_restoration","input_node_ids","x_vars","y_vars"],
     },
     LayerKind.DIV.value: {
         "params_required": [],
-        "params_optional": ["broadcast","axis"],
+        "params_optional": ["broadcast","axis","x_vars","y_vars"],
     },
     LayerKind.POW.value: {
         "params_required": [],
-        "params_optional": ["broadcast","axis"],
+        "params_optional": ["broadcast","axis","x_vars","y_vars"],
     },
     LayerKind.MIN.value: {
         "params_required": [],
-        "params_optional": ["broadcast","axis"],
+        "params_optional": ["broadcast","axis","x_vars","y_vars","y_vars_list"],
     },
     LayerKind.MAX.value: {
         "params_required": [],
-        "params_optional": ["broadcast","axis"],
+        "params_optional": ["broadcast","axis","x_vars","y_vars","y_vars_list"],
     },
     LayerKind.SCALE.value: {
         "params_required": ["a"],
