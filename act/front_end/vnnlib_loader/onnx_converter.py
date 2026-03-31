@@ -56,6 +56,16 @@ def convert_onnx_to_pytorch(
         logger.info(f"Loading ONNX model from {onnx_path}")
         onnx_model = onnx.load(str(onnx_path))
         
+        # Upgrade old opsets for onnx2torch compatibility (e.g. ACAS Xu ships opset 8)
+        try:
+            from onnx import version_converter
+            current_opset = max((op.version for op in onnx_model.opset_import if not op.domain or op.domain == 'ai.onnx'), default=0)
+            if 0 < current_opset < 13:
+                logger.info(f"Upgrading ONNX opset {current_opset} → 13")
+                onnx_model = version_converter.convert_version(onnx_model, 13)
+        except Exception as e:
+            logger.warning(f"Opset upgrade failed ({e}), proceeding with original opset")
+        
         # Optionally simplify
         if simplify:
             try:

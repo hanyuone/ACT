@@ -114,7 +114,7 @@ def _merge_specs_to_batch(
     
     # Merge input tensors: (1,C,H,W) * N → (N,C,H,W)
     tensor = torch.cat([lt.tensor for lt in lts], dim=0)
-    labels = torch.cat([lt.label for lt in lts], dim=0)
+    labels = torch.cat([lt.label for lt in lts], dim=0) if all(lt.label is not None for lt in lts) else None
     
     # Merge input specs based on kind
     if in_kind == InKind.BOX:
@@ -144,17 +144,23 @@ def _merge_specs_to_batch(
         raise NotImplementedError(f"Batching for {in_kind} not implemented")
     
     # Merge output specs: y_true and margin
-    y_true = torch.cat([s.y_true for s in out_specs], dim=0)
+    y_true = torch.cat([s.y_true for s in out_specs], dim=0) if all(s.y_true is not None for s in out_specs) else None
     # Use default dtype - device is automatically handled by device_manager
     margins = torch.cat([
         s.margin if s.margin is not None else torch.tensor([0.0], dtype=torch.get_default_dtype())
         for s in out_specs
-    ], dim=0)
+    ], dim=0) if any(s.margin is not None for s in out_specs) else None
     
     # Create batched spec objects
     batched_lt = LabeledInputTensor(tensor=tensor, label=labels)
     batched_in = InputSpec(kind=in_kind, lb=lb, ub=ub, center=center, eps=eps)
-    batched_out = OutputSpec(kind=out_kind, y_true=y_true, margin=margins)
+    def _batch_attr(attr):
+        """Batch a field that only exists for certain output spec kinds (e.g. c/d for LINEAR_LE, lb/ub for RANGE). Returns None if this kind doesn't use the field."""
+        vals = [getattr(s, attr, None) for s in out_specs]
+        return torch.stack(vals) if all(v is not None for v in vals) else None
+    c_vec, d_vec = _batch_attr('c'), _batch_attr('d')
+    out_lb, out_ub = _batch_attr('lb'), _batch_attr('ub')
+    batched_out = OutputSpec(kind=out_kind, y_true=y_true, margin=margins, c=c_vec, d=d_vec, lb=out_lb, ub=out_ub)
     
     return batched_lt, batched_in, batched_out
 
