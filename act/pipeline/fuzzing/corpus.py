@@ -34,6 +34,7 @@ class FuzzingSeed:
         depth:           [B] int64 — how many mutations from original seed
         id:              [B] int64 — unique seed identifiers (auto-generated)
         parent_id:       [B] int64 — parent seed IDs (-1 = no parent)
+        select_count:    [B] int64 — how many times this seed has been selected
     """
     
     _id_counter: int = 0
@@ -55,6 +56,7 @@ class FuzzingSeed:
         depth: Optional[torch.Tensor] = None,
         id: Optional[torch.Tensor] = None,
         parent_id: Optional[torch.Tensor] = None,
+        select_count: Optional[torch.Tensor] = None,
     ):
         B = tensor.shape[0]
         self.tensor = tensor
@@ -65,6 +67,7 @@ class FuzzingSeed:
         self.depth = depth if depth is not None else torch.zeros(B, dtype=torch.long)
         self.id = id if id is not None else FuzzingSeed._next_ids(B)
         self.parent_id = parent_id if parent_id is not None else torch.full((B,), -1, dtype=torch.long)
+        self.select_count = select_count if select_count is not None else torch.zeros(B, dtype=torch.long)
     
     def __len__(self) -> int:
         """Return batch size B."""
@@ -83,6 +86,7 @@ class FuzzingSeed:
             depth=self.depth[idx],
             id=self.id[idx],
             parent_id=self.parent_id[idx],
+            select_count=self.select_count[idx],
         )
 
 
@@ -145,6 +149,7 @@ class SeedCorpus:
         self._depths = torch.zeros(N, dtype=torch.long, device=device)               # [N]
         self._ids = FuzzingSeed._next_ids(N)                                         # [N]
         self._parent_ids = torch.full((N,), -1, dtype=torch.long, device=device)     # [N]
+        self._select_counts = torch.zeros(N, dtype=torch.long, device=device)         # [N]
     
     def _hash_tensor(self, tensor: torch.Tensor) -> int:
         """Compute hash of tensor for deduplication."""
@@ -179,7 +184,7 @@ class SeedCorpus:
             indices = np.random.choice(corpus_size, size=n, replace=True)
         
         idx = torch.from_numpy(indices).long().to(self._device)
-        return FuzzingSeed(
+        result = FuzzingSeed(
             tensor=self._tensors[idx],
             original_tensor=self._original_tensors[idx],
             original_index=self._original_indices[idx],
@@ -188,7 +193,10 @@ class SeedCorpus:
             depth=self._depths[idx],
             id=self._ids[idx],
             parent_id=self._parent_ids[idx],
+            select_count=self._select_counts[idx],
         )
+        self._select_counts.scatter_add_(0, idx, torch.ones_like(idx))
+        return result
     
     def add(self, seeds: FuzzingSeed, mask: torch.Tensor):
         """
@@ -226,6 +234,7 @@ class SeedCorpus:
         self._depths = torch.cat([self._depths, seeds.depth[idx]])
         self._ids = torch.cat([self._ids, seeds.id[idx]])
         self._parent_ids = torch.cat([self._parent_ids, seeds.parent_id[idx]])
+        self._select_counts = torch.cat([self._select_counts, torch.zeros(len(keep), dtype=torch.long, device=self._device)])
     
     def __len__(self) -> int:
         """Return corpus size."""
@@ -243,6 +252,7 @@ class SeedCorpus:
                 depth=self._depths[i:i+1],
                 id=self._ids[i:i+1],
                 parent_id=self._parent_ids[i:i+1],
+                select_count=self._select_counts[i:i+1],
             )
     
     def get_stats(self) -> dict:

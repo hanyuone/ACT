@@ -54,10 +54,9 @@ consistent exploration across different problem scales.
    - Best for: Non-uniform ranges (e.g., different features with vastly different scales)
    - Example: lb=[0, -100], ub=[1, 100] → perturb_size=[0.1, 20.0] (10 steps per dimension)
 
-3. **fixed** (legacy):
-   - Uses hardcoded perturb_size values (0.01 for gradient/activation, 0.005 for boundary/random)
-   - Best for: Backward compatibility or when InputSpec is not available
-   - Note: May be too large for tight bounds or too small for wide bounds
+3. **fixed** (conventional):
+   - Computes perturb_size from mean range: perturb_size = mean(ub - lb)
+   - Note: Uses full feasible range as perturbation size 
 
 ### Configuration
 
@@ -420,8 +419,8 @@ class MutationEngine:
             "gradient": FGSMMutation(perturb_size=perturb_size),
             "pgd": PGDMutation(perturb_size=perturb_size),
             "activation": ActivationMutation(perturb_size=perturb_size),
-            "boundary": BoundaryMutation(perturb_size=perturb_size * 0.5),  # Half perturb_size for boundary (more conservative)
-            "random": RandomMutation(perturb_size=perturb_size * 0.5)       # Half perturb_size for random (more conservative)
+            "boundary": BoundaryMutation(perturb_size=perturb_size),
+            "random": RandomMutation(perturb_size=perturb_size),
         }
 
         # Validate and normalize weights
@@ -465,9 +464,9 @@ class MutationEngine:
                - Tensor of perturb_size values, one per dimension
                - Best for non-uniform ranges (different feature scales)
             
-            3. fixed: Uses hardcoded defaults (backward compatibility)
-               - gradient/activation: 0.01
-               - boundary/random: 0.005
+            3. fixed: Computes perturb_size from mean range (range-aware)
+               - perturb_size = mean(ub - lb)
+               - Uses the average feasible range as perturbation size
         
         Interpretation:
             perturb_scale represents the fraction of range each perturbation covers.
@@ -478,12 +477,6 @@ class MutationEngine:
                 - perturb_scale=0.2  → 20% per perturbation → ~5 steps to traverse
                 - perturb_scale=0.05 → 5% per perturbation  → ~20 steps to traverse
         """
-        # Legacy fixed perturbation sizes (backward compatibility)
-        if self.perturb_mode == "fixed":
-            print(f"[MutationEngine] Using fixed perturb_size mode (legacy)")
-            print(f"  - Gradient/Activation perturb_size: 0.01")
-            print(f"  - Boundary/Random perturb_size: 0.005")
-            return 0.01
         
         if self.input_spec is None:
             print(f"[MutationEngine] No InputSpec provided, falling back to fixed perturb_size=0.01")
@@ -507,6 +500,10 @@ class MutationEngine:
         
         # Compute range for perturbation scaling
         range_tensor = ub - lb
+        
+        # Range-aware fixed mode: use mean range as perturb_size
+        if self.perturb_mode == "fixed":
+            return (ub - lb).mean().item()
         
         # Compute single perturb_size from mean range
         if self.perturb_mode == "adaptive_scalar":
@@ -588,6 +585,31 @@ class MutationEngine:
         
         # Store strategy for tracing
         self.last_strategy = strategy_name
+        
+        # Dynamic per-seed scale: s_b = 1 - (1 - s₀)^{n_b+1}
+        if self.perturb_mode != "fixed" and self.input_spec is not None:
+            if self.input_spec.kind == InKind.LINF_BALL:
+                _lb = seeds.original_tensor.to(self.device) - self.input_spec.eps
+                _ub = seeds.original_tensor.to(self.device) + self.input_spec.eps
+            else:
+                _lb = self.input_spec.lb.to(self.device)
+                _ub = self.input_spec.ub.to(self.device)
+                if _lb.shape[0] > 1:
+                    _ix = seeds.original_index.clamp(max=_lb.shape[0] - 1).to(self.device)
+                    _lb, _ub = _lb[_ix], _ub[_ix]
+                elif _lb.shape[0] == 1 and B > 1:
+                    _lb = _lb.expand(B, *_lb.shape[1:])
+                    _ub = _ub.expand(B, *_ub.shape[1:])
+                else:
+                    _lb, _ub = _lb[:B], _ub[:B]
+            n = seeds.select_count.float().to(self.device)
+            s_b = 1.0 - (1.0 - self.perturb_scale) ** (n + 1.0)
+            reach = torch.max(batch_input - _lb, _ub - batch_input)
+            shape = [B] + [1] * (reach.dim() - 1)
+            perturb_size = s_b.view(*shape) * reach
+            if self.perturb_mode == "adaptive_scalar":
+                perturb_size = perturb_size.mean(dim=list(range(1, perturb_size.dim())), keepdim=True)
+            strategy.perturb_size = perturb_size
         
         # Apply mutation
         mutated = strategy.mutate(
