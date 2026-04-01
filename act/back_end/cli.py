@@ -22,10 +22,10 @@ from act.util.cli_utils import add_device_args, initialize_from_args
 
 def run_verification(args):
     """Run verification on a network."""
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"ACT BACK-END VERIFICATION")
-    print(f"{'='*80}\n")
-    
+    print(f"{'=' * 80}\n")
+
     # Import here to avoid circular dependencies
     from act.back_end.core import Net
     from act.back_end.serialization.serialization import load_net_from_file
@@ -34,83 +34,80 @@ def run_verification(args):
     from act.back_end.solver.solver_gurobi import GurobiSolver
     from act.back_end.solver.solver_torch import TorchLPSolver
     from act.util.stats import VerifyStatus
-    
+
     # Load network
     print(f"Loading network from: {args.network}")
     net = load_net_from_file(args.network)
     print(f"Loaded network with {len(net.layers)} layers")
-    
+
     # Select solver
-    if args.solver == 'gurobi':
+    if args.solver == "gurobi":
         print(f"Using solver: Gurobi")
         solver = GurobiSolver()
-    elif args.solver == 'torch':
+    elif args.solver == "torch":
         print(f"Using solver: TorchLP")
         solver = TorchLPSolver()
     else:  # auto
         try:
             from act.back_end.solver.solver_gurobi import GurobiSolver
+
             print(f"Using solver: Gurobi (auto-detected)")
             solver = GurobiSolver()
         except:
             print(f"Using solver: TorchLP (Gurobi not available)")
             solver = TorchLPSolver()
-    
+
     # Run verification
     if args.bab:
         print(f"\nRunning Branch-and-Bound verification...")
         print(f"  Max depth: {args.bab_max_depth}")
         print(f"  Max subproblems: {args.bab_max_subproblems}")
         print(f"  Timeout: {args.timeout}s\n")
-        
+
         result = verify_bab(
             net=net,
             solver=solver,
             timelimit=args.timeout,
             max_depth=args.bab_max_depth,
             max_subproblems=args.bab_max_subproblems,
-            verbose=args.verbose
+            verbose=args.verbose,
         )
     else:
         print(f"\nRunning single-shot verification...")
         print(f"  Timeout: {args.timeout}s\n")
-        
-        result = verify_once(
-            net=net,
-            solver=solver,
-            timelimit=args.timeout
-        )
-    
+
+        result = verify_once(net=net, solver=solver, timelimit=args.timeout)
+
     # Display results
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"VERIFICATION RESULT: {result.status}")
-    print(f"{'='*80}")
-    
-    if 'time' in result.metadata:
+    print(f"{'=' * 80}")
+
+    if "time" in result.metadata:
         print(f"Time: {result.metadata['time']:.3f}s")
-    
+
     if result.counterexample is not None:
         print(f"Counterexample found:")
         print(f"  Shape: {result.counterexample.shape}")
         if args.verbose:
             print(f"  Values: {result.counterexample}")
-    
+
     if args.verbose and result.metadata:
         print(f"\nVerification metadata:")
         for key, value in result.metadata.items():
             print(f"  {key}: {value}")
-    
-    print(f"\n{'='*80}\n")
-    
+
+    print(f"\n{'=' * 80}\n")
+
     return 0 if result.status == VerifyStatus.CERTIFIED else 1
 
 
 def run_network_factory(args):
     """Generate example networks using TF-aware NetFactory."""
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"ACT NETWORK FACTORY")
-    print(f"{'='*80}\n")
-    
+    print(f"{'=' * 80}\n")
+
     from act.back_end.net_factory import NetFactory
 
     config_file = args.config if args.config else None
@@ -136,101 +133,102 @@ def run_network_factory(args):
             registry_mode=registry_mode,
         )
         factory.generate()
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print(f"✓ Network generation complete")
-        print(f"{'='*80}\n")
-        
+        print(f"{'=' * 80}\n")
+
         return 0
     except Exception as e:
         print(f"\n❌ Error: {e}")
         if args.verbose:
             import traceback
+
             traceback.print_exc()
         return 1
 
 
 def run_network_info(args):
     """Display information about a network."""
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"NETWORK INFORMATION")
-    print(f"{'='*80}\n")
-    
+    print(f"{'=' * 80}\n")
+
     from act.back_end.serialization.serialization import load_net_from_file
     from act.back_end.layer_schema import LayerKind
-    
+
     print(f"Loading network from: {args.network}\n")
     net = load_net_from_file(args.network)
-    
+
     # Basic info
     print(f"Network: {Path(args.network).stem}")
     print(f"Total layers: {len(net.layers)}")
     print(f"Predecessors: {sum(len(p) for p in net.preds.values())} edges")
     print(f"Successors: {sum(len(s) for s in net.succs.values())} edges")
-    
+
     # Layer breakdown by kind
     layer_kinds = {}
     for layer in net.layers:
         kind = layer.kind
         layer_kinds[kind] = layer_kinds.get(kind, 0) + 1
-    
+
     print(f"\nLayer breakdown:")
     for kind, count in sorted(layer_kinds.items()):
         print(f"  {kind:20s}: {count}")
-    
+
     # Detailed layer info if verbose
     if args.verbose:
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print(f"DETAILED LAYER INFORMATION")
-        print(f"{'='*80}\n")
-        
+        print(f"{'=' * 80}\n")
+
         for layer in net.layers:
             print(f"Layer {layer.id}: {layer.kind}")
             print(f"  In vars: {layer.in_vars}")
             print(f"  Out vars: {layer.out_vars}")
             if layer.params:
                 print(f"  Params: {layer.params}")
-            
+
             # Show predecessors
             preds = net.preds.get(layer.id, [])
             if preds:
                 print(f"  Predecessors: {preds}")
-            
+
             # Show successors
             succs = net.succs.get(layer.id, [])
             if succs:
                 print(f"  Successors: {succs}")
             print()
-    
-    print(f"{'='*80}\n")
+
+    print(f"{'=' * 80}\n")
     return 0
 
 
 def run_serialization_test(args):
     """Test network serialization (save/load round-trip)."""
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"SERIALIZATION TEST")
-    print(f"{'='*80}\n")
-    
+    print(f"{'=' * 80}\n")
+
     from act.back_end.serialization.test_serialization import main as test_main
-    
+
     print("Running serialization tests...\n")
     result = test_main()
-    
-    print(f"\n{'='*80}")
+
+    print(f"\n{'=' * 80}")
     if result == 0:
         print("✓ All serialization tests passed")
     else:
         print("❌ Some serialization tests failed")
-    print(f"{'='*80}\n")
-    
+    print(f"{'=' * 80}\n")
+
     return result
 
 
 def list_examples(args):
     """List available example networks."""
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"AVAILABLE EXAMPLE NETWORKS")
-    print(f"{'='*80}\n")
+    print(f"{'=' * 80}\n")
 
     from act.pipeline.verification.model_factory import ModelFactory
 
@@ -263,11 +261,11 @@ def list_examples(args):
             layers = info.get("num_layers", "?")
             print(f"  {name:40s}  shape={shape}  layers={layers}")
         print()
-    
-    print(f"{'='*80}")
+
+    print(f"{'=' * 80}")
     print("To generate networks: python -m act.back_end --generate")
-    print(f"{'='*80}\n")
-    
+    print(f"{'=' * 80}\n")
+
     return 0
 
 
@@ -335,68 +333,63 @@ Examples:
   
   # Use GPU with float64
   python -m act.back_end --verify --network cifar.json --device cuda --dtype float64
-        """
+        """,
     )
-    
+
     # Command groups
     cmd_group = parser.add_mutually_exclusive_group(required=True)
-    
+
     cmd_group.add_argument(
-        "--generate", "-g",
+        "--generate",
+        "-g",
         action="store_true",
-        help="Generate example networks from YAML configuration"
+        help="Generate example networks from YAML configuration",
     )
     cmd_group.add_argument(
-        "--verify", "-v",
-        action="store_true",
-        help="Run verification on a network"
+        "--verify", "-v", action="store_true", help="Run verification on a network"
     )
     cmd_group.add_argument(
-        "--info", "-i",
-        action="store_true",
-        help="Display network information"
+        "--info", "-i", action="store_true", help="Display network information"
     )
     cmd_group.add_argument(
-        "--list-examples", "-l",
+        "--list-examples",
+        "-l",
         action="store_true",
         dest="list_examples",
-        help="List available example networks"
+        help="List available example networks",
     )
     cmd_group.add_argument(
         "--test-serialization",
         action="store_true",
         dest="test_serialization",
-        help="Run serialization tests"
+        help="Run serialization tests",
     )
-    
+
     # Network factory options
     factory_group = parser.add_argument_group("Network Factory Options")
     factory_group.add_argument(
-        "--config", "-c",
-        type=str,
-        help="Path to YAML configuration file"
+        "--config", "-c", type=str, help="Path to YAML configuration file"
     )
     factory_group.add_argument(
-        "--output", "-o",
+        "--output",
+        "-o",
         type=str,
-        help="Output directory for generated networks (default: act/back_end/examples/nets)"
+        help="Output directory for generated networks (default: act/back_end/examples/nets)",
     )
     factory_group.add_argument(
-        "--num",
-        type=int,
-        help="Number of networks to generate (generate mode)"
+        "--num", type=int, help="Number of networks to generate (generate mode)"
     )
     factory_group.add_argument(
         "--base-seed",
         type=int,
         dest="base_seed",
-        help="Base seed for reproducible generation"
+        help="Base seed for reproducible generation",
     )
     factory_group.add_argument(
         "--name-prefix",
         type=str,
         dest="name_prefix",
-        help="Filename prefix for generated networks"
+        help="Filename prefix for generated networks",
     )
     factory_group.add_argument(
         "--tf-targets",
@@ -404,7 +397,7 @@ Examples:
         nargs="+",
         dest="tf_targets",
         choices=["interval", "hybridz", "dual"],
-        help="Target TFs for layer filtering (generate mode)"
+        help="Target TFs for layer filtering (generate mode)",
     )
     factory_group.add_argument(
         "--registry-mode",
@@ -412,69 +405,65 @@ Examples:
         dest="registry_mode",
         choices=["intersection", "union"],
         default="intersection",
-        help="How to combine TF layer sets: 'intersection' (default) or 'union'"
+        help="How to combine TF layer sets: 'intersection' (default) or 'union'",
     )
-    
+
     # Verification options
     verify_group = parser.add_argument_group("Verification Options")
     verify_group.add_argument(
-        "--network", "-n",
-        type=str,
-        help="Path to network file (JSON format)"
+        "--network", "-n", type=str, help="Path to network file (JSON format)"
     )
     verify_group.add_argument(
-        "--solver", "-s",
+        "--solver",
+        "-s",
         type=str,
-        choices=['auto', 'gurobi', 'torch'],
-        default='auto',
-        help="Solver backend (default: auto - try Gurobi first, fallback to Torch)"
+        choices=["auto", "gurobi", "torch"],
+        default="auto",
+        help="Solver backend (default: auto - try Gurobi first, fallback to Torch)",
     )
     verify_group.add_argument(
         "--bab",
         action="store_true",
-        help="Use branch-and-bound refinement (instead of single-shot)"
+        help="Use branch-and-bound refinement (instead of single-shot)",
     )
     verify_group.add_argument(
         "--bab-max-depth",
         type=int,
         default=5,
         dest="bab_max_depth",
-        help="Maximum BaB tree depth (default: 5)"
+        help="Maximum BaB tree depth (default: 5)",
     )
     verify_group.add_argument(
         "--bab-max-subproblems",
         type=int,
         default=100,
         dest="bab_max_subproblems",
-        help="Maximum number of BaB subproblems (default: 100)"
+        help="Maximum number of BaB subproblems (default: 100)",
     )
     verify_group.add_argument(
-        "--timeout", "-t",
+        "--timeout",
+        "-t",
         type=float,
         default=300.0,
-        help="Solver timeout in seconds (default: 300)"
+        help="Solver timeout in seconds (default: 300)",
     )
-    
+
     # Common options
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose output"
-    )
-    
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+
     # Add standard device/dtype arguments (shared across all ACT CLIs)
     add_device_args(parser)
-    
+
     args = parser.parse_args()
-    
+
     # Initialize device manager from CLI arguments
     initialize_from_args(args)
-    
+
     # Validate arguments based on command
     if args.verify or args.info:
         if not args.network:
             parser.error("--network is required for --verify and --info")
-    
+
     # Execute command
     try:
         if args.generate:
@@ -497,6 +486,7 @@ Examples:
         print(f"\n❌ Error: {e}")
         if args.verbose:
             import traceback
+
             traceback.print_exc()
         return 1
 
