@@ -30,29 +30,20 @@ def hybridz_tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     padding = L.params.get("padding", 0)
     dilation = L.params.get("dilation", 1)
     groups = L.params.get("groups", 1)
-    
-    # Input shape: (batch, in_channels, height, width) - for bounds propagation batch=1
-    input_shape = L.params.get("input_shape", None)  # (channels, height, width)
-    if Bin.lb.dim() == 1:
-        # Flatten input needs to be reshaped
-        if input_shape is None:
-            raise ValueError("CONV2D got flat bounds but params.input_shape is missing")
 
-        # input_shape may be (N,C,H,W) or (C,H,W)
-        if len(input_shape) == 4:
-            _, C, H, W = input_shape
-        elif len(input_shape) == 3:
-            C, H, W = input_shape
-        else:
-            raise ValueError(f"Unexpected input_shape={input_shape}")
-        Bin_reshaped_lb = Bin.lb.view(1, C, H, W)
-        Bin_reshaped_ub = Bin.ub.view(1, C, H, W)
-    elif Bin.lb.dim() == 3:
-        Bin_reshaped_lb = Bin.lb.unsqueeze(0)
-        Bin_reshaped_ub = Bin.ub.unsqueeze(0)
-    else:
-        Bin_reshaped_lb = Bin.lb
-        Bin_reshaped_ub = Bin.ub
+    # Infer spatial dims from bounds size + weight shape (same approach as interval_tf)
+    out_ch, in_ch_per_group, kh, kw = weight.shape
+    in_ch = in_ch_per_group * groups
+    spatial = Bin.lb.numel() // in_ch
+    in_h = in_w = int(spatial ** 0.5)
+    if in_h * in_w != spatial:
+        for h in range(int(spatial ** 0.5) + 10, 0, -1):
+            if spatial % h == 0:
+                in_h, in_w = h, spatial // h
+                break
+
+    Bin_reshaped_lb = Bin.lb.view(1, in_ch, in_h, in_w)
+    Bin_reshaped_ub = Bin.ub.view(1, in_ch, in_h, in_w)
     
     # Apply convolution to bounds
     # For HybridZ: more precise bound computation considering kernel structure
@@ -100,22 +91,22 @@ def hybridz_tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     
     # Reshape input if flattened
     in_shape = L.params.get("input_shape")  # (channels, height, width)
-    if len(Bin.lb.shape) == 1 and in_shape:
-        Bin_lb = Bin.lb.view(1, *in_shape)
-        Bin_ub = Bin.ub.view(1, *in_shape)
+    if in_shape is not None:
+        s = list(in_shape)
+        C, H, W = (s[1], s[2], s[3]) if len(s) == 4 else (s[0], s[1], s[2])
     else:
-        Bin_lb = Bin.lb.unsqueeze(0) if len(Bin.lb.shape) == 3 else Bin.lb
-        Bin_ub = Bin.ub.unsqueeze(0) if len(Bin.ub.shape) == 3 else Bin.ub
-    
+        raise ValueError(f"MAXPOOL2D layer {L.id} missing input_shape")
+    Bin_lb = Bin.lb.view(1, C, H, W)
+    Bin_ub = Bin.ub.view(1, C, H, W)
+
     # Max pooling: upper bounds of pooling regions
     # For HybridZ: track which neurons contribute to maximum
     lb_pool = F.max_pool2d(Bin_lb, kernel_size, stride=stride, padding=padding)
     ub_pool = F.max_pool2d(Bin_ub, kernel_size, stride=stride, padding=padding)
     
-    # For max pooling, lower bound is more complex - use max of lower bounds in each region
-    # This is conservative but sound
-    lb = lb_pool.squeeze(0).flatten() if len(L.out_vars) != lb_pool.numel() else lb_pool.squeeze(0)
-    ub = ub_pool.squeeze(0).flatten() if len(L.out_vars) != ub_pool.numel() else ub_pool.squeeze(0)
+    # Flatten output to 1-D (matching len(L.out_vars))
+    lb = lb_pool.reshape(-1)
+    ub = ub_pool.reshape(-1)
 
     Bout = Bounds(lb=lb, ub=ub)
     
@@ -134,21 +125,22 @@ def hybridz_tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
     stride = L.params.get("stride", kernel_size)
     padding = L.params.get("padding", 0)
     
-    # Reshape input if needed
+    # Infer spatial dims from input_shape metadata
     in_shape = L.params.get("input_shape")
-    if len(Bin.lb.shape) == 1 and in_shape:
-        Bin_lb = Bin.lb.view(1, *in_shape)
-        Bin_ub = Bin.ub.view(1, *in_shape)
+    if in_shape is not None:
+        s = list(in_shape)
+        C, H, W = (s[1], s[2], s[3]) if len(s) == 4 else (s[0], s[1], s[2])
     else:
-        Bin_lb = Bin.lb.unsqueeze(0) if len(Bin.lb.shape) == 3 else Bin.lb
-        Bin_ub = Bin.ub.unsqueeze(0) if len(Bin.ub.shape) == 3 else Bin.ub
-    
+        raise ValueError(f"AVGPOOL2D layer {L.id} missing input_shape")
+    Bin_lb = Bin.lb.view(1, C, H, W)
+    Bin_ub = Bin.ub.view(1, C, H, W)
+
     # Average pooling is linear - exact bounds
     lb_pool = F.avg_pool2d(Bin_lb, kernel_size, stride=stride, padding=padding)
     ub_pool = F.avg_pool2d(Bin_ub, kernel_size, stride=stride, padding=padding)
     
-    lb = lb_pool.squeeze(0).flatten() if len(L.out_vars) != lb_pool.numel() else lb_pool.squeeze(0)
-    ub = ub_pool.squeeze(0).flatten() if len(L.out_vars) != ub_pool.numel() else ub_pool.squeeze(0)
+    lb = lb_pool.reshape(-1)
+    ub = ub_pool.reshape(-1)
     
     Bout = Bounds(lb=lb, ub=ub)
     

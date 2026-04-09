@@ -1,23 +1,23 @@
-#===- act/back_end/layer_schema.py - ACT Layer Schema and Registry -----====#
+# ===- act/back_end/layer_schema.py - ACT Layer Schema and Registry -----====#
 # ACT: Abstract Constraint Transformer
 # Copyright (C) 2025– ACT Team
 #
 # Licensed under the GNU Affero General Public License v3.0 or later (AGPLv3+).
 # Distributed without any warranty; see <http://www.gnu.org/licenses/>.
-#===---------------------------------------------------------------------===#
+# ===---------------------------------------------------------------------===#
 #
 # Purpose:
 #   ACT layer schema definitions, strict registry, wrapper checks,
 #   and validation for layer types and parameters.
 #
-#===---------------------------------------------------------------------===#
+# ===---------------------------------------------------------------------===#
 
 """
 SCHEMA STRUCTURE:
 - The REGISTRY uses two keys per entry:
   1. `params_required`: Required parameters (tensors + scalars that MUST be present)
   2. `params_optional`: Optional parameters (tensors + scalars that MAY be present)
-  
+
   Tensor params are auto-detected at runtime via isinstance(val, torch.Tensor).
   No separate 'tensors' list needed - eliminates redundancy.
 
@@ -37,11 +37,12 @@ WHAT THIS FILE PROVIDES (concise):
 HOW TO ADD NEW STUFF (READ THIS):
 - Add a new LAYER KIND:
     1. Append a value to LayerKind (e.g., MYOP = "MYOP").
-    2. Add REGISTRY[LayerKind.MYOP.value] = {
-           "torch_module": "torch.nn.MyModule",  # Optional: for PyTorch restoration
+     2. Add REGISTRY[LayerKind.MYOP.value] = {
            "params_required": [...],  # All required params (tensors + scalars)
            "params_optional": [...],  # All optional params (tensors + scalars)
        }
+       If the layer has a PyTorch nn.Module equivalent, also add it to
+       _ACT_TO_TORCH in act2torch.py for ACT→PyTorch restoration.
     3. Done. The validator will enforce that only those keys are used.
        Tensor params are auto-detected at runtime - no manual tracking needed.
 
@@ -67,23 +68,26 @@ import enum
 
 # Import Layer from core to avoid circular import issues
 from typing import TYPE_CHECKING
+
 if TYPE_CHECKING:
     from .core import Layer
 
 try:
     import torch
+
     Tensor = torch.Tensor
 except Exception:  # typing only
     Tensor = "torch.Tensor"  # type: ignore
+
 
 # -------------------------------
 # Minimal enum of operation kinds
 # -------------------------------
 class LayerKind(str, enum.Enum):
     # Wrapper & specs
-    INPUT = "INPUT"           # params: shape (required), center (optional)
-    INPUT_SPEC = "INPUT_SPEC" # params: kind ('BOX'|'LINF_BALL'|'LIN_POLY'), constraints in params
-    ASSERT = "ASSERT"         # params: kind ('LINEAR_LE'|'TOP1_ROBUST'|'MARGIN_ROBUST'|'RANGE'), all fields in params
+    INPUT = "INPUT"  # params: shape (required), center (optional)
+    INPUT_SPEC = "INPUT_SPEC"  # params: kind ('BOX'|'LINF_BALL'|'LIN_POLY'), constraints in params
+    ASSERT = "ASSERT"  # params: kind ('LINEAR_LE'|'TOP1_ROBUST'|'MARGIN_ROBUST'|'RANGE'), all fields in params
 
     # Core MLP/CNN ops (subset can be extended easily)
     DENSE = "DENSE"
@@ -126,7 +130,7 @@ class LayerKind(str, enum.Enum):
     MIN = "MIN"
     MAX = "MAX"
     SCALE = "SCALE"  # Element-wise multiplication by constant: y = a * x
-    BIAS = "BIAS"    # Element-wise addition of constant: y = x + c
+    BIAS = "BIAS"  # Element-wise addition of constant: y = x + c
 
     # Tensor plumbing
     CONCAT = "CONCAT"
@@ -148,20 +152,24 @@ class LayerKind(str, enum.Enum):
     SOFTMAX = "SOFTMAX"
     MHA = "MHA"
     POSENC = "POSENC"
+    SLICE = "SLICE"
+    GATHER = "GATHER"
+    INDEX_SELECT = "INDEX_SELECT"
+    PAD = "PAD"
+
 
 # -------------------------------------------
 # Strict schema: flat registry (easy to edit)
 # -------------------------------------------
 # Each entry contains:
-#   - torch_module (optional): PyTorch module path for restoration (e.g., "torch.nn.Linear")
 #   - params_required: Required params (tensors + scalar constructor args)
 #   - params_optional: Optional params (tensors + scalar constructor kwargs)
 #
-# PyTorch restoration: act2torch.py reads torch_module from this registry.
 # Tensor params are auto-detected via isinstance(val, torch.Tensor).
-# Constructor args = params_required where value is NOT a tensor.
-# Constructor kwargs = params_optional where value is NOT a tensor.
 # Bias existence is determined by checking if "bias" is in params (no separate flag needed).
+#
+# PyTorch restoration mapping (ACT LayerKind → torch.nn.Module) lives in
+# act2torch.py (_ACT_TO_TORCH dict), not here.  REGISTRY is validation-only.
 
 REGISTRY: Dict[str, Dict[str, Any]] = {
     # =====================
@@ -169,138 +177,239 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     # =====================
     LayerKind.INPUT.value: {
         "params_required": [
-            "shape",            # Required tuple: input shape including batch=1 (e.g., (1, 784) or (1, 3, 32, 32))
-            "dtype",            # Required str: tensor data type (e.g., "torch.float32", "torch.float64") - CRITICAL for verification soundness
+            "shape",  # Required tuple: input shape including batch=1 (e.g., (1, 784) or (1, 3, 32, 32))
+            "dtype",  # Required str: tensor data type (e.g., "torch.float32", "torch.float64") - CRITICAL for verification soundness
         ],
         "params_optional": [
-            "labeled_input",    # Optional: LabeledInputTensor (tensor + label pair) for self-contained model inference
-            "desc",             # Optional str: human-readable description (default: "input")
+            "labeled_input",  # Optional: LabeledInputTensor (tensor + label pair) for self-contained model inference
+            "desc",  # Optional str: human-readable description (default: "input")
             # Tier 1: Essential attributes for data characterization
-            "layout",           # Optional str: data format - "CHW" (channel-first), "HWC" (channel-last), "FLAT" (flattened)
-            "dataset_name",     # Optional str: dataset identifier (e.g., "mnist", "cifar10", "custom_data")
+            "layout",  # Optional str: data format - "CHW" (channel-first), "HWC" (channel-last), "FLAT" (flattened)
+            "dataset_name",  # Optional str: dataset identifier (e.g., "mnist", "cifar10", "custom_data")
             # Tier 2: Important attributes for verification context
-            "batch_size",       # Optional int: batch size for batched verification (extracted from shape[0])
-            "num_classes",      # Optional int: number of output classes for classification tasks
-            "value_range",      # Optional tuple: (min, max) actual value range in data (e.g., (0.0, 1.0) or (0.0, 255.0))
-            "scale_hint",       # Optional str: scale description - "0-1", "0-255", "normalized", "unknown"
-            "distribution",     # Optional str: data distribution - "uniform", "normal", "normalized", "unknown", or custom (free-form)
+            "batch_size",  # Optional int: batch size for batched verification (extracted from shape[0])
+            "num_classes",  # Optional int: number of output classes for classification tasks
+            "value_range",  # Optional tuple: (min, max) actual value range in data (e.g., (0.0, 1.0) or (0.0, 255.0))
+            "scale_hint",  # Optional str: scale description - "0-1", "0-255", "normalized", "unknown"
+            "distribution",  # Optional str: data distribution - "uniform", "normal", "normalized", "unknown", or custom (free-form)
             # Tier 3: Optional attributes for debugging and tracking
-            "sample_id",        # Optional int/str: sample identifier for tracking individual inputs
-            "domain",           # Optional str: problem domain - "vision", "tabular", "text", "audio"
-            "channels",         # Optional int: number of channels (e.g., 1 for grayscale, 3 for RGB)
+            "sample_id",  # Optional int/str: sample identifier for tracking individual inputs
+            "domain",  # Optional str: problem domain - "vision", "tabular", "text", "audio"
+            "channels",  # Optional int: number of channels (e.g., 1 for grayscale, 3 for RGB)
         ],
     },
     LayerKind.INPUT_SPEC.value: {
         "params_required": ["kind"],
-        "params_optional": ["lb","ub","center","A","b","eps","lb_val","ub_val","center_val"],
+        "params_optional": [
+            "lb",
+            "ub",
+            "center",
+            "A",
+            "b",
+            "eps",
+            "lb_val",
+            "ub_val",
+            "center_val",
+        ],
     },
     LayerKind.ASSERT.value: {
         "params_required": ["kind"],
         "params_optional": [
-            "c",        # Tensor: coefficient vector for LINEAR_LE (c^T y <= d)
-            "lb",       # Tensor: lower bounds for RANGE
-            "ub",       # Tensor: upper bounds for RANGE
-            "d",        # Scalar: threshold for LINEAR_LE (c^T y <= d)
-            "y_true",   # Scalar int: true class index for TOP1_ROBUST / MARGIN_ROBUST
-            "margin",   # Scalar float: margin threshold for MARGIN_ROBUST
+            "c",  # Tensor: coefficient vector for LINEAR_LE (c^T y <= d)
+            "lb",  # Tensor: lower bounds for RANGE
+            "ub",  # Tensor: upper bounds for RANGE
+            "d",  # Scalar: threshold for LINEAR_LE (c^T y <= d)
+            "y_true",  # Scalar int: true class index for TOP1_ROBUST / MARGIN_ROBUST
+            "margin",  # Scalar float: margin threshold for MARGIN_ROBUST
         ],
     },
-
     # =====================
     # Dense/CNN
     # =====================
     LayerKind.DENSE.value: {
-        "torch_module": "torch.nn.Linear",
-        "params_required": ["weight","in_features","out_features"],
-        "params_optional": ["bias","weight_pos","weight_neg","activation","input_shape","output_shape"],
+        "params_required": ["weight", "in_features", "out_features"],
+        "params_optional": [
+            "bias",
+            "weight_pos",
+            "weight_neg",
+            "activation",
+            "input_shape",
+            "output_shape",
+        ],
     },
     LayerKind.CONV1D.value: {
-        "torch_module": "torch.nn.Conv1d",
-        "params_required": ["weight","in_channels","out_channels","kernel_size"],
-        "params_optional": ["bias","weight_pos","weight_neg","stride","padding","dilation","groups","transposed","output_padding","padding_mode","input_shape","output_shape","data_format"],
+        "params_required": ["weight", "in_channels", "out_channels", "kernel_size"],
+        "params_optional": [
+            "bias",
+            "weight_pos",
+            "weight_neg",
+            "stride",
+            "padding",
+            "dilation",
+            "groups",
+            "transposed",
+            "output_padding",
+            "padding_mode",
+            "input_shape",
+            "output_shape",
+            "data_format",
+        ],
     },
     LayerKind.CONV2D.value: {
-        "torch_module": "torch.nn.Conv2d",
-        "params_required": ["weight","in_channels","out_channels","kernel_size"],
-        "params_optional": ["bias","weight_pos","weight_neg","stride","padding","dilation","groups","input_shape","output_shape","transposed","output_padding","padding_mode","data_format"],
+        "params_required": ["weight", "in_channels", "out_channels", "kernel_size"],
+        "params_optional": [
+            "bias",
+            "weight_pos",
+            "weight_neg",
+            "stride",
+            "padding",
+            "dilation",
+            "groups",
+            "input_shape",
+            "output_shape",
+            "transposed",
+            "output_padding",
+            "padding_mode",
+            "data_format",
+        ],
     },
     LayerKind.CONV3D.value: {
-        "torch_module": "torch.nn.Conv3d",
-        "params_required": ["weight","in_channels","out_channels","kernel_size"],
-        "params_optional": ["bias","weight_pos","weight_neg","stride","padding","dilation","groups","transposed","output_padding","padding_mode","input_shape","output_shape","data_format"],
+        "params_required": ["weight", "in_channels", "out_channels", "kernel_size"],
+        "params_optional": [
+            "bias",
+            "weight_pos",
+            "weight_neg",
+            "stride",
+            "padding",
+            "dilation",
+            "groups",
+            "transposed",
+            "output_padding",
+            "padding_mode",
+            "input_shape",
+            "output_shape",
+            "data_format",
+        ],
     },
     LayerKind.CONVTRANSPOSE2D.value: {
-        "params_required": ["weight","stride","padding","dilation","groups"],
-        "params_optional": ["bias","transposed","output_padding","padding_mode","input_shape","output_shape","data_format"],
+        "params_required": ["weight", "stride", "padding", "dilation", "groups"],
+        "params_optional": [
+            "bias",
+            "transposed",
+            "output_padding",
+            "padding_mode",
+            "input_shape",
+            "output_shape",
+            "data_format",
+        ],
     },
-
     # =====================
     # Pooling
     # =====================
     LayerKind.MAXPOOL1D.value: {
         "params_required": ["kernel_size"],
-        "params_optional": ["stride","padding","dilation","ceil_mode","count_include_pad","output_size"],
+        "params_optional": [
+            "stride",
+            "padding",
+            "dilation",
+            "ceil_mode",
+            "count_include_pad",
+            "output_size",
+        ],
     },
     LayerKind.MAXPOOL2D.value: {
-        "torch_module": "torch.nn.MaxPool2d",
         "params_required": ["kernel_size"],
-        "params_optional": ["stride","padding","dilation","ceil_mode","count_include_pad","output_size","input_shape","output_shape"],
+        "params_optional": [
+            "stride",
+            "padding",
+            "dilation",
+            "ceil_mode",
+            "count_include_pad",
+            "output_size",
+            "input_shape",
+            "output_shape",
+        ],
     },
     LayerKind.MAXPOOL3D.value: {
         "params_required": ["kernel_size"],
-        "params_optional": ["stride","padding","dilation","ceil_mode","count_include_pad","output_size"],
+        "params_optional": [
+            "stride",
+            "padding",
+            "dilation",
+            "ceil_mode",
+            "count_include_pad",
+            "output_size",
+        ],
     },
     LayerKind.AVGPOOL1D.value: {
         "params_required": ["kernel_size"],
-        "params_optional": ["stride","padding","dilation","ceil_mode","count_include_pad","output_size"],
+        "params_optional": [
+            "stride",
+            "padding",
+            "dilation",
+            "ceil_mode",
+            "count_include_pad",
+            "output_size",
+        ],
     },
     LayerKind.AVGPOOL2D.value: {
-        "torch_module": "torch.nn.AvgPool2d",
         "params_required": ["kernel_size"],
-        "params_optional": ["stride","padding","dilation","ceil_mode","count_include_pad","output_size","input_shape","output_shape"],
+        "params_optional": [
+            "stride",
+            "padding",
+            "dilation",
+            "ceil_mode",
+            "count_include_pad",
+            "output_size",
+            "input_shape",
+            "output_shape",
+        ],
     },
     LayerKind.AVGPOOL3D.value: {
         "params_required": ["kernel_size"],
-        "params_optional": ["stride","padding","dilation","ceil_mode","count_include_pad","output_size"],
+        "params_optional": [
+            "stride",
+            "padding",
+            "dilation",
+            "ceil_mode",
+            "count_include_pad",
+            "output_size",
+        ],
     },
     LayerKind.ADAPTIVEAVGPOOL2D.value: {
         "params_required": [],
         "params_optional": ["output_size"],
     },
-
     # =====================
     # Activations / elementwise
     # =====================
     LayerKind.RELU.value: {
-        "torch_module": "torch.nn.ReLU",
         "params_required": [],
-        "params_optional": ["input_shape","output_shape"],
+        "params_optional": ["input_shape", "output_shape"],
     },
     LayerKind.LRELU.value: {
         "params_required": [],
-        "params_optional": ["negative_slope"],
+        "params_optional": ["negative_slope", "alpha"],
     },
     LayerKind.PRELU.value: {
         "params_required": ["weight"],
         "params_optional": [],
     },
     LayerKind.SIGMOID.value: {
-        "torch_module": "torch.nn.Sigmoid",
         "params_required": [],
-        "params_optional": ["input_shape","output_shape"],
+        "params_optional": ["input_shape", "output_shape"],
     },
     LayerKind.TANH.value: {
-        "torch_module": "torch.nn.Tanh",
         "params_required": [],
-        "params_optional": ["input_shape","output_shape"],
+        "params_optional": ["input_shape", "output_shape"],
     },
     LayerKind.SOFTPLUS.value: {
         "params_required": [],
-        "params_optional": ["input_shape","output_shape"],
+        "params_optional": ["input_shape", "output_shape"],
     },
     LayerKind.SILU.value: {
         "params_required": [],
-        "params_optional": ["input_shape","output_shape"],
+        "params_optional": ["input_shape", "output_shape"],
     },
     LayerKind.GELU.value: {
         "params_required": [],
@@ -308,79 +417,121 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     LayerKind.RELU6.value: {
         "params_required": [],
-        "params_optional": ["input_shape","output_shape"],
+        "params_optional": ["input_shape", "output_shape"],
     },
     LayerKind.HARDTANH.value: {
         "params_required": [],
-        "params_optional": ["min_val","max_val"],
+        "params_optional": ["min_val", "max_val"],
     },
     LayerKind.HARDSIGMOID.value: {
         "params_required": [],
-        "params_optional": ["alpha","beta"],
+        "params_optional": ["alpha", "beta"],
     },
     LayerKind.HARDSWISH.value: {
         "params_required": [],
-        "params_optional": ["input_shape","output_shape"],
+        "params_optional": ["input_shape", "output_shape"],
     },
     LayerKind.MISH.value: {
         "params_required": [],
-        "params_optional": ["input_shape","output_shape"],
+        "params_optional": ["input_shape", "output_shape"],
     },
     LayerKind.SOFTSIGN.value: {
         "params_required": [],
-        "params_optional": ["input_shape","output_shape"],
+        "params_optional": ["input_shape", "output_shape"],
     },
     LayerKind.ABS.value: {
         "params_required": [],
-        "params_optional": ["input_shape","output_shape"],
+        "params_optional": ["input_shape", "output_shape"],
     },
     LayerKind.CLIP.value: {
         "params_required": [],
-        "params_optional": ["min","max"],
+        "params_optional": ["min", "max"],
     },
     LayerKind.ADD.value: {
         "params_required": [],
-        "params_optional": ["bias","broadcast","axis","input_shape","output_shape","original_shape","x_vars","y_vars","x_src","y_src","requires_graph_restoration","input_node_ids"],
+        "params_optional": [
+            "bias",
+            "broadcast",
+            "axis",
+            "input_shape",
+            "output_shape",
+            "original_shape",
+            "x_vars",
+            "y_vars",
+            "x_src",
+            "y_src",
+            "requires_graph_restoration",
+            "input_node_ids",
+        ],
     },
     LayerKind.SUB.value: {
         "params_required": [],
-        "params_optional": ["broadcast","axis"],
+        "params_optional": ["broadcast", "axis", "x_vars", "y_vars"],
     },
     LayerKind.MUL.value: {
         "params_required": [],
-        "params_optional": ["scale","broadcast","axis","input_shape","output_shape","original_shape","requires_graph_restoration","input_node_ids"],
+        "params_optional": [
+            "scale",
+            "broadcast",
+            "axis",
+            "input_shape",
+            "output_shape",
+            "original_shape",
+            "requires_graph_restoration",
+            "input_node_ids",
+            "x_vars",
+            "y_vars",
+        ],
     },
     LayerKind.DIV.value: {
         "params_required": [],
-        "params_optional": ["broadcast","axis"],
+        "params_optional": ["broadcast", "axis", "x_vars", "y_vars"],
     },
     LayerKind.POW.value: {
         "params_required": [],
-        "params_optional": ["broadcast","axis"],
+        "params_optional": ["broadcast", "axis", "x_vars", "y_vars"],
     },
     LayerKind.MIN.value: {
         "params_required": [],
-        "params_optional": ["broadcast","axis"],
+        "params_optional": ["broadcast", "axis", "x_vars", "y_vars", "y_vars_list"],
     },
     LayerKind.MAX.value: {
         "params_required": [],
-        "params_optional": ["broadcast","axis"],
+        "params_optional": ["broadcast", "axis", "x_vars", "y_vars", "y_vars_list"],
     },
     LayerKind.SCALE.value: {
         "params_required": ["a"],
-        "params_optional": ["input_shape","output_shape","original_shape","is_batchnorm_decomposition","batchnorm_module","batchnorm_args","batchnorm_kwargs","batchnorm_state"],
+        "params_optional": [
+            "input_shape",
+            "output_shape",
+            "original_shape",
+            "is_batchnorm_decomposition",
+            "batchnorm_module",
+            "batchnorm_args",
+            "batchnorm_kwargs",
+            "batchnorm_state",
+        ],
     },
     LayerKind.BIAS.value: {
         "params_required": ["c"],
-        "params_optional": ["input_shape","output_shape","original_shape","paired_with_scale","is_batchnorm_decomposition","batchnorm_module","batchnorm_args","batchnorm_kwargs","batchnorm_state"],
+        "params_optional": [
+            "input_shape",
+            "output_shape",
+            "original_shape",
+            "paired_with_scale",
+            "is_batchnorm_decomposition",
+            "batchnorm_module",
+            "batchnorm_args",
+            "batchnorm_kwargs",
+            "batchnorm_state",
+        ],
     },
-
     # =====================
     # Tensor plumbing
     # =====================
     LayerKind.CONCAT.value: {
         "params_required": ["concat_dim"],
-        "params_optional": ["requires_graph_restoration","input_node_ids"],
+        "params_optional": ["requires_graph_restoration", "input_node_ids"],
     },
     LayerKind.STACK.value: {
         "params_required": ["axis"],
@@ -391,9 +542,8 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
         "params_optional": ["target_shape"],
     },
     LayerKind.FLATTEN.value: {
-        "torch_module": "torch.nn.Flatten",
         "params_required": [],
-        "params_optional": ["start_dim","end_dim","input_shape","output_shape"],
+        "params_optional": ["start_dim", "end_dim", "input_shape", "output_shape"],
     },
     LayerKind.TRANSPOSE.value: {
         "params_required": [],
@@ -417,27 +567,65 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     LayerKind.UPSAMPLE.value: {
         "params_required": [],
-        "params_optional": ["mode","align_corners","scale_factor","size"],
+        "params_optional": ["mode", "align_corners", "scale_factor", "size"],
     },
-
     # =====================
     # Sequences / attention
     # =====================
     LayerKind.EMBEDDING.value: {
-        "params_required": ["weight","num_embeddings","embedding_dim"],
-        "params_optional": ["padding_idx","max_norm","norm_type","scale_grad_by_freq","sparse"],
+        "params_required": ["weight", "num_embeddings", "embedding_dim"],
+        "params_optional": [
+            "padding_idx",
+            "max_norm",
+            "norm_type",
+            "scale_grad_by_freq",
+            "sparse",
+        ],
     },
     LayerKind.RNN.value: {
-        "params_required": ["input_size","hidden_size","num_layers","bidirectional"],
-        "params_optional": ["weight_ih_l0","weight_hh_l0","bias_ih_l0","bias_hh_l0","dropout","batch_first","nonlinearity","proj_size","gate_order","packed_sequence"],
+        "params_required": ["input_size", "hidden_size", "num_layers", "bidirectional"],
+        "params_optional": [
+            "weight_ih_l0",
+            "weight_hh_l0",
+            "bias_ih_l0",
+            "bias_hh_l0",
+            "dropout",
+            "batch_first",
+            "nonlinearity",
+            "proj_size",
+            "gate_order",
+            "packed_sequence",
+        ],
     },
     LayerKind.GRU.value: {
-        "params_required": ["input_size","hidden_size","num_layers","bidirectional"],
-        "params_optional": ["weight_ih_l0","weight_hh_l0","bias_ih_l0","bias_hh_l0","dropout","batch_first","nonlinearity","proj_size","gate_order","packed_sequence"],
+        "params_required": ["input_size", "hidden_size", "num_layers", "bidirectional"],
+        "params_optional": [
+            "weight_ih_l0",
+            "weight_hh_l0",
+            "bias_ih_l0",
+            "bias_hh_l0",
+            "dropout",
+            "batch_first",
+            "nonlinearity",
+            "proj_size",
+            "gate_order",
+            "packed_sequence",
+        ],
     },
     LayerKind.LSTM.value: {
-        "params_required": ["input_size","hidden_size","num_layers","bidirectional"],
-        "params_optional": ["weight_ih_l0","weight_hh_l0","bias_ih_l0","bias_hh_l0","dropout","batch_first","nonlinearity","proj_size","gate_order","packed_sequence"],
+        "params_required": ["input_size", "hidden_size", "num_layers", "bidirectional"],
+        "params_optional": [
+            "weight_ih_l0",
+            "weight_hh_l0",
+            "bias_ih_l0",
+            "bias_hh_l0",
+            "dropout",
+            "batch_first",
+            "nonlinearity",
+            "proj_size",
+            "gate_order",
+            "packed_sequence",
+        ],
     },
     LayerKind.SOFTMAX.value: {
         "params_required": ["axis"],
@@ -445,14 +633,62 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     LayerKind.MHA.value: {
         "params_required": ["num_heads"],
-        "params_optional": ["in_proj_weight","in_proj_bias","q_proj.weight","q_proj.bias","k_proj.weight","k_proj.bias","v_proj.weight","v_proj.bias","out_proj.weight","out_proj.bias","bias_k","bias_v","rel_pos_bias","head_dim","scale","dropout","add_zero_attn","batch_first","causal","mask_kind","mask_format","axis","qkv_layout","posenc_kind","rope_theta"],
+        "params_optional": [
+            "in_proj_weight",
+            "in_proj_bias",
+            "q_proj.weight",
+            "q_proj.bias",
+            "k_proj.weight",
+            "k_proj.bias",
+            "v_proj.weight",
+            "v_proj.bias",
+            "out_proj.weight",
+            "out_proj.bias",
+            "bias_k",
+            "bias_v",
+            "rel_pos_bias",
+            "head_dim",
+            "scale",
+            "dropout",
+            "add_zero_attn",
+            "batch_first",
+            "causal",
+            "mask_kind",
+            "mask_format",
+            "axis",
+            "qkv_layout",
+            "posenc_kind",
+            "rope_theta",
+        ],
     },
     LayerKind.POSENC.value: {
         "params_required": [],
-        "params_optional": ["weight","slopes","kind","seq_len","embedding_dim","theta"],
+        "params_optional": [
+            "weight",
+            "slopes",
+            "kind",
+            "seq_len",
+            "embedding_dim",
+            "theta",
+        ],
+    },
+    LayerKind.SLICE.value: {
+        "params_required": ["starts", "ends", "axes"],
+        "params_optional": ["input_shape", "output_shape"],
+    },
+    LayerKind.GATHER.value: {
+        "params_required": ["indices", "axis"],
+        "params_optional": ["input_shape", "output_shape"],
+    },
+    LayerKind.INDEX_SELECT.value: {
+        "params_required": ["indices", "dim"],
+        "params_optional": ["input_shape", "output_shape"],
+    },
+    LayerKind.PAD.value: {
+        "params_required": ["pad"],
+        "params_optional": ["mode", "value", "input_shape", "output_shape"],
     },
 }
-
 
 # Supported exporter op tags (base name before ":").
 SUPPORTED_EXPORT_OPS = {

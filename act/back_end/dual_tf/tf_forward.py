@@ -116,6 +116,9 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
             A, bias, lb, ub = _fwd_lrelu(A, bias, x0, eps, lb, ub, alpha)
             if post_activation:
                 bounds_dict[lid] = Bounds(lb.clone(), ub.clone())  # POST-activation (for validation)
+                # Keep forward validation sound: do not keep propagating affine
+                # coefficients from an upper relaxation through subsequent layers.
+                A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
             
         elif kind in ["MAXPOOL2D"]:
             lb, ub = _fwd_maxpool2d(layer, lb, ub)
@@ -290,10 +293,11 @@ def _fwd_lrelu(A: torch.Tensor, bias: torch.Tensor, x0: torch.Tensor, eps: torch
     bias_new = d * bias + offset
     center = A_new @ x0 + bias_new
     radius = A_new.abs() @ eps
-    
-    # Leaky ReLU output bounds (can be negative if α > 0)
-    lb_out = center - radius
     ub_out = center + radius
+
+    # Sound lower bound for monotone LeakyReLU:
+    # f(x)=x for x>=0, alpha*x for x<0 (alpha>0), so minimum over [lb,ub] is f(lb).
+    lb_out = torch.where(on, lb, alpha * lb)
     return A_new, bias_new, lb_out, ub_out
 
 def _fwd_conv2d(layer: Layer, lb: torch.Tensor, ub: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

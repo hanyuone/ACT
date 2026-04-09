@@ -63,6 +63,7 @@ def _add_tanh_small_band(solver: Solver, yi: int, zi: int, lo: float, hi: float)
     solver.add_lin_ge([zi, yi], [1.0, -1.0], float(-delta))
 
 def _add_tanh_constraints_for_var(solver: Solver, yi: int, zi: int, lo: float, hi: float) -> None:
+    """Add LP relaxation constraints for z = tanh(y) over [lo, hi]."""
     if not np.isfinite(lo) or not np.isfinite(hi):
         return
 
@@ -86,17 +87,25 @@ def _add_tanh_constraints_for_var(solver: Solver, yi: int, zi: int, lo: float, h
         _add_tanh_concave_segment(solver, yi, zi, lo, hi)
         return
 
-    added = False
+    # Range crosses zero: use global monotone bounds + per-region tangents.
+    f_lo = _tanh_value(lo)
+    f_hi = _tanh_value(hi)
+
+    # Global bounds (tanh is monotone)
+    solver.add_lin_ge([zi], [1.0], float(f_lo))
+    solver.add_lin_le([zi], [1.0], float(f_hi))
+
+    # Tangent lines in convex region (y < 0) → valid global lower bounds
     if lo < -TANH_EPS:
-        neg_hi = min(hi, -TANH_EPS)
-        _add_tanh_convex_segment(solver, yi, zi, lo, neg_hi)
-        added = True
+        slope_lo = _tanh_derivative(lo)
+        intercept_lo = f_lo - slope_lo * lo
+        solver.add_lin_ge([zi, yi], [1.0, -float(slope_lo)], float(intercept_lo))
+
+    # Tangent lines in concave region (y > 0) → valid global upper bounds
     if hi > TANH_EPS:
-        pos_lo = max(lo, TANH_EPS)
-        _add_tanh_concave_segment(solver, yi, zi, pos_lo, hi)
-        added = True
-    if not added:
-        _add_tanh_small_band(solver, yi, zi, lo, hi)
+        slope_hi = _tanh_derivative(hi)
+        intercept_hi = f_hi - slope_hi * hi
+        solver.add_lin_le([zi, yi], [1.0, -float(slope_hi)], float(intercept_hi))
 
 def to_numpy(x) -> np.ndarray:
     try:
@@ -199,7 +208,8 @@ def export_to_solver(globalC: ConSet, solver: Solver,
             meta=con.meta; alpha=float(meta["alpha"]); n=len(con.var_ids)//2
             z=list(con.var_ids[:n]); y=list(con.var_ids[n:])
             for i in to_numpy(meta["idx_on"]).astype(int):  solver.add_lin_eq([z[i],y[i]],[1.0,-1.0],0.0)
-            for i in to_numpy(meta["idx_off"]).astype(int): solver.add_lin_eq([z[i],y[i]],[1.0, alpha],0.0)
+            # LRELU off region: z = alpha * y, i.e. z - alpha*y = 0
+            for i in to_numpy(meta["idx_off"]).astype(int): solver.add_lin_eq([z[i],y[i]],[1.0, -alpha],0.0)
             for i in to_numpy(meta["idx_amb"]).astype(int):
                 solver.add_lin_le([y[i],z[i]],[ 1.0,-1.0],0.0)
                 solver.add_lin_le([y[i],z[i]],[ alpha,-1.0],0.0)

@@ -46,7 +46,10 @@ def tf_relu(L: Layer, Bin: Bounds) -> Fact:
     l,u=Bin.lb,Bin.ub; on=l>=0; off=u<=0; amb=~(on|off)
     lb=torch.where(off,0.0,torch.where(on,l,0.0)); ub=torch.where(off,0.0,torch.where(on,u,u))
     if torch.any(amb):
-        s=u[amb]/torch.clamp(u[amb]-l[amb],min=1e-12); t=-s*l[amb]
+        ua,la=u[amb],l[amb]; gap=ua-la
+        finite=torch.isfinite(gap) & (gap>1e-12)
+        s=torch.where(finite, ua/torch.clamp(gap,min=1e-12), torch.ones_like(gap))
+        t=torch.where(finite, -s*la, torch.zeros_like(gap))
     else: s=t=torch.empty(0, dtype=l.dtype, device=l.device)
     B=Bounds(lb,ub); C=ConSet()
     C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"relu:{L.id}",
@@ -58,10 +61,15 @@ def tf_relu(L: Layer, Bin: Bounds) -> Fact:
 
 def tf_lrelu(L: Layer, Bin: Bounds) -> Fact:
     a=float(L.params["alpha"]); l,u=Bin.lb,Bin.ub; on=l>=0; off=u<=0; amb=~(on|off)
-    lb=torch.minimum(a*torch.minimum(l,0.0), torch.maximum(l,0.0))
-    ub=torch.maximum(a*torch.maximum(u,0.0), torch.maximum(u,0.0))
+    z=torch.zeros_like(l)
+    lb=torch.minimum(a*torch.minimum(l,z), torch.maximum(l,z))
+    ub=torch.maximum(a*torch.maximum(u,z), torch.maximum(u,z))
     if torch.any(amb):
-        s=(u[amb]-a*l[amb])/torch.clamp(u[amb]-l[amb],min=1e-12); t=a*l[amb]-s*l[amb]
+        la,ua=l[amb],u[amb]; gap=ua-la
+        # Guard against inf-inf=NaN: when gap is not finite, use slope=max(a,1)
+        finite=torch.isfinite(gap) & (gap>1e-12)
+        s=torch.where(finite, (ua-a*la)/torch.clamp(gap,min=1e-12), torch.full_like(gap,max(a,1.0)))
+        t=torch.where(finite, a*la-s*la, torch.zeros_like(gap))
     else: s=t=torch.empty(0, dtype=l.dtype, device=l.device)
     B=Bounds(lb,ub); C=ConSet()
     C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"lrelu:{L.id}","alpha":a,

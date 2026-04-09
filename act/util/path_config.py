@@ -223,3 +223,21 @@ def list_spec_configs() -> list:
     from pathlib import Path
     config_root = Path(get_spec_config_root())
     return sorted([f.stem for f in config_root.glob('*.yaml')])
+
+
+# ============================================================================
+# NetFactory Paths
+# ============================================================================
+
+def get_examples_nets_dir() -> str:
+    """Get directory containing pre-generated Net JSON files."""
+    from pathlib import Path
+    d = Path(get_project_root()) / 'act' / 'back_end' / 'examples' / 'nets'
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
+def get_examples_gen_config_path() -> str:
+    """Get path to the NetFactory generation YAML config."""
+    from pathlib import Path
+    return str(Path(get_project_root()) / 'act' / 'back_end' / 'examples' / 'config_gen_act_net.yaml')
