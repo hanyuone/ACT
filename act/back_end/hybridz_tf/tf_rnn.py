@@ -48,10 +48,7 @@ def hybridz_tf_lstm(L: Layer, Bin: Bounds) -> Fact:
     
     Bout = Bounds(lb=lb, ub=ub)
     
-    cons = ConSet()
-    cons.add_lstm(L.id, L.in_vars, L.out_vars, input_size, hidden_size)
-    
-    return Fact(bounds=Bout, cons=cons)
+    return Fact(bounds=Bout, cons=ConSet())
 
 
 @torch.no_grad()
@@ -75,10 +72,7 @@ def hybridz_tf_gru(L: Layer, Bin: Bounds) -> Fact:
     
     Bout = Bounds(lb=lb, ub=ub)
     
-    cons = ConSet()
-    cons.add_gru(L.id, L.in_vars, L.out_vars, input_size, hidden_size)
-    
-    return Fact(bounds=Bout, cons=cons)
+    return Fact(bounds=Bout, cons=ConSet())
 
 
 @torch.no_grad()
@@ -105,10 +99,7 @@ def hybridz_tf_rnn(L: Layer, Bin: Bounds) -> Fact:
     
     Bout = Bounds(lb=lb, ub=ub)
     
-    cons = ConSet()
-    cons.add_rnn(L.id, L.in_vars, L.out_vars, input_size, hidden_size, nonlinearity)
-    
-    return Fact(bounds=Bout, cons=cons)
+    return Fact(bounds=Bout, cons=ConSet())
 
 
 @torch.no_grad()
@@ -131,7 +122,4 @@ def hybridz_tf_embedding(L: Layer, Bin: Bounds) -> Fact:
     
     Bout = Bounds(lb=lb, ub=ub)
     
-    cons = ConSet()
-    cons.add_embedding(L.id, L.in_vars, L.out_vars, num_embeddings, embedding_dim, weight)
-    
-    return Fact(bounds=Bout, cons=cons)
+    return Fact(bounds=Bout, cons=ConSet())

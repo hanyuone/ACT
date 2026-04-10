@@ -133,3 +133,49 @@ class GurobiSolver(Solver):
     def get_counterexample(self, input_ids: List[int]) -> np.ndarray:
         # Gurobi returns exact LP/MILP solutions; just proxy.
         return self.get_values(input_ids)
+
+    @staticmethod
+    def compute_bounds(hz) -> 'Bounds':
+        from act.back_end.core import Bounds
+        import torch
+        n = int(hz.c.shape[0])
+        p = int(hz.Gc.shape[1])
+        q = int(hz.Gb.shape[1])
+        c_np = hz.c.detach().cpu().numpy().astype("float64").reshape(-1)
+        Gc_np = hz.Gc.detach().cpu().numpy().astype("float64")
+        Gb_np = hz.Gb.detach().cpu().numpy().astype("float64")
+        Ac_np = hz.Ac.detach().cpu().numpy().astype("float64")
+        Ab_np = hz.Ab.detach().cpu().numpy().astype("float64")
+        b_np = hz.b.detach().cpu().numpy().astype("float64").reshape(-1)
+        nc = Ac_np.shape[0]
+        LB = np.empty((n,), dtype=np.float64)
+        UB = np.empty((n,), dtype=np.float64)
+        for i in range(n):
+            m = gp.Model(f"hz_dim_{i}")
+            m.Params.OutputFlag = 0
+            xi_c = m.addMVar(p, lb=-1.0, ub=1.0, name="xi_c")
+            xi_b = m.addMVar(q, vtype=GRB.BINARY, name="xi_b") if q > 0 else None
+            if nc > 0:
+                if xi_b is not None:
+                    for r in range(nc):
+                        m.addConstr(Ac_np[r] @ xi_c + Ab_np[r] @ xi_b == b_np[r])
+                else:
+                    for r in range(nc):
+                        m.addConstr(Ac_np[r] @ xi_c == b_np[r])
+            obj_c = Gc_np[i]
+            obj_b = Gb_np[i] if q > 0 else np.zeros(0)
+            if xi_b is not None:
+                m.setObjective(obj_c @ xi_c + obj_b @ xi_b, GRB.MINIMIZE)
+            else:
+                m.setObjective(obj_c @ xi_c, GRB.MINIMIZE)
+            m.optimize()
+            LB[i] = c_np[i] + (m.ObjVal if m.Status == GRB.OPTIMAL else 0.0)
+            if xi_b is not None:
+                m.setObjective(obj_c @ xi_c + obj_b @ xi_b, GRB.MAXIMIZE)
+            else:
+                m.setObjective(obj_c @ xi_c, GRB.MAXIMIZE)
+            m.optimize()
+            UB[i] = c_np[i] + (m.ObjVal if m.Status == GRB.OPTIMAL else 0.0)
+        dtype, device = hz.c.dtype, hz.c.device
+        return Bounds(lb=torch.from_numpy(LB).to(device=device, dtype=dtype),
+                      ub=torch.from_numpy(UB).to(device=device, dtype=dtype))
