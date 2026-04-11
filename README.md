@@ -1,12 +1,12 @@
 # Abstract Constraint Transformation (ACT)
 
-A testing and verification platform for neural networks and AI models built on a three-tier architecture (front-end, back-end, and pipeline), with PyTorch-native support and ACT intermediate representation (IR) that enables refinement-based precision, diverse model architectures, input formats, and specification types.
+A testing and verification platform for AI models based on neural networks, built on a three-tier architecture (front-end, back-end, and pipeline), with native PyTorch support and an ACT intermediate representation (IR) that enables refinement-based precision and supports diverse model architectures, input formats, and specification types.
 
 ## Quick Start
 
 
 ## 0. Preparation
-Install [Miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install#quickstart-install-instructions) and create running environment.
+Install [Miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install#quickstart-install-instructions) and create a running environment.
 
 ```
 conda env create -f environment.yml    # Install required lib packages to run ACT
@@ -34,13 +34,11 @@ python -m act.pipeline --help
 - [ACT Verifier example](https://github.com/SVF-tools/ACT/blob/main/ipynb/vnnlib_verifier.ipynb)
 - [More](https://github.com/SVF-tools/ACT/tree/main/ipynb)
 
+### Pubs and Docs
+- Kaijie Liu and Yulei Sui. [Detecting Unsoundness in Neural Network Verifiers via Concrete–Abstract Consistency](https://openreview.net/forum?id=6vjnMGdx5i). ACM/IEEE International Conference on AI-Powered Software Engineering (AIWare 2026)
+
 ### License
 ACT is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
-
-
-### Pubs and Docs
-Kaijie Liu and Yulei Sui. [Detecting Unsoundness in Neural Network Verifiers via Concrete–Abstract Consistency](https://openreview.net/forum?id=6vjnMGdx5i). ACM/IEEE International Conference on AI-Powered Software Engineering (AIWare 2026)
-
 
 ### Acknowledgements
 This project was developed with the assistance of GitHub Copilot to enhance code readability and efficiency. AI-generated suggestions were reviewed and tested by the contributors before inclusion.
