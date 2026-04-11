@@ -1,15 +1,29 @@
+# ===- act/back_end/hybridz_tf/tf_mlp.py - HybridZ MLP Transfer Functions ====#
+# ACT: Abstract Constraint Transformer
+# Copyright (C) 2025– ACT Team
+#
+# Licensed under the GNU Affero General Public License v3.0 or later (AGPLv3+).
+# Distributed without any warranty; see <http://www.gnu.org/licenses/>.
+# ===---------------------------------------------------------------------===#
+#
+# Purpose:
+#   HybridZ MLP Transfer Functions. Implements HybridZ-based transfer functions
+#   for MLP layers including dense, activation, and element-wise operations.
+#
+# ===---------------------------------------------------------------------===#
+
 import torch
 import torch.nn.functional as F
 from act.back_end.core import Bounds, Fact
 from act.back_end.solver.solver_hz import (
-    HZono, hz_multiply, hz_add_const, hz_minkowski_sum,
-    hz_from_bounds, hz_compute_bounds,
+    HZono,
+    hz_multiply,
+    hz_add_const,
+    hz_minkowski_sum,
+    hz_from_bounds,
+    hz_compute_bounds,
 )
-from act.back_end.interval_tf.tf_mlp import (
-    tf_dense, tf_bias, tf_scale, tf_relu, tf_lrelu,
-    tf_tanh, tf_sigmoid, tf_abs, tf_bn,
-    tf_add, tf_mul, tf_concat,
-)
+import act.back_end.interval_tf.tf_mlp as interval
 
 
 # ============================================================================
@@ -20,7 +34,8 @@ from act.back_end.interval_tf.tf_mlp import (
 
 # --- HZ transfer functions (MLP) ---
 
-def hz_tf_dense(L, bounds, tf):
+
+def tf_dense(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     if hz_in is not None:
         dtype, device = hz_in.c.dtype, hz_in.c.device
@@ -30,98 +45,100 @@ def hz_tf_dense(L, bounds, tf):
             b_col = b.to(dtype=dtype, device=device)
             hz = hz_add_const(hz, b_col.view(-1, 1) if b_col.ndim == 1 else b_col)
         tf._hz_cache[L.id] = hz
-    fact = tf_dense(L, bounds)
+    fact = interval.tf_dense(L, bounds)
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
     return fact
 
 
-def hz_tf_bias(L, bounds, tf):
+def tf_bias(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     if hz_in is not None:
         dtype, device = hz_in.c.dtype, hz_in.c.device
         c = L.params["c"].to(dtype=dtype, device=device)
         tf._hz_cache[L.id] = hz_add_const(hz_in, c.view(-1, 1) if c.ndim == 1 else c)
-    fact = tf_bias(L, bounds)
+    fact = interval.tf_bias(L, bounds)
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
     return fact
 
 
-def hz_tf_scale(L, bounds, tf):
+def tf_scale(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     if hz_in is not None:
         dtype, device = hz_in.c.dtype, hz_in.c.device
         a = L.params["a"].to(dtype=dtype, device=device).flatten()
         tf._hz_cache[L.id] = hz_multiply(hz_in, torch.diag(a))
-    fact = tf_scale(L, bounds)
+    fact = interval.tf_scale(L, bounds)
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
     return fact
 
 
-def hz_tf_relu(L, bounds, tf):
+def tf_relu(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     if hz_in is not None:
         tf._hz_cache[L.id] = hz_reduce(hz_apply_relu(hz_in))
-    fact = tf_relu(L, bounds)
+    fact = interval.tf_relu(L, bounds)
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
     return fact
 
 
-def hz_tf_lrelu(L, bounds, tf):
+def tf_lrelu(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     if hz_in is not None:
         tf._hz_cache[L.id] = hz_reduce(
             hz_apply_leaky_relu(hz_in, float(L.params.get("negative_slope", 0.01)))
         )
-    fact = tf_lrelu(L, bounds)
+    fact = interval.tf_lrelu(L, bounds)
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
     return fact
 
 
-def hz_tf_tanh(L, bounds, tf):
+def tf_tanh(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     if hz_in is not None:
-        tf._hz_cache[L.id] = hz_apply_tanh(hz_in, K=tf._tanh_K)
-    fact = tf_tanh(L, bounds)
+        tf._hz_cache[L.id] = hz_reduce(hz_apply_tanh(hz_in, K=tf._tanh_K))
+    fact = interval.tf_tanh(L, bounds)
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
     return fact
 
 
-def hz_tf_sigmoid(L, bounds, tf):
+def tf_sigmoid(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     if hz_in is not None:
-        tf._hz_cache[L.id] = hz_apply_sigmoid(hz_in, K=tf._sigmoid_K)
-    fact = tf_sigmoid(L, bounds)
+        tf._hz_cache[L.id] = hz_reduce(hz_apply_sigmoid(hz_in, K=tf._sigmoid_K))
+    fact = interval.tf_sigmoid(L, bounds)
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
     return fact
 
 
-def hz_tf_abs(L, bounds, tf):
+def tf_abs(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     if hz_in is not None:
         dtype, device = hz_in.c.dtype, hz_in.c.device
         bds = hz_compute_bounds(hz_in)
         lb_out = torch.where(
-            bds.lb >= 0, bds.lb,
+            bds.lb >= 0,
+            bds.lb,
             torch.where(bds.ub <= 0, -bds.ub, torch.zeros_like(bds.lb)),
         )
         tf._hz_cache[L.id] = hz_from_bounds(
             Bounds(lb=lb_out, ub=torch.maximum(bds.lb.abs(), bds.ub.abs())),
-            dtype, device,
+            dtype,
+            device,
         )
-    fact = tf_abs(L, bounds)
+    fact = interval.tf_abs(L, bounds)
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
     return fact
 
 
-def hz_tf_bn(L, bounds, tf):
+def tf_bn(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     if hz_in is not None:
         dtype, device = hz_in.c.dtype, hz_in.c.device
@@ -129,13 +146,13 @@ def hz_tf_bn(L, bounds, tf):
         c = L.params["c"].to(dtype=dtype, device=device)
         hz = hz_multiply(hz_in, torch.diag(A))
         tf._hz_cache[L.id] = hz_add_const(hz, c.view(-1, 1) if c.ndim == 1 else c)
-    fact = tf_bn(L, bounds)
+    fact = interval.tf_bn(L, bounds)
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
     return fact
 
 
-def hz_tf_add(L, bounds, tf):
+def tf_add(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     if hz_in is not None:
         preds = tf._net.preds.get(L.id, [])
@@ -144,15 +161,17 @@ def hz_tf_add(L, bounds, tf):
             tf._hz_cache[L.id] = hz_minkowski_sum(hz_in, hz2)
         else:
             hz_in = None
-    fact = tf_add(L,
+    fact = interval.tf_add(
+        L,
         tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
-        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1))
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1),
+    )
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
     return fact
 
 
-def hz_tf_mul(L, bounds, tf):
+def tf_mul(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     if hz_in is not None:
         dtype, device = hz_in.c.dtype, hz_in.c.device
@@ -168,15 +187,17 @@ def hz_tf_mul(L, bounds, tf):
             )
         else:
             hz_in = None
-    fact = tf_mul(L,
+    fact = interval.tf_mul(
+        L,
         tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
-        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1))
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1),
+    )
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
     return fact
 
 
-def hz_tf_concat(L, bounds, tf):
+def tf_concat(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     if hz_in is not None:
         preds = tf._net.preds.get(L.id, [])
@@ -188,13 +209,16 @@ def hz_tf_concat(L, bounds, tf):
             tf._hz_cache[L.id] = result
         else:
             hz_in = None
-    fact = tf_concat(L, tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before))
+    fact = interval.tf_concat(
+        L, tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before)
+    )
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
     return fact
 
 
 # --- HZ activation encodings (zonotope domain) ---
+
 
 def hz_apply_relu(hz: HZono) -> HZono:
     """Exact ReLU via equality constraints + linking equality.
@@ -626,7 +650,8 @@ def hz_apply_tanh(hz: HZono, K: int = 2) -> HZono:
 
 # --- HZ order reduction ---
 
-def hz_reduce(hz: HZono, max_order: float = 10.0) -> HZono:
+
+def hz_reduce(hz: HZono, max_order: float = 3.0) -> HZono:
     """Reduce HZ complexity via Girard's method (sound over-approximation)."""
     dtype, device = hz.c.dtype, hz.c.device
     n = hz.c.shape[0]
@@ -680,18 +705,14 @@ def hz_reduce(hz: HZono, max_order: float = 10.0) -> HZono:
         )
 
         if nc > 0:
-            drop_set = set(drop_idx.tolist())
-            keep_rows = [
-                r
-                for r in range(nc)
-                if not any(abs(hz.Ac[r, c].item()) > 1e-15 for c in drop_set)
-            ]
-            if keep_rows:
-                krt = torch.tensor(keep_rows, dtype=torch.long, device=device)
+            has_dropped = hz.Ac[:, drop_idx].abs().max(dim=1).values > 1e-15
+            keep_mask = ~has_dropped
+            krt = torch.where(keep_mask)[0]
+            if krt.numel() > 0:
                 new_Ac = torch.cat(
                     [
                         hz.Ac[krt][:, keep_idx],
-                        torch.zeros((len(keep_rows), n), dtype=dtype, device=device),
+                        torch.zeros((krt.numel(), n), dtype=dtype, device=device),
                     ],
                     dim=1,
                 )

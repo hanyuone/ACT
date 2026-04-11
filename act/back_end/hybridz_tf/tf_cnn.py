@@ -1,13 +1,28 @@
+#===- act/back_end/hybridz_tf/tf_cnn.py - HybridZ CNN Transfer Functions ====#
+# ACT: Abstract Constraint Transformer
+# Copyright (C) 2025– ACT Team
+#
+# Licensed under the GNU Affero General Public License v3.0 or later (AGPLv3+).
+# Distributed without any warranty; see <http://www.gnu.org/licenses/>.
+#===---------------------------------------------------------------------===#
+#
+# Purpose:
+#   HybridZ CNN Transfer Functions. Implements HybridZ-based transfer functions
+#   for CNN layers including convolution, pooling, and tensor reshaping
+#   operations.
+#
+#===---------------------------------------------------------------------===#
+
 import torch
 import torch.nn.functional as F
 from act.back_end.core import Bounds, Fact
 from act.back_end.solver.solver_hz import HZono, hz_compute_bounds
-from act.back_end.interval_tf.tf_cnn import tf_conv2d, tf_maxpool2d
+import act.back_end.interval_tf.tf_cnn as interval
 
 
 # --- HZ transfer functions (CNN) ---
 
-def hz_tf_conv2d(L, bounds, tf):
+def tf_conv2d(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     if hz_in is not None:
         input_shape = L.params.get("input_shape")
@@ -19,13 +34,13 @@ def hz_tf_conv2d(L, bounds, tf):
             )
         else:
             hz_in = None
-    fact = tf_conv2d(L, bounds)
+    fact = interval.tf_conv2d(L, bounds)
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
     return fact
 
 
-def hz_tf_maxpool2d(L, bounds, tf):
+def tf_maxpool2d(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     if hz_in is not None:
         bds = hz_compute_bounds(hz_in)
@@ -54,7 +69,7 @@ def hz_tf_maxpool2d(L, bounds, tf):
                 done = True
         if not done:
             hz_in = None
-    fact = tf_maxpool2d(L, bounds)
+    fact = interval.tf_maxpool2d(L, bounds)
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
     return fact

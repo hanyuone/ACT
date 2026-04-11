@@ -25,144 +25,92 @@ from act.back_end.transfer_functions import TransferFunction
 from act.back_end.layer_schema import LayerKind
 from act.back_end.solver.solver_hz import HZono, hz_from_bounds, hz_compute_bounds
 
-from act.back_end.hybridz_tf.tf_mlp import (
-    hz_tf_dense,
-    hz_tf_bias,
-    hz_tf_scale,
-    hz_tf_relu,
-    hz_tf_lrelu,
-    hz_tf_tanh,
-    hz_tf_sigmoid,
-    hz_tf_abs,
-    hz_tf_bn,
-    hz_tf_add,
-    hz_tf_mul,
-    hz_tf_concat,
-)
-from act.back_end.hybridz_tf.tf_cnn import hz_tf_conv2d, hz_tf_maxpool2d
-
-from act.back_end.interval_tf.tf_mlp import (
-    tf_clip,
-    tf_softplus,
-    tf_silu,
-    tf_relu6,
-    tf_hardtanh,
-    tf_hardsigmoid,
-    tf_hardswish,
-    tf_mish,
-    tf_softsign,
-    tf_square,
-    tf_power,
-    tf_max,
-    tf_min,
-    tf_reshape,
-    tf_transpose,
-    tf_squeeze,
-    tf_unsqueeze,
-    tf_tile,
-    tf_expand,
-)
-from act.back_end.interval_tf.tf_cnn import (
-    tf_avgpool2d,
-    tf_conv1d,
-    tf_conv3d,
-    tf_convtranspose2d,
-    tf_flatten,
-)
-from act.back_end.hybridz_tf.tf_rnn import (
-    hz_tf_lstm,
-    hz_tf_gru,
-    hz_tf_rnn,
-    hz_tf_embedding,
-)
-from act.back_end.hybridz_tf.tf_transformer import (
-    hz_tf_posenc,
-    hz_tf_layernorm,
-    hz_tf_gelu,
-    hz_tf_att_scores,
-    hz_tf_softmax,
-    hz_tf_att_mix,
-    hz_tf_mha_split,
-    hz_tf_mha_join,
-    hz_tf_mask_add,
-)
+import act.back_end.hybridz_tf.tf_mlp as hz_mlp
+import act.back_end.hybridz_tf.tf_cnn as hz_cnn
+import act.back_end.hybridz_tf.tf_rnn as hz_rnn
+import act.back_end.hybridz_tf.tf_transformer as hz_transformer
+import act.back_end.interval_tf.tf_mlp as interval_mlp
+import act.back_end.interval_tf.tf_cnn as interval_cnn
 
 
 class HybridzTF(TransferFunction):
     def __init__(self):
         self._hz_cache: Dict[int, HZono] = {}
         self._cache_net_id: Optional[int] = None
-        self._tanh_K: int = 2
-        self._sigmoid_K: int = 2
+        self._tanh_K: int = 1
+        self._sigmoid_K: int = 1
 
     _LAYER_REGISTRY = {
+        # Identity / spec
         LayerKind.INPUT.value: lambda L, b, tf: Fact(bounds=b, cons=ConSet()),
         LayerKind.INPUT_SPEC.value: lambda L, b, tf: Fact(bounds=b, cons=ConSet()),
         LayerKind.ASSERT.value: lambda L, b, tf: Fact(bounds=b, cons=ConSet()),
         # MLP: HZ + interval
-        LayerKind.DENSE.value: lambda L, b, tf: hz_tf_dense(L, b, tf),
-        "BIAS": lambda L, b, tf: hz_tf_bias(L, b, tf),
-        "SCALE": lambda L, b, tf: hz_tf_scale(L, b, tf),
-        LayerKind.RELU.value: lambda L, b, tf: hz_tf_relu(L, b, tf),
-        "LRELU": lambda L, b, tf: hz_tf_lrelu(L, b, tf),
-        "TANH": lambda L, b, tf: hz_tf_tanh(L, b, tf),
-        "SIGMOID": lambda L, b, tf: hz_tf_sigmoid(L, b, tf),
-        "ABS": lambda L, b, tf: hz_tf_abs(L, b, tf),
-        "BN": lambda L, b, tf: hz_tf_bn(L, b, tf),
+        LayerKind.DENSE.value: lambda L, b, tf: hz_mlp.tf_dense(L, b, tf),
+        LayerKind.BIAS.value: lambda L, b, tf: hz_mlp.tf_bias(L, b, tf),
+        LayerKind.SCALE.value: lambda L, b, tf: hz_mlp.tf_scale(L, b, tf),
+        LayerKind.RELU.value: lambda L, b, tf: hz_mlp.tf_relu(L, b, tf),
+        LayerKind.LRELU.value: lambda L, b, tf: hz_mlp.tf_lrelu(L, b, tf),
+        LayerKind.TANH.value: lambda L, b, tf: hz_mlp.tf_tanh(L, b, tf),
+        LayerKind.SIGMOID.value: lambda L, b, tf: hz_mlp.tf_sigmoid(L, b, tf),
+        LayerKind.ABS.value: lambda L, b, tf: hz_mlp.tf_abs(L, b, tf),
+        "BN": lambda L, b, tf: hz_mlp.tf_bn(L, b, tf),
         # Multi-input: HZ + interval
-        "ADD": lambda L, b, tf: hz_tf_add(L, b, tf),
-        "MUL": lambda L, b, tf: hz_tf_mul(L, b, tf),
-        "CONCAT": lambda L, b, tf: hz_tf_concat(L, b, tf),
+        LayerKind.ADD.value: lambda L, b, tf: hz_mlp.tf_add(L, b, tf),
+        LayerKind.MUL.value: lambda L, b, tf: hz_mlp.tf_mul(L, b, tf),
+        LayerKind.CONCAT.value: lambda L, b, tf: hz_mlp.tf_concat(L, b, tf),
         # CNN: HZ + interval
-        "CONV2D": lambda L, b, tf: hz_tf_conv2d(L, b, tf),
-        "MAXPOOL2D": lambda L, b, tf: hz_tf_maxpool2d(L, b, tf),
-        # Interval-only activations
-        "CLIP": lambda L, b, tf: tf_clip(L, b),
-        "SOFTPLUS": lambda L, b, tf: tf_softplus(L, b),
-        "SILU": lambda L, b, tf: tf_silu(L, b),
-        "RELU6": lambda L, b, tf: tf_relu6(L, b),
-        "HARDTANH": lambda L, b, tf: tf_hardtanh(L, b),
-        "HARDSIGMOID": lambda L, b, tf: tf_hardsigmoid(L, b),
-        "HARDSWISH": lambda L, b, tf: tf_hardswish(L, b),
-        "MISH": lambda L, b, tf: tf_mish(L, b),
-        "SOFTSIGN": lambda L, b, tf: tf_softsign(L, b),
-        "SQUARE": lambda L, b, tf: tf_square(L, b),
-        "POWER": lambda L, b, tf: tf_power(L, b),
-        "MAX": lambda L, b, tf: tf_max(
+        LayerKind.CONV2D.value: lambda L, b, tf: hz_cnn.tf_conv2d(L, b, tf),
+        LayerKind.MAXPOOL2D.value: lambda L, b, tf: hz_cnn.tf_maxpool2d(L, b, tf),
+        # Activations: interval-only
+        LayerKind.CLIP.value: lambda L, b, tf: interval_mlp.tf_clip(L, b),
+        LayerKind.SOFTPLUS.value: lambda L, b, tf: interval_mlp.tf_softplus(L, b),
+        LayerKind.SILU.value: lambda L, b, tf: interval_mlp.tf_silu(L, b),
+        LayerKind.RELU6.value: lambda L, b, tf: interval_mlp.tf_relu6(L, b),
+        LayerKind.HARDTANH.value: lambda L, b, tf: interval_mlp.tf_hardtanh(L, b),
+        LayerKind.HARDSIGMOID.value: lambda L, b, tf: interval_mlp.tf_hardsigmoid(L, b),
+        LayerKind.HARDSWISH.value: lambda L, b, tf: interval_mlp.tf_hardswish(L, b),
+        LayerKind.MISH.value: lambda L, b, tf: interval_mlp.tf_mish(L, b),
+        LayerKind.SOFTSIGN.value: lambda L, b, tf: interval_mlp.tf_softsign(L, b),
+        "SQUARE": lambda L, b, tf: interval_mlp.tf_square(L, b),
+        "POWER": lambda L, b, tf: interval_mlp.tf_power(L, b),
+        LayerKind.MAX.value: lambda L, b, tf: interval_mlp.tf_max(
             L, tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before)
         ),
-        "MIN": lambda L, b, tf: tf_min(
+        LayerKind.MIN.value: lambda L, b, tf: interval_mlp.tf_min(
             L, tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before)
         ),
-        # CNN interval-only
-        "AVGPOOL2D": lambda L, b, tf: tf_avgpool2d(L, b),
-        "CONV1D": lambda L, b, tf: tf_conv1d(L, b),
-        "CONV3D": lambda L, b, tf: tf_conv3d(L, b),
-        "CONVTRANSPOSE2D": lambda L, b, tf: tf_convtranspose2d(L, b),
-        "FLATTEN": lambda L, b, tf: tf_flatten(L, b),
-        # Shape ops
-        "RESHAPE": lambda L, b, tf: tf_reshape(L, b),
-        "TRANSPOSE": lambda L, b, tf: tf_transpose(L, b),
-        "SQUEEZE": lambda L, b, tf: tf_squeeze(L, b),
-        "UNSQUEEZE": lambda L, b, tf: tf_unsqueeze(L, b),
-        "TILE": lambda L, b, tf: tf_tile(L, b),
-        "EXPAND": lambda L, b, tf: tf_expand(L, b),
+        # CNN: interval-only
+        LayerKind.AVGPOOL2D.value: lambda L, b, tf: interval_cnn.tf_avgpool2d(L, b),
+        LayerKind.CONV1D.value: lambda L, b, tf: interval_cnn.tf_conv1d(L, b),
+        LayerKind.CONV3D.value: lambda L, b, tf: interval_cnn.tf_conv3d(L, b),
+        LayerKind.CONVTRANSPOSE2D.value: lambda L, b, tf: (
+            interval_cnn.tf_convtranspose2d(L, b)
+        ),
+        LayerKind.FLATTEN.value: lambda L, b, tf: interval_cnn.tf_flatten(L, b),
+        # Shape ops: interval-only
+        LayerKind.RESHAPE.value: lambda L, b, tf: interval_mlp.tf_reshape(L, b),
+        LayerKind.TRANSPOSE.value: lambda L, b, tf: interval_mlp.tf_transpose(L, b),
+        LayerKind.SQUEEZE.value: lambda L, b, tf: interval_mlp.tf_squeeze(L, b),
+        LayerKind.UNSQUEEZE.value: lambda L, b, tf: interval_mlp.tf_unsqueeze(L, b),
+        LayerKind.TILE.value: lambda L, b, tf: interval_mlp.tf_tile(L, b),
+        LayerKind.EXPAND.value: lambda L, b, tf: interval_mlp.tf_expand(L, b),
         # RNN
-        "LSTM": lambda L, b, tf: hz_tf_lstm(L, b, tf),
-        "GRU": lambda L, b, tf: hz_tf_gru(L, b, tf),
-        "RNN": lambda L, b, tf: hz_tf_rnn(L, b, tf),
-        "EMBEDDING": lambda L, b, tf: hz_tf_embedding(L, b, tf),
+        LayerKind.LSTM.value: lambda L, b, tf: hz_rnn.tf_lstm(L, b, tf),
+        LayerKind.GRU.value: lambda L, b, tf: hz_rnn.tf_gru(L, b, tf),
+        LayerKind.RNN.value: lambda L, b, tf: hz_rnn.tf_rnn(L, b, tf),
+        LayerKind.EMBEDDING.value: lambda L, b, tf: hz_rnn.tf_embedding(L, b, tf),
+        "EMBEDDING_TF": lambda L, b, tf: hz_rnn.tf_embedding(L, b, tf),
         # Transformer
-        "EMBEDDING_TF": lambda L, b, tf: hz_tf_embedding(L, b, tf),
-        "POSENC": lambda L, b, tf: hz_tf_posenc(L, b, tf),
-        "LAYERNORM": lambda L, b, tf: hz_tf_layernorm(L, b, tf),
-        "GELU": lambda L, b, tf: hz_tf_gelu(L, b, tf),
-        "ATT_SCORES": lambda L, b, tf: hz_tf_att_scores(L, b, tf),
-        "SOFTMAX": lambda L, b, tf: hz_tf_softmax(L, b, tf),
-        "ATT_MIX": lambda L, b, tf: hz_tf_att_mix(L, b, tf),
-        "MHA_SPLIT": lambda L, b, tf: hz_tf_mha_split(L, b, tf),
-        "MHA_JOIN": lambda L, b, tf: hz_tf_mha_join(L, b, tf),
-        "MASK_ADD": lambda L, b, tf: tf_mask_add(L, b),
+        LayerKind.POSENC.value: lambda L, b, tf: hz_transformer.tf_posenc(L, b, tf),
+        "LAYERNORM": lambda L, b, tf: hz_transformer.tf_layernorm(L, b, tf),
+        LayerKind.GELU.value: lambda L, b, tf: hz_transformer.tf_gelu(L, b, tf),
+        "ATT_SCORES": lambda L, b, tf: hz_transformer.tf_att_scores(L, b, tf),
+        LayerKind.SOFTMAX.value: lambda L, b, tf: hz_transformer.tf_softmax(L, b, tf),
+        "ATT_MIX": lambda L, b, tf: hz_transformer.tf_att_mix(L, b, tf),
+        "MHA_SPLIT": lambda L, b, tf: hz_transformer.tf_mha_split(L, b, tf),
+        "MHA_JOIN": lambda L, b, tf: hz_transformer.tf_mha_join(L, b, tf),
+        "MASK_ADD": lambda L, b, tf: hz_transformer.tf_mask_add(L, b, tf),
     }
 
     @property
@@ -220,6 +168,14 @@ class HybridzTF(TransferFunction):
             preds = net.preds.get(L.id, [])
             if preds and preds[0] in self._hz_cache:
                 self._hz_cache[L.id] = self._hz_cache[preds[0]]
+
+        n_out = len(L.out_vars)
+        if n_out >= self._HZ_MAX_INPUT_DIM and k not in (
+            "INPUT",
+            "INPUT_SPEC",
+            "ASSERT",
+        ):
+            self._hz_cache.pop(L.id, None)
 
         hz_before = self._hz_cache.get(L.id)
         result = self._LAYER_REGISTRY[k](L, input_bounds, self)
