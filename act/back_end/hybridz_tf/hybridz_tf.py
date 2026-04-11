@@ -54,7 +54,7 @@ class HybridzTF(TransferFunction):
         LayerKind.TANH.value: lambda L, b, tf: hz_mlp.tf_tanh(L, b, tf),
         LayerKind.SIGMOID.value: lambda L, b, tf: hz_mlp.tf_sigmoid(L, b, tf),
         LayerKind.ABS.value: lambda L, b, tf: hz_mlp.tf_abs(L, b, tf),
-        "BN": lambda L, b, tf: hz_mlp.tf_bn(L, b, tf),
+        LayerKind.BN.value: lambda L, b, tf: hz_mlp.tf_bn(L, b, tf),
         # Multi-input: HZ + interval
         LayerKind.ADD.value: lambda L, b, tf: hz_mlp.tf_add(L, b, tf),
         LayerKind.MUL.value: lambda L, b, tf: hz_mlp.tf_mul(L, b, tf),
@@ -72,8 +72,8 @@ class HybridzTF(TransferFunction):
         LayerKind.HARDSWISH.value: lambda L, b, tf: interval_mlp.tf_hardswish(L, b),
         LayerKind.MISH.value: lambda L, b, tf: interval_mlp.tf_mish(L, b),
         LayerKind.SOFTSIGN.value: lambda L, b, tf: interval_mlp.tf_softsign(L, b),
-        "SQUARE": lambda L, b, tf: interval_mlp.tf_square(L, b),
-        "POWER": lambda L, b, tf: interval_mlp.tf_power(L, b),
+        LayerKind.SQUARE.value: lambda L, b, tf: interval_mlp.tf_square(L, b),
+        LayerKind.POWER.value: lambda L, b, tf: interval_mlp.tf_power(L, b),
         LayerKind.MAX.value: lambda L, b, tf: interval_mlp.tf_max(
             L, tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before)
         ),
@@ -100,17 +100,17 @@ class HybridzTF(TransferFunction):
         LayerKind.GRU.value: lambda L, b, tf: hz_rnn.tf_gru(L, b, tf),
         LayerKind.RNN.value: lambda L, b, tf: hz_rnn.tf_rnn(L, b, tf),
         LayerKind.EMBEDDING.value: lambda L, b, tf: hz_rnn.tf_embedding(L, b, tf),
-        "EMBEDDING_TF": lambda L, b, tf: hz_rnn.tf_embedding(L, b, tf),
+        LayerKind.EMBEDDING_TF.value: lambda L, b, tf: hz_rnn.tf_embedding(L, b, tf),
         # Transformer
         LayerKind.POSENC.value: lambda L, b, tf: hz_transformer.tf_posenc(L, b, tf),
-        "LAYERNORM": lambda L, b, tf: hz_transformer.tf_layernorm(L, b, tf),
+        LayerKind.LAYERNORM.value: lambda L, b, tf: hz_transformer.tf_layernorm(L, b, tf),
         LayerKind.GELU.value: lambda L, b, tf: hz_transformer.tf_gelu(L, b, tf),
-        "ATT_SCORES": lambda L, b, tf: hz_transformer.tf_att_scores(L, b, tf),
+        LayerKind.ATT_SCORES.value: lambda L, b, tf: hz_transformer.tf_att_scores(L, b, tf),
         LayerKind.SOFTMAX.value: lambda L, b, tf: hz_transformer.tf_softmax(L, b, tf),
-        "ATT_MIX": lambda L, b, tf: hz_transformer.tf_att_mix(L, b, tf),
-        "MHA_SPLIT": lambda L, b, tf: hz_transformer.tf_mha_split(L, b, tf),
-        "MHA_JOIN": lambda L, b, tf: hz_transformer.tf_mha_join(L, b, tf),
-        "MASK_ADD": lambda L, b, tf: hz_transformer.tf_mask_add(L, b, tf),
+        LayerKind.ATT_MIX.value: lambda L, b, tf: hz_transformer.tf_att_mix(L, b, tf),
+        LayerKind.MHA_SPLIT.value: lambda L, b, tf: hz_transformer.tf_mha_split(L, b, tf),
+        LayerKind.MHA_JOIN.value: lambda L, b, tf: hz_transformer.tf_mha_join(L, b, tf),
+        LayerKind.MASK_ADD.value: lambda L, b, tf: hz_transformer.tf_mask_add(L, b, tf),
     }
 
     @property
