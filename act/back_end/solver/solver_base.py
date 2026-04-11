@@ -24,8 +24,10 @@ class SolveStatus:
     UNKNOWN = "UNKNOWN"      # Inconclusive (timeout/spurious/error)
 
 class SolverCaps:
-    def __init__(self, supports_gpu: bool = False):
+    def __init__(self, supports_gpu: bool = False, supports_csp: bool = True, supports_hz: bool = False):
         self.supports_gpu = supports_gpu
+        self.supports_csp = supports_csp
+        self.supports_hz = supports_hz
 
 class Solver:
     """Abstract solver interface used by the exporter and verification pipeline."""
@@ -93,3 +95,7 @@ class Solver:
         perform rounding or clipping before returning.
         """
         return self.get_values(input_ids)
+
+    # --- Domain-based bounds ---
+    def compute_bounds(self, domain_obj) -> object:  # pragma: no cover - abstract
+        raise NotImplementedError

@@ -32,7 +32,7 @@ def run_verification(args):
     from act.back_end.verifier import verify_once
     from act.back_end.bab import verify_bab
     from act.back_end.solver.solver_gurobi import GurobiSolver
-    from act.back_end.solver.solver_torch import TorchLPSolver
+    from act.back_end.solver.solver_interval import TorchLPSolver
     from act.util.stats import VerifyStatus
 
     # Load network

@@ -19,6 +19,10 @@ from act.util.options import PerformanceOptions
 
 EPS = 1e-12
 
+def parse_input_shape(input_shape) -> Tuple[int, ...]:
+    """Normalize input_shape to a tuple of ints, preserving all dimensions."""
+    return tuple(int(x) for x in input_shape)
+
 def box_join(a: Bounds, b: Bounds) -> Bounds:
     return Bounds(lb=torch.minimum(a.lb, b.lb), ub=torch.maximum(a.ub, b.ub))
 

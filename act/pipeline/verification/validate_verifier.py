@@ -163,7 +163,7 @@ from act.back_end.verifier import (
 from act.util.stats import VerifyStatus
 from act.back_end.solver.solver_gurobi import GurobiSolver
 from act.back_end.solver.solver_gurobi import is_gurobi_available
-from act.back_end.solver.solver_torch import TorchLPSolver
+from act.back_end.solver.solver_interval import TorchLPSolver
 from act.util.options import PerformanceOptions
 from act.front_end.specs import OutKind
 

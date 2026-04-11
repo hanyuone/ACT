@@ -64,10 +64,7 @@ def hybridz_tf_layernorm(L: Layer, Bin: Bounds) -> Fact:
     
     Bout = Bounds(lb=lb_out, ub=ub_out)
     
-    cons = ConSet()
-    cons.add_layernorm(L.id, L.in_vars, L.out_vars, normalized_shape, eps, weight, bias)
-    
-    return Fact(bounds=Bout, cons=cons)
+    return Fact(bounds=Bout, cons=ConSet())
 
 
 @torch.no_grad()
@@ -111,10 +108,7 @@ def hybridz_tf_gelu(L: Layer, Bin: Bounds) -> Fact:
     
     Bout = Bounds(lb=lb, ub=ub)
     
-    cons = ConSet()
-    cons.add_gelu(L.id, L.in_vars, L.out_vars)
-    
-    return Fact(bounds=Bout, cons=cons)
+    return Fact(bounds=Bout, cons=ConSet())
 
 
 def gelu_approx(x: float) -> float:
@@ -161,11 +155,9 @@ def hybridz_tf_softmax(L: Layer, Bin: Bounds) -> Fact:
     
     Bout = Bounds(lb=lb, ub=ub)
     
-    # Softmax generates simplex constraints (sum = 1, all ≥ 0)
     cons = ConSet()
     rowsize = len(L.out_vars)
-    cons.add_simplex(L.id, L.out_vars, rowsize)
-    
+    cons.add_op(f"softmax:{L.id}", list(L.out_vars), rowsize=rowsize)
     return Fact(bounds=Bout, cons=cons)
 
 
@@ -187,10 +179,7 @@ def hybridz_tf_posenc(L: Layer, Bin: Bounds) -> Fact:
     ub = Bin.ub + pe_range
     Bout = Bounds(lb=lb, ub=ub)
     
-    cons = ConSet()
-    cons.add_posenc(L.id, L.in_vars, L.out_vars, max_len, d_model)
-    
-    return Fact(bounds=Bout, cons=cons)
+    return Fact(bounds=Bout, cons=ConSet())
 
 
 @torch.no_grad()
@@ -229,7 +218,4 @@ def hybridz_tf_attention_scores(L: Layer, Q_bounds: Bounds, K_bounds: Bounds) ->
     
     Bout = Bounds(lb=lb, ub=ub)
     
-    cons = ConSet()
-    cons.add_attention_scores(L.id, L.in_vars, L.out_vars, d_k)
-    
-    return Fact(bounds=Bout, cons=cons)
+    return Fact(bounds=Bout, cons=ConSet())

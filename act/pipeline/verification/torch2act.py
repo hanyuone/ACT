@@ -60,7 +60,7 @@ from act.pipeline.verification.utils import _prod, _normalize_tuple
 # Imports needed for main() test harness
 from act.util.model_inference import model_inference
 from act.front_end.model_synthesis import model_synthesis
-from act.back_end.solver.solver_torch import TorchLPSolver
+from act.back_end.solver.solver_interval import TorchLPSolver
 from act.back_end.solver.solver_gurobi import GurobiSolver
 from act.util.options import PerformanceOptions
 
