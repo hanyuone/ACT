@@ -1,6 +1,6 @@
 # Abstract Constraint Transformation (ACT)
 
-A testing and verification platform for AI models based on neural networks, built on a three-tier architecture (front-end, back-end, and pipeline), with native PyTorch support and an ACT intermediate representation (IR) that enables refinement-based precision and supports diverse model architectures, input formats, and specification types.
+A testing and verification framework for AI models based on neural networks, built on a three-tier architecture (front-end, back-end, and pipeline), with native PyTorch support and an ACT intermediate representation (IR) that enables refinement-based precision and supports diverse model architectures, input formats, and specification types.
 
 ## Quick Start
 
@@ -35,7 +35,7 @@ python -m act.pipeline --help
 - [More](https://github.com/SVF-tools/ACT/tree/main/ipynb)
 
 ### Pubs and Docs
-- Kaijie Liu and Yulei Sui. [Detecting Unsoundness in Neural Network Verifiers via Concrete–Abstract Consistency](https://openreview.net/forum?id=6vjnMGdx5i). ACM/IEEE International Conference on AI-Powered Software Engineering (AIWare 2026)
+- Kaijie Liu and Yulei Sui. [Detecting Unsoundness in Neural Network Verifiers via Concrete–Abstract Consistency](https://openreview.net/forum?id=6vjnMGdx5i). ACM/IEEE International Conference on AI-Powered Software Engineering (AIware 2026)
 
 ### License
 ACT is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
