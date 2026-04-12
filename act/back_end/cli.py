@@ -59,19 +59,29 @@ def run_verification(args):
 
     # Run verification
     if args.bab:
-        print(f"\nRunning Branch-and-Bound verification...")
-        print(f"  Max depth: {args.bab_max_depth}")
-        print(f"  Max subproblems: {args.bab_max_subproblems}")
-        print(f"  Timeout: {args.timeout}s\n")
+        from act.back_end.bab.config import BaBConfig
 
-        result = verify_bab(
-            net=net,
-            solver=solver,
-            timelimit=args.timeout,
-            max_depth=args.bab_max_depth,
-            max_subproblems=args.bab_max_subproblems,
-            verbose=args.verbose,
-        )
+        overrides = {
+            "max_depth": args.bab_max_depth,
+            "max_nodes": args.bab_max_subproblems,
+            "time_budget_s": args.timeout,
+            "verbose": args.verbose,
+        }
+        if args.bab_branching:
+            overrides["branching_method"] = args.bab_branching
+        if args.bab_scheduling:
+            overrides["scheduling_method"] = args.bab_scheduling
+
+        bab_config = BaBConfig.from_yaml(config_path=args.bab_config, **overrides)
+
+        print(f"\nRunning Branch-and-Bound verification...")
+        print(f"  Max depth: {bab_config.max_depth}")
+        print(f"  Max subproblems: {bab_config.max_nodes}")
+        print(f"  Branching: {bab_config.branching_method}")
+        print(f"  Scheduling: {bab_config.scheduling_method}")
+        print(f"  Timeout: {bab_config.time_budget_s}s\n")
+
+        result = verify_bab(net=net, solver=solver, config=bab_config)
     else:
         print(f"\nRunning single-shot verification...")
         print(f"  Timeout: {args.timeout}s\n")
@@ -439,6 +449,26 @@ Examples:
         default=100,
         dest="bab_max_subproblems",
         help="Maximum number of BaB subproblems (default: 100)",
+    )
+    verify_group.add_argument(
+        "--bab-config",
+        type=str,
+        dest="bab_config",
+        help="Path to BaB YAML config (default: act/back_end/bab/config.yaml)",
+    )
+    verify_group.add_argument(
+        "--bab-branching",
+        type=str,
+        default=None,
+        dest="bab_branching",
+        help="Branching strategy (default: from config, built-in: random)",
+    )
+    verify_group.add_argument(
+        "--bab-scheduling",
+        type=str,
+        default=None,
+        dest="bab_scheduling",
+        help="Scheduling strategy (default: from config, built-in: random)",
     )
     verify_group.add_argument(
         "--timeout",
