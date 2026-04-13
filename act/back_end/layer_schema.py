@@ -91,6 +91,7 @@ class LayerKind(str, enum.Enum):
 
     # Core MLP/CNN ops (subset can be extended easily)
     DENSE = "DENSE"
+    BN = "BN"
     CONV1D = "CONV1D"
     CONV2D = "CONV2D"
     CONV3D = "CONV3D"
@@ -127,6 +128,8 @@ class LayerKind(str, enum.Enum):
     MUL = "MUL"
     DIV = "DIV"
     POW = "POW"
+    SQUARE = "SQUARE"
+    POWER = "POWER"
     MIN = "MIN"
     MAX = "MAX"
     SCALE = "SCALE"  # Element-wise multiplication by constant: y = a * x
@@ -146,6 +149,13 @@ class LayerKind(str, enum.Enum):
 
     # Sequences & attention
     EMBEDDING = "EMBEDDING"
+    EMBEDDING_TF = "EMBEDDING_TF"
+    LAYERNORM = "LAYERNORM"
+    ATT_SCORES = "ATT_SCORES"
+    ATT_MIX = "ATT_MIX"
+    MHA_SPLIT = "MHA_SPLIT"
+    MHA_JOIN = "MHA_JOIN"
+    MASK_ADD = "MASK_ADD"
     RNN = "RNN"
     GRU = "GRU"
     LSTM = "LSTM"

@@ -51,7 +51,7 @@ class IntervalTF(TransferFunction):
             tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
             tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1)),
         "CONCAT": lambda L, bounds, tf: tf_concat(L, tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before)),
-        "BN": lambda L, bounds, tf: tf_bn(L, bounds),
+        LayerKind.BN.value: lambda L, bounds, tf: tf_bn(L, bounds),
         
         # CNN operations
         "CONV2D": lambda L, bounds, tf: tf_conv2d(L, bounds),
@@ -83,8 +83,8 @@ class IntervalTF(TransferFunction):
         # Element-wise operations
         "MAX": lambda L, bounds, tf: tf_max(L, tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before)),
         "MIN": lambda L, bounds, tf: tf_min(L, tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before)),
-        "SQUARE": lambda L, bounds, tf: tf_square(L, bounds),
-        "POWER": lambda L, bounds, tf: tf_power(L, bounds),
+        LayerKind.SQUARE.value: lambda L, bounds, tf: tf_square(L, bounds),
+        LayerKind.POWER.value: lambda L, bounds, tf: tf_power(L, bounds),
         
         # Tensor operations
         "RESHAPE": lambda L, bounds, tf: tf_reshape(L, bounds),
@@ -95,20 +95,20 @@ class IntervalTF(TransferFunction):
         "EXPAND": lambda L, bounds, tf: tf_expand(L, bounds),
         
         # Transformer operations
-        "EMBEDDING_TF": lambda L, bounds, tf: tf_embedding(L, bounds),
+        LayerKind.EMBEDDING_TF.value: lambda L, bounds, tf: tf_embedding(L, bounds),
         "POSENC": lambda L, bounds, tf: tf_posenc(L, bounds),
-        "LAYERNORM": lambda L, bounds, tf: tf_layernorm(L, bounds),
+        LayerKind.LAYERNORM.value: lambda L, bounds, tf: tf_layernorm(L, bounds),
         "GELU": lambda L, bounds, tf: tf_gelu(L, bounds),
-        "ATT_SCORES": lambda L, bounds, tf: tf_att_scores(L,
+        LayerKind.ATT_SCORES.value: lambda L, bounds, tf: tf_att_scores(L,
             tf._before[L.params["q_src"]].bounds,
             tf._before[L.params["k_src"]].bounds),
         "SOFTMAX": lambda L, bounds, tf: tf_softmax(L, bounds),
-        "ATT_MIX": lambda L, bounds, tf: tf_att_mix(L,
+        LayerKind.ATT_MIX.value: lambda L, bounds, tf: tf_att_mix(L,
             tf._before[L.params["w_src"]].bounds, 
             tf._before[L.params["v_src"]].bounds),
-        "MHA_SPLIT": lambda L, bounds, tf: tf_mha_split(L, bounds),
-        "MHA_JOIN": lambda L, bounds, tf: tf_mha_join(L, tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before)),
-        "MASK_ADD": lambda L, bounds, tf: tf_mask_add(L, bounds),
+        LayerKind.MHA_SPLIT.value: lambda L, bounds, tf: tf_mha_split(L, bounds),
+        LayerKind.MHA_JOIN.value: lambda L, bounds, tf: tf_mha_join(L, tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before)),
+        LayerKind.MASK_ADD.value: lambda L, bounds, tf: tf_mask_add(L, bounds),
     }
     
     @property

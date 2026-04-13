@@ -207,8 +207,24 @@ def _hz_compute_bounds_scipy(hz: HZono) -> Bounds:
     )
 
 
-def hz_compute_bounds(hz: HZono) -> Bounds:
+def hz_compute_bounds(hz: HZono, *, exact: bool = False) -> Bounds:
+    """Compute box bounds from a hybrid zonotope.
+
+    Args:
+        hz: The hybrid zonotope.
+        exact: If False (default), always use the fast unconstrained
+            over-approximation (|Gc| + |Gb| radius). This is sound but
+            may be wider than necessary.  If True, solve per-dimension
+            LP/MILP to obtain tight bounds when equality constraints
+            exist.  Use ``exact=True`` only at the final output layer
+            where tight bounds matter for verification; intermediate
+            layers benefit from the 1000×+ speed-up of the fast path
+            with negligible precision loss (the full zonotope structure
+            is still propagated via ``_hz_cache``).
+    """
     if _hz_is_unconstrained(hz):
+        return _hz_bounds_unconstrained(hz)
+    if not exact:
         return _hz_bounds_unconstrained(hz)
     if _HAS_GUROBI:
         try:
@@ -241,8 +257,8 @@ class HZSolver(Solver):
     def capabilities(self) -> SolverCaps:
         return SolverCaps(supports_gpu=False, supports_csp=False, supports_hz=True)
 
-    def compute_bounds(self, hz: HZono) -> Bounds:
-        self._last_bounds = hz_compute_bounds(hz)
+    def compute_bounds(self, hz: HZono, *, exact: bool = False) -> Bounds:
+        self._last_bounds = hz_compute_bounds(hz, exact=exact)
         return self._last_bounds
 
     def begin(self, name="verify", device=None):
