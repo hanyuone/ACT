@@ -122,6 +122,9 @@ __all__ = [
     "seed_from_input_spec",
     "add_input_spec",
     "verify_once",
+    # Config
+    "BackendConfig",
+    "GenerationConfig",
     # BaB
     "BabNode",
     "SubproblemBatch",

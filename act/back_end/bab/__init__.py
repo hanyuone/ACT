@@ -6,12 +6,11 @@
 # Distributed without any warranty; see <http://www.gnu.org/licenses/>.
 # ===---------------------------------------------------------------------====#
 
-from act.back_end.bab.config import BaBConfig
-from act.back_end.bab.engine import verify_bab
+from act.back_end.config import BaBConfig
+from act.back_end.bab.bab import verify_bab, check_violation_at_point
 from act.back_end.bab.node import BabNode, SubproblemBatch, split_subproblems
-from act.back_end.bab.test_bab import check_violation_at_point
-from act.back_end.bab.branching.random_branching import BranchingStrategy
-from act.back_end.bab.branching.random_scheduling import Scheduler
+from act.back_end.bab.branching.branching import BranchingStrategy
+from act.back_end.bab.branching.bounding import BoundingStrategy
 
 __all__ = [
     "BaBConfig",
@@ -21,5 +20,5 @@ __all__ = [
     "split_subproblems",
     "check_violation_at_point",
     "BranchingStrategy",
-    "Scheduler",
+    "BoundingStrategy",
 ]

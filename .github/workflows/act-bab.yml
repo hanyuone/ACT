@@ -10,6 +10,9 @@ on:
 env:
   PYTHONPATH: ${{ github.workspace }}
   ACT_CI_MODE: "true"
+  ACT_SOLVER: "torch"
+  ACT_DEVICE: "cpu"
+  ACT_DTYPE: "float64"
 
 jobs:
   bab-tests:
@@ -43,19 +46,17 @@ jobs:
       - name: Run BaB module tests
         run: |
           cd ${{ github.workspace }}
-          python -m act.back_end.bab.test_bab
+          python -m act.back_end.bab.bab
 
       - name: Generate example networks
         run: |
           cd ${{ github.workspace }}
-          python -m act.back_end --generate --device cpu --dtype float64
+          python -m act.back_end --generate
 
       - name: Run BaB verification (float64)
         run: |
           cd ${{ github.workspace }}
           NET=$(ls act/back_end/examples/nets/mlp_block_*.json | head -1)
           echo "Testing BaB on: $NET"
-          python -m act.back_end --verify --network "$NET" \
-            --bab --bab-max-depth 3 --bab-max-subproblems 10 --timeout 60 \
-            --bab-branching random --bab-scheduling random \
-            --solver torch --device cpu --dtype float64 --verbose
+          # All settings from act/back_end/config.yaml + ACT_* env vars above.
+          python -m act.back_end --verify --network "$NET"

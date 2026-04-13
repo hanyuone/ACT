@@ -6,10 +6,10 @@
 # Distributed without any warranty; see <http://www.gnu.org/licenses/>.
 # ===---------------------------------------------------------------------====#
 
-from act.back_end.bab.branching.random_branching import (
+from act.back_end.bab.branching.branching import (
     BranchingStrategy,
     RandomBranching,
 )
-from act.back_end.bab.branching.random_scheduling import Scheduler, RandomScheduler
+from act.back_end.bab.branching.bounding import BoundingStrategy, RandomBounding
 
-__all__ = ["BranchingStrategy", "RandomBranching", "Scheduler", "RandomScheduler"]
+__all__ = ["BranchingStrategy", "RandomBranching", "BoundingStrategy", "RandomBounding"]

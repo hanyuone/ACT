@@ -10,7 +10,7 @@
 #   Tensor-native representation of BaB subproblems.
 #
 #   SubproblemBatch is the primary data structure — every field is a tensor
-#   with leading batch dimension (N, …) so that branching, scheduling, and
+#   with leading batch dimension (N, …) so that branching, bounding, and
 #   (future) batched solving operate in pure tensor arithmetic.
 #
 #   BabNode is retained for backward compatibility with existing callers.

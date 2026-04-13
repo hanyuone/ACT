@@ -1,4 +1,4 @@
-# ===- act/back_end/bab/branching/random_scheduling.py - Scheduling ------====#
+# ===- act/back_end/bab/branching/bounding.py - Subproblem Bounding ------====#
 # ACT: Abstract Constraint Transformer
 # Copyright (C) 2025– ACT Team
 #
@@ -7,13 +7,13 @@
 # ===---------------------------------------------------------------------====#
 #
 # Purpose:
-#   Subproblem schedulers for Branch-and-Bound.
+#   Subproblem pool management for Branch-and-Bound.
 #
-#   Contains the abstract base class ``Scheduler`` and the
-#   ``RandomScheduler`` baseline implementation.
+#   Contains the abstract base class ``BoundingStrategy`` and the
+#   ``RandomBounding`` baseline implementation.
 #
-#   A scheduler maintains a *pool* of pending subproblems and decides
-#   which ones to process next.  All data flows through
+#   A bounding strategy maintains a *pool* of pending subproblems and
+#   decides which ones to process next.  All data flows through
 #   ``SubproblemBatch`` (tensor-native) so that:
 #
 #     * ``push`` and ``pop`` operate on batches, not individual nodes.
@@ -38,16 +38,16 @@ from act.back_end.bab.node import SubproblemBatch
 # ---------------------------------------------------------------------------
 
 
-class Scheduler(ABC):
-    """Abstract subproblem scheduler for Branch-and-Bound.
+class BoundingStrategy(ABC):
+    """Abstract subproblem pool for Branch-and-Bound.
 
     Lifecycle (called by the BaB engine)::
 
-        scheduler.push(root_batch)
-        while not scheduler.empty:
-            batch = scheduler.pop(batch_size=N)
+        pool.push(root_batch)
+        while not pool.empty:
+            batch = pool.pop(batch_size=N)
             …solve / branch…
-            scheduler.push(children_batch)
+            pool.push(children_batch)
 
     Subclass contract
     ~~~~~~~~~~~~~~~~~
@@ -68,7 +68,7 @@ class Scheduler(ABC):
 
     @abstractmethod
     def pop(self, batch_size: int = 1) -> SubproblemBatch:
-        """Dequeue subproblems according to the scheduling policy.
+        """Dequeue subproblems for the next bounding iteration.
 
         Args:
             batch_size: Maximum number of subproblems to return.
@@ -97,8 +97,8 @@ class Scheduler(ABC):
 # ---------------------------------------------------------------------------
 
 
-class RandomScheduler(Scheduler):
-    """Uniform-random subproblem scheduler.
+class RandomBounding(BoundingStrategy):
+    """Uniform-random subproblem selection.
 
     ``pop(k)`` selects ``k`` subproblems uniformly at random from the
     pool (without replacement).
@@ -113,7 +113,7 @@ class RandomScheduler(Scheduler):
         self._ub: Optional[torch.Tensor] = None  # (M, D)
         self._depths: Optional[torch.Tensor] = None  # (M,)
 
-    # -- Scheduler interface ------------------------------------------------
+    # -- BoundingStrategy interface -----------------------------------------
 
     def push(self, batch: SubproblemBatch) -> None:
         if self._lb is None:
@@ -127,7 +127,7 @@ class RandomScheduler(Scheduler):
 
     def pop(self, batch_size: int = 1) -> SubproblemBatch:
         if self.empty:
-            raise IndexError("pop from empty scheduler")
+            raise IndexError("pop from empty pool")
 
         n = min(batch_size, len(self))
         perm = torch.randperm(len(self), device=self._lb.device)

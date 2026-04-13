@@ -1,4 +1,4 @@
-# ===- act/back_end/bab/branching/random_branching.py - Branching --------====#
+# ===- act/back_end/bab/branching/branching.py - Branching ---------------====#
 # ACT: Abstract Constraint Transformer
 # Copyright (C) 2025– ACT Team
 #
