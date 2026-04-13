@@ -428,6 +428,9 @@ class ACTFuzzer:
         global_delta, cov_interesting = self.coverage_tracker.update(
             inputs, activations
         )
+        # Update secondary strategy for dual coverage reporting
+        _other = "BestInputCov" if self.config.coverage_strategy == "GlobalCov" else "GlobalCov"
+        self.coverage_tracker.update(inputs, activations, strategy=_other)
 
         # 6. energy computation (fully vectorized)
         interesting_mask = violation_mask | cov_interesting
@@ -509,7 +512,8 @@ class ACTFuzzer:
         """Print fuzzing progress with incremental counterexample count."""
         elapsed = time.time() - self.start_time
         iter_per_sec = iteration / elapsed if elapsed > 0 else 0
-        coverage = self.coverage_tracker.get_coverage()
+        glc = self.coverage_tracker.get_coverage(strategy="GlobalCov")
+        bic = self.coverage_tracker.get_coverage(strategy="BestInputCov")
 
         # Calculate new counterexamples since last report
         ce_total = len(self.counterexamples)
@@ -519,7 +523,7 @@ class ACTFuzzer:
         samples_per_sec = iter_per_sec * self.batch_size
         print(
             f"📊 Iteration {iteration:6d} | "
-            f"Coverage: {coverage:6.2%} | "
+            f"GlobalCov: {glc:6.2%} BestInputCov: {bic:6.2%} | "
             f"Seeds: {len(self.seed_corpus):4d} | "
             f"Violations: {ce_total:3d} (+{ce_new}) | "
             f"Speed: {iter_per_sec:5.1f} it/s ({samples_per_sec:.0f} samples/s)"
@@ -557,7 +561,8 @@ class ACTFuzzer:
         print(f"🎉 ACTFuzzer completed in {total_time:.1f}s")
         print(f"   Iterations: {report.total_iterations}")
         print(f"   Counterexamples: {len(report.counterexamples)}")
-        print(f"   Coverage: {report.neuron_coverage:.2%}")
+        bic = self.coverage_tracker.get_coverage(strategy="BestInputCov")
+        print(f"   GlobalCov: {report.neuron_coverage:.2%}  BestInputCov: {bic:.2%}")
         print(f"   Seeds explored: {report.seeds_explored}")
         print(f"   Never-activated neurons: {report.num_of_never_activated_neurons}")
         if report.never_activated_neurons:
