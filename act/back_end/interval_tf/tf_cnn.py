@@ -67,39 +67,35 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     out_w = (in_w + 2 * padding[1] - dilation[1] * (kernel_w - 1) - 1) // stride[1] + 1
     output_shape = (1, out_channels, out_h, out_w)
     
-    # Create equivalent linear transformation matrix using im2col
-    # This converts the convolution to matrix multiplication
-    W_equiv = _conv2d_to_linear_matrix(
-        weight, input_shape, output_shape, stride, padding, dilation, groups
-    )
+    # Compute bounds via torch
+    lb_4d = Bin.lb.view(1, in_channels, in_h, in_w)
+    ub_4d = Bin.ub.view(1, in_channels, in_h, in_w)
     
-    # Apply affine transformation
-    # Use actual matrix output size to ensure bias matches (metadata may be inconsistent)
-    actual_output_size = W_equiv.shape[0]
+    W_pos = weight.clamp(min=0)
+    W_neg = weight.clamp(max=0)
+    conv_kw = dict(stride=stride, padding=padding, dilation=dilation, groups=groups)
+    
+    lb_out = F.conv2d(lb_4d, W_pos, None, **conv_kw) + F.conv2d(ub_4d, W_neg, None, **conv_kw)
+    ub_out = F.conv2d(ub_4d, W_pos, None, **conv_kw) + F.conv2d(lb_4d, W_neg, None, **conv_kw)
+    
+    if bias is not None:
+        lb_out = lb_out + bias.view(1, -1, 1, 1)
+        ub_out = ub_out + bias.view(1, -1, 1, 1)
+    
+    B_output = Bounds(lb=lb_out.flatten(), ub=ub_out.flatten())
+    
+    actual_output_size = B_output.lb.numel()
     spatial_size_per_channel = actual_output_size // out_channels
     if bias is not None:
         b_equiv = bias.repeat_interleave(spatial_size_per_channel)
     else:
         b_equiv = torch.zeros(actual_output_size, dtype=weight.dtype, device=weight.device)
     
-    # Compute bounds using affine transformation
-    W_pos = torch.clamp(W_equiv, min=0)
-    W_neg = torch.clamp(W_equiv, max=0)
-    
-    # Reshape input bounds to flat format
-    input_bounds_flat = Bounds(
-        Bin.lb.view(-1),  # [input_flat_size]
-        Bin.ub.view(-1)   # [input_flat_size]
-    )
-    
-    # Apply linear transformation
-    B_output = affine_bounds(W_pos, W_neg, b_equiv, input_bounds_flat)
-    
-    # Create constraints
+    # Store conv params for constraint (no Toeplitz materialization)
     C = ConSet()
     C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
         "tag": f"conv2d:{L.id}",
-        "W": W_equiv,
+        "weight": weight,
         "b": b_equiv,
         "input_shape": input_shape,
         "output_shape": output_shape,
@@ -113,10 +109,6 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     
     C.add_box(L.id, L.out_vars, B_output)
     return Fact(B_output, C)
-
-def tf_maxpool1d(L: Layer, Bin: Bounds) -> Fact:
-    kernel_size = L.params["kernel_size"]
-    stride = L.params.get("stride", kernel_size)
     padding = L.params.get("padding", 0)
     dilation = L.params.get("dilation", 1)
 
@@ -335,64 +327,6 @@ def tf_flatten(L: Layer, Bin: Bounds) -> Fact:
 
     C.add_box(L.id, L.out_vars, B_out)
     return Fact(B_out, C)
-
-def _conv2d_to_linear_matrix(
-    weight: torch.Tensor,
-    input_shape: Tuple[int, ...],
-    output_shape: Tuple[int, ...],
-    stride: int = 1,
-    padding: int = 0,
-    dilation: int = 1,
-    groups: int = 1
-) -> torch.Tensor:
-    """
-    Convert Conv2d operation to equivalent linear transformation matrix.
-    
-    This uses the im2col algorithm to unfold the convolution into matrix multiplication.
-    """
-    batch_size, in_channels, in_h, in_w = input_shape
-    out_channels, _, kernel_h, kernel_w = weight.shape
-    _, _, out_h, out_w = output_shape
-    
-    # Create input and output flat sizes
-    input_flat_size = in_channels * in_h * in_w
-    output_flat_size = out_channels * out_h * out_w
-    
-    # Initialize the equivalent weight matrix
-    W_equiv = torch.zeros(output_flat_size, input_flat_size, dtype=weight.dtype, device=weight.device)
-    
-    # Convert stride, padding, dilation to tuples if they're integers
-    if isinstance(stride, int):
-        stride = (stride, stride)
-    if isinstance(padding, int):
-        padding = (padding, padding)
-    if isinstance(dilation, int):
-        dilation = (dilation, dilation)
-    
-    # For each output position, find corresponding input positions
-    for out_c in range(out_channels):
-        for out_y in range(out_h):
-            for out_x in range(out_w):
-                # Calculate output linear index
-                out_idx = out_c * (out_h * out_w) + out_y * out_w + out_x
-                
-                # For each kernel position
-                for in_c in range(in_channels):
-                    for k_y in range(kernel_h):
-                        for k_x in range(kernel_w):
-                            # Calculate input position
-                            in_y = out_y * stride[0] - padding[0] + k_y * dilation[0]
-                            in_x = out_x * stride[1] - padding[1] + k_x * dilation[1]
-                            
-                            # Check bounds
-                            if 0 <= in_y < in_h and 0 <= in_x < in_w:
-                                # Calculate input linear index
-                                in_idx = in_c * (in_h * in_w) + in_y * in_w + in_x
-                                
-                                # Set weight in equivalent matrix
-                                W_equiv[out_idx, in_idx] = weight[out_c, in_c, k_y, k_x]
-    
-    return W_equiv
 
 
 def tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
