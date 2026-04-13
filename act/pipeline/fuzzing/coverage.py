@@ -166,7 +166,7 @@ class BestInputCov(CoverageStrategy):
             mat = _activation_to_neuron_matrix(activation)
             if mat.numel() == 0:
                 continue
-            total_fired += (mat.abs() > float(self.threshold)).sum(dim=1).float()
+            total_fired += (mat > float(self.threshold)).sum(dim=1).float()
         
         sample_covs = total_fired / total_neurons  # (N,)
         
@@ -264,7 +264,7 @@ class GlobalCov(CoverageStrategy):
             n_neurons = mat.shape[1]
             self._ensure_layer_registered(layer_name, n_neurons, device=mat.device)
             
-            fired_mask = mat.abs() > float(self.threshold)  # (N, neurons)
+            fired_mask = mat > float(self.threshold)  # (N, neurons)
             already_covered = self._covered_masks[layer_name]  # (neurons,)
             
             fired_any = fired_mask.any(dim=0)  # (neurons,)
