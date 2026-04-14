@@ -24,7 +24,7 @@ def tf_dense(L: Layer, Bin: Bounds) -> Fact:
     W = L.params["weight"]
     W_pos = L.params.get("weight_pos", torch.clamp(W, min=0))
     W_neg = L.params.get("weight_neg", torch.clamp(W, max=0))
-    b = L.params.get("bias", torch.zeros(W.shape[0], device=W.device, dtype=W.dtype))
+    b = L.params.get("bias", torch.zeros(W.shape[0]))
     
     B = affine_bounds(W_pos, W_neg, b, Bin)
     C = ConSet(); C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"dense:{L.id}", "W": W, "b": b}))
@@ -50,7 +50,7 @@ def tf_relu(L: Layer, Bin: Bounds) -> Fact:
         finite=torch.isfinite(gap) & (gap>1e-12)
         s=torch.where(finite, ua/torch.clamp(gap,min=1e-12), torch.ones_like(gap))
         t=torch.where(finite, -s*la, torch.zeros_like(gap))
-    else: s=t=torch.empty(0, dtype=l.dtype, device=l.device)
+    else: s=t=torch.empty(0)
     B=Bounds(lb,ub); C=ConSet()
     C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"relu:{L.id}",
         "idx_on": torch.nonzero(on,as_tuple=True)[0],
@@ -70,7 +70,7 @@ def tf_lrelu(L: Layer, Bin: Bounds) -> Fact:
         finite=torch.isfinite(gap) & (gap>1e-12)
         s=torch.where(finite, (ua-a*la)/torch.clamp(gap,min=1e-12), torch.full_like(gap,max(a,1.0)))
         t=torch.where(finite, a*la-s*la, torch.zeros_like(gap))
-    else: s=t=torch.empty(0, dtype=l.dtype, device=l.device)
+    else: s=t=torch.empty(0)
     B=Bounds(lb,ub); C=ConSet()
     C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"lrelu:{L.id}","alpha":a,
         "idx_on": torch.nonzero(on,as_tuple=True)[0],
@@ -415,7 +415,7 @@ def tf_gather(L: Layer, Bin: Bounds) -> Fact:
 
     raw_idx = L.params["indices"]
     if isinstance(raw_idx, (list, tuple)):
-        indices = torch.tensor(raw_idx, dtype=torch.long, device=x_lb.device)
+        indices = torch.tensor(raw_idx, dtype=torch.long)
     else:
         indices = raw_idx.to(x_lb.device).long()
 
@@ -445,7 +445,7 @@ def tf_index_select(L: Layer, Bin: Bounds) -> Fact:
 
     raw_idx = L.params["indices"]
     if isinstance(raw_idx, (list, tuple)):
-        indices = torch.tensor(raw_idx, dtype=torch.long, device=x_lb.device)
+        indices = torch.tensor(raw_idx, dtype=torch.long)
     else:
         indices = raw_idx.to(x_lb.device).long()
     assert indices.numel() > 0, "index_select received empty indices"
@@ -480,7 +480,7 @@ def tf_permute(L, ctx):
 def tf_reorder(L, ctx):
     (lx, ux) = ctx.get_predecessor_bounds(L.id, 0)
     raw_order = L.params["order"]
-    order = raw_order if torch.is_tensor(raw_order) else torch.tensor(raw_order, device=lx.device, dtype=torch.long)
+    order = raw_order if torch.is_tensor(raw_order) else torch.tensor(raw_order, dtype=torch.long)
     dim = L.params.get("dim", 0)
     assert order.numel() == lx.shape[dim], f"reorder order length {order.numel()} != dim size {lx.shape[dim]}"
     lx = lx.index_select(L.params.get("dim", 0), order)

@@ -51,12 +51,12 @@ def tf_lstm(L: Layer, Bin: Bounds) -> Fact:
     
     # Initialize hidden and cell states bounds (typically zeros)
     h_bounds = Bounds(
-        torch.zeros(batch_size, hidden_size, device=weight_ih.device, dtype=weight_ih.dtype),
-        torch.zeros(batch_size, hidden_size, device=weight_ih.device, dtype=weight_ih.dtype)
+        torch.zeros(batch_size, hidden_size),
+        torch.zeros(batch_size, hidden_size)
     )
     c_bounds = Bounds(
-        torch.zeros(batch_size, hidden_size, device=weight_ih.device, dtype=weight_ih.dtype),
-        torch.zeros(batch_size, hidden_size, device=weight_ih.device, dtype=weight_ih.dtype)
+        torch.zeros(batch_size, hidden_size),
+        torch.zeros(batch_size, hidden_size)
     )
     
     # Process each time step
@@ -149,8 +149,8 @@ def tf_gru(L: Layer, Bin: Bounds) -> Fact:
     
     # Initialize hidden state bounds
     h_bounds = Bounds(
-        torch.zeros(batch_size, hidden_size, device=weight_ih.device, dtype=weight_ih.dtype),
-        torch.zeros(batch_size, hidden_size, device=weight_ih.device, dtype=weight_ih.dtype)
+        torch.zeros(batch_size, hidden_size),
+        torch.zeros(batch_size, hidden_size)
     )
     
     # Process each time step
@@ -239,8 +239,8 @@ def tf_rnn(L: Layer, Bin: Bounds) -> Fact:
     
     # Initialize hidden state bounds
     h_bounds = Bounds(
-        torch.zeros(batch_size, hidden_size, device=weight_ih.device, dtype=weight_ih.dtype),
-        torch.zeros(batch_size, hidden_size, device=weight_ih.device, dtype=weight_ih.dtype)
+        torch.zeros(batch_size, hidden_size),
+        torch.zeros(batch_size, hidden_size)
     )
     
     # Process each time step
@@ -334,7 +334,7 @@ def tf_embedding(L: Layer, Bin: Bounds) -> Fact:
     weight_max = torch.max(weight, dim=0)[0]  # [embedding_dim]
     
     # Broadcast to output shape
-    output_size = torch.prod(torch.tensor(output_shape, device=weight.device)).item()
+    output_size = torch.prod(torch.tensor(output_shape)).item()
     embedding_elements = output_size // embedding_dim
     
     output_lb = weight_min.repeat(embedding_elements)
@@ -465,7 +465,7 @@ def _apply_linear_bounds(input_bounds, weight, bias=None):
     W_pos = torch.clamp(weight, min=0)
     W_neg = torch.clamp(weight, max=0)
     
-    result = affine_bounds(W_pos, W_neg, bias or torch.zeros(weight.shape[0], device=weight.device, dtype=weight.dtype), input_bounds)
+    result = affine_bounds(W_pos, W_neg, bias or torch.zeros(weight.shape[0]), input_bounds)
     return result
 
 

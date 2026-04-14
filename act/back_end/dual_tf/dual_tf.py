@@ -116,7 +116,7 @@ class DualTF(TransferFunction):
         
         self._bounds_dict = bounds_dict
         nu = c.clone()  # Start with c (not -c) for lower bound computation
-        obj = torch.tensor(0.0, dtype=c.dtype, device=c.device)
+        obj = torch.tensor(0.0)
         
         for layer in reversed(list(net.layers)):
             k = layer.kind.upper()
@@ -203,7 +203,7 @@ class DualTF(TransferFunction):
         which is correct for the ADD operation itself. The sequential traversal in
         compute_bound will need enhancement for full skip connection support.
         """
-        contrib = torch.tensor(0.0, dtype=nu.dtype, device=nu.device)
+        contrib = torch.tensor(0.0)
         
         # If ADD has a bias, it contributes to the objective: nu^T @ bias
         if "bias" in L.params and L.params["bias"] is not None:
@@ -226,7 +226,7 @@ class DualTF(TransferFunction):
                 input_layer = layer
         
         if input_layer is None:
-            return torch.tensor(0.0, dtype=nu.dtype, device=nu.device), None
+            return torch.tensor(0.0), None
         
         # Get bounds
         bounds = self._bounds_dict.get(input_layer.id)
@@ -234,7 +234,7 @@ class DualTF(TransferFunction):
             if "lb" in input_layer.params and "ub" in input_layer.params:
                 lb, ub = input_layer.params["lb"], input_layer.params["ub"]
             else:
-                return torch.tensor(0.0, dtype=nu.dtype, device=nu.device), None
+                return torch.tensor(0.0), None
         else:
             lb, ub = bounds.lb, bounds.ub
         
