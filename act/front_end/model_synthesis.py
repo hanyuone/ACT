@@ -24,6 +24,7 @@ if __name__ == "__main__" and __package__ is None:
     sys.exit(1)
 
 import torch
+from act.util.device_manager import get_default_dtype
 import torch.nn as nn
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List, Tuple, Union
@@ -147,7 +148,7 @@ def _merge_specs_to_batch(
     y_true = torch.cat([s.y_true for s in out_specs], dim=0) if all(s.y_true is not None for s in out_specs) else None
     # Use default dtype - device is automatically handled by device_manager
     margins = torch.cat([
-        s.margin if s.margin is not None else torch.tensor([0.0], dtype=torch.get_default_dtype())
+        s.margin if s.margin is not None else torch.tensor([0.0], dtype=get_default_dtype())
         for s in out_specs
     ], dim=0) if any(s.margin is not None for s in out_specs) else None
     

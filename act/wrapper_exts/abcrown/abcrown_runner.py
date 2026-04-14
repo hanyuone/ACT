@@ -36,6 +36,7 @@ import sys
 import time
 import gc
 import torch
+from act.util.device_manager import get_default_dtype
 import numpy as np
 from collections import defaultdict
 from act.util.path_config import get_abcrown_path
@@ -379,7 +380,7 @@ class abCrown:
                     'eps_min': properties[0][0].get('eps_min', 0),
                 }
             else:
-                x_range = torch.tensor(properties[0], dtype=torch.get_default_dtype())
+                x_range = torch.tensor(properties[0], dtype=get_default_dtype())
                 data_min = x_range.select(-1, 0).reshape(vnnlib_shape)
                 data_max = x_range.select(-1, 1).reshape(vnnlib_shape)
                 x = x_range.mean(-1).reshape(vnnlib_shape)
@@ -408,7 +409,7 @@ class abCrown:
                 this_spec_attack_images = None
 
             rhs = torch.tensor(rhs, device=arguments.Config['general']['device'],
-                               dtype=torch.get_default_dtype())
+                               dtype=get_default_dtype())
             if enable_incomplete and len(init_global_lb) > 1:
 
                 ret_trim = trim_batch(
