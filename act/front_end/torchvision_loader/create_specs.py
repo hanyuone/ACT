@@ -25,6 +25,7 @@ from act.front_end.torchvision_loader.data_model_loader import (
     list_downloaded_pairs,
     load_dataset_model_pair
 )
+from act.util.device_manager import get_default_device
 
 logger = logging.getLogger(__name__)
 
@@ -211,9 +212,10 @@ class TorchVisionSpecCreator(BaseSpecCreator):
             if len(labeled_tensors) >= num_samples:
                 break
             
-            # Create LabeledInputTensor pairing image with label (keep batch dimension)
-            tensor = images  # Keep batch dimension (1, C, H, W)
-            label = targets  # Keep as tensor (1,) 
+            # DataLoader always returns CPU tensors regardless of torch.set_default_device
+            device = get_default_device()
+            tensor = images.to(device)
+            label = targets.to(device)
             labeled_tensors.append(LabeledInputTensor(tensor=tensor, label=label))
         
         if not labeled_tensors:
@@ -304,7 +306,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
                     input_specs.append(InputSpec(
                         kind=InKind.LINF_BALL,
                         center=sample_tensor.clone(),
-                        eps=torch.tensor(eps, dtype=torch.get_default_dtype())
+                        eps=torch.tensor(eps)
                     ))
         
         return input_specs
@@ -338,7 +340,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
                     output_specs.append(OutputSpec(
                         kind=OutKind.MARGIN_ROBUST,
                         y_true=label.clone(),  # Use label tensor directly (already (1,) shape)
-                        margin=torch.tensor([margin], dtype=torch.get_default_dtype())
+                        margin=torch.tensor([margin])
                     ))
             
             elif kind == 'TOP1_ROBUST':
@@ -392,7 +394,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
                         input_specs.append(InputSpec(
                             kind=InKind.LINF_BALL,
                             center=sample_tensor.clone(),
-                            eps=torch.tensor(eps, dtype=torch.get_default_dtype())
+                            eps=torch.tensor(eps)
                         ))
         
         logger.debug(f"Generated {len(input_specs)} input specs from {len(input_tensors)} samples")
@@ -428,7 +430,7 @@ class TorchVisionSpecCreator(BaseSpecCreator):
                         output_specs.append(OutputSpec(
                             kind=OutKind.MARGIN_ROBUST,
                             y_true=torch.tensor([y_true], dtype=torch.int64),  # Batch: (1,) shape
-                            margin=torch.tensor([margin], dtype=torch.get_default_dtype())  # Batch: (1,) shape
+                            margin=torch.tensor([margin])  # Batch: (1,) shape
                         ))
                 
                 elif kind == 'TOP1_ROBUST':
