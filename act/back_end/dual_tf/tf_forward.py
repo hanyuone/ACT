@@ -185,8 +185,8 @@ def _fwd_dense(layer: Layer, A: torch.Tensor, bias: torch.Tensor,
     if A.shape[0] != n_in:
         if A.shape[0] < n_in:
             pad = n_in - A.shape[0]
-            A = torch.cat([A, torch.zeros(pad, A.shape[1], dtype=A.dtype, device=A.device)], dim=0)
-            bias = torch.cat([bias, torch.zeros(pad, dtype=bias.dtype, device=bias.device)])
+            A = torch.cat([A, torch.zeros(pad, A.shape[1])], dim=0)
+            bias = torch.cat([bias, torch.zeros(pad)])
         else:
             A, bias = A[:n_in, :], bias[:n_in]
     

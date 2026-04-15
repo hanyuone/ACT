@@ -40,7 +40,7 @@ def tf_layernorm(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_gelu(L: Layer, Bin: Bounds) -> Fact:
-    f=lambda x: 0.5*x*(1+torch.tanh(torch.sqrt(torch.tensor(2.0/torch.pi, dtype=x.dtype, device=x.device))*(x+0.044715*(x**3))))
+    f=lambda x: 0.5*x*(1+torch.tanh(torch.sqrt(torch.tensor(2.0/torch.pi))*(x+0.044715*(x**3))))
     B=Bounds(f(Bin.lb), f(Bin.ub)); C=ConSet()
     C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"gelu:{L.id}","segs":pwl_meta(Bin.lb,Bin.ub,3)}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)

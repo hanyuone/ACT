@@ -74,7 +74,7 @@ def dual_relu_backward(nu: torch.Tensor, bounds: Bounds) -> Tuple[torch.Tensor, 
     # Contribution from crossing neurons AFTER applying slope
     # Wong-Kolter: [nu]_+ * l for crossing neurons
     # Since l < 0 for crossing neurons, this is negative when nu > 0
-    contrib = torch.tensor(0.0, dtype=v.dtype, device=v.device)
+    contrib = torch.tensor(0.0)
     if amb.any():
         # Use v_out (AFTER slope), not v (before slope)
         crossing_contrib = torch.where(
@@ -94,7 +94,7 @@ def dual_dense_backward(nu: torch.Tensor, W: torch.Tensor, b: Optional[torch.Ten
     assert nu.numel() == W.shape[0], f"nu size {nu.numel()} != W.shape[0] {W.shape[0]}"
     
     v_out = W.T @ nu
-    contrib = -(b @ nu) if b is not None else torch.tensor(0.0, dtype=nu.dtype, device=nu.device)
+    contrib = -(b @ nu) if b is not None else torch.tensor(0.0)
     return v_out, contrib
 
 # -------- Bias / Scale / BatchNorm --------
@@ -108,7 +108,7 @@ def dual_bias_backward(nu: torch.Tensor, c: torch.Tensor) -> Tuple[torch.Tensor,
 def dual_scale_backward(nu: torch.Tensor, a: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Scale backward (y=a*x): v_out=a*v, contrib=0."""
     a_aligned = _align(a, nu.numel()).view(nu.shape)
-    return a_aligned * nu, torch.tensor(0.0, dtype=nu.dtype, device=nu.device)
+    return a_aligned * nu, torch.tensor(0.0)
 
 @torch.no_grad()
 def dual_bn_backward(nu: torch.Tensor, A: torch.Tensor, c: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -122,4 +122,4 @@ def dual_bn_backward(nu: torch.Tensor, A: torch.Tensor, c: torch.Tensor) -> Tupl
 @torch.no_grad()
 def dual_identity_backward(nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Identity backward (Flatten, Reshape, etc.): v_out=v, contrib=0."""
-    return nu, torch.tensor(0.0, dtype=nu.dtype, device=nu.device)
+    return nu, torch.tensor(0.0)
