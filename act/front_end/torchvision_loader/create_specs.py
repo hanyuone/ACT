@@ -25,6 +25,7 @@ from act.front_end.torchvision_loader.data_model_loader import (
     list_downloaded_pairs,
     load_dataset_model_pair
 )
+from act.util.device_manager import get_default_device
 
 logger = logging.getLogger(__name__)
 
@@ -211,9 +212,10 @@ class TorchVisionSpecCreator(BaseSpecCreator):
             if len(labeled_tensors) >= num_samples:
                 break
             
-            # Create LabeledInputTensor pairing image with label (keep batch dimension)
-            tensor = images  # Keep batch dimension (1, C, H, W)
-            label = targets  # Keep as tensor (1,) 
+            # DataLoader always returns CPU tensors regardless of torch.set_default_device
+            device = get_default_device()
+            tensor = images.to(device)
+            label = targets.to(device)
             labeled_tensors.append(LabeledInputTensor(tensor=tensor, label=label))
         
         if not labeled_tensors:
