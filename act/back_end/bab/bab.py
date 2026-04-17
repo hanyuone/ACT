@@ -72,7 +72,7 @@ def check_violation_at_point(net: Net, x: torch.Tensor, assert_layer) -> bool:
         return (y[mask] - y[t]).max().item() >= margin
 
     if k == OutKind.LINEAR_LE:
-        c = torch.as_tensor(assert_layer.params["c"], dtype=y.dtype)
+        c = torch.as_tensor(assert_layer.params["c"])
         d = float(assert_layer.params["d"])
         return (c @ y).item() >= d + 1e-8
 
@@ -80,14 +80,23 @@ def check_violation_at_point(net: Net, x: torch.Tensor, assert_layer) -> bool:
         lb = assert_layer.params.get("lb")
         ub = assert_layer.params.get("ub")
         if lb is not None:
-            lb_t = torch.as_tensor(lb, dtype=y.dtype)
+            lb_t = torch.as_tensor(lb)
             if (y < lb_t - 1e-8).any():
                 return True
         if ub is not None:
-            ub_t = torch.as_tensor(ub, dtype=y.dtype)
+            ub_t = torch.as_tensor(ub)
             if (y > ub_t + 1e-8).any():
                 return True
         return False
+
+    if k == OutKind.UNSAFE_LINEAR:
+        C = torch.as_tensor(assert_layer.params["c"])
+        if C.dim() == 1:
+            C = C.unsqueeze(0)
+        d_vec = torch.as_tensor(assert_layer.params["d"]).reshape(-1)
+        Cy = C @ y.reshape(-1)
+        in_unsafe_region = (Cy <= d_vec + 1e-8).all()
+        return bool(in_unsafe_region.item())
 
     raise NotImplementedError(f"ASSERT kind not supported: {k}")
 
@@ -167,7 +176,12 @@ def verify_bab(
 
         for bounds in batch.to_bounds_list():
             processed += 1
-            status, ce_input, _ = setup_and_solve(net, bounds, solver, timelimit=None)
+            # Fresh solver per subproblem: setup_and_solve mutates solver state
+            # (adds constraints/vars), and that state must not leak across BaB
+            # iterations. Reconstruct from the original type to preserve class
+            # configuration while resetting accumulated state.
+            iter_solver = type(solver)()
+            status, ce_input, _ = setup_and_solve(net, bounds, iter_solver, timelimit=None)
 
             if status == SolveStatus.UNSAT:
                 continue

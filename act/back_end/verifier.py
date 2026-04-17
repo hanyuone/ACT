@@ -159,6 +159,15 @@ def add_negated_assert_to_solver(solver: Solver, out_ids: List[int], assert_laye
         coeffs = list(to_numpy(assert_layer.params["c"]))
         d = float(assert_layer.params["d"])
         solver.add_lin_ge(out_ids, coeffs, d + 1e-6)
+
+    elif k == OutKind.UNSAFE_LINEAR:
+        C = to_numpy(assert_layer.params["c"])
+        d_vec = to_numpy(assert_layer.params["d"]).reshape(-1)
+        if C.ndim == 1:
+            C = C.reshape(1, -1)
+        for i in range(C.shape[0]):
+            row = list(C[i])
+            solver.add_lin_le(out_ids, row, float(d_vec[i]) + 1e-6)
         
     elif k == OutKind.TOP1_ROBUST:
         # Property: y[t] > y[j] for all j≠t  →  Negation: ∃j: y[j] ≥ y[t]

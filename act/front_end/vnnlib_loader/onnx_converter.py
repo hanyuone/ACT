@@ -78,10 +78,39 @@ def convert_onnx_to_pytorch(
                 logger.warning("onnxsim not available, skipping simplification")
             except Exception as e:
                 logger.warning(f"ONNX simplification failed: {e}, using original model")
-        
-        # Convert to PyTorch
+
+        # Propagate types/shapes through the graph after any earlier rewrites.
+        # VNN-COMP ONNX files can leave intermediate values with ValueType.UNKNOWN
+        # (nn4sys) or lose annotations during onnxsim simplification; without this
+        # step onnx2torch raises "Got unexpected input value type".
+        try:
+            from onnx import shape_inference
+            onnx_model = shape_inference.infer_shapes(onnx_model)
+        except Exception as e:
+            logger.warning(f"ONNX shape inference failed ({e}); proceeding without it")
+
+        # Convert to PyTorch. Simplification occasionally leaves intermediate
+        # values with ValueType.UNKNOWN (nn4sys); only retry-without-simplify
+        # for that specific upstream error so unrelated conversion bugs
+        # (unsupported ops, shape errors) still surface normally.
         logger.info("Converting ONNX to PyTorch")
-        pytorch_model = convert(onnx_model)
+        try:
+            pytorch_model = convert(onnx_model)
+        except Exception as convert_err:
+            if simplify and "ValueType.UNKNOWN" in str(convert_err):
+                logger.warning(
+                    f"onnx2torch failed on simplified graph ({convert_err}); "
+                    f"retrying with simplify=False"
+                )
+                raw_model = onnx.load(str(onnx_path))
+                try:
+                    from onnx import shape_inference
+                    raw_model = shape_inference.infer_shapes(raw_model)
+                except Exception:
+                    pass
+                pytorch_model = convert(raw_model)
+            else:
+                raise
         pytorch_model.eval()
         
         # Convert model to match device_manager settings

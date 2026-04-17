@@ -158,7 +158,14 @@ def _merge_specs_to_batch(
         """Batch a field that only exists for certain output spec kinds (e.g. c/d for LINEAR_LE, lb/ub for RANGE). Returns None if this kind doesn't use the field."""
         vals = [getattr(s, attr, None) for s in out_specs]
         return torch.stack(vals) if all(v is not None for v in vals) else None
-    c_vec, d_vec = _batch_attr('c'), _batch_attr('d')
+    # c/d in (UNSAFE_)LINEAR are per-constraint (not per-sample): stacking would
+    # produce a spurious 3-D tensor OutputSpecLayer can't consume. Grouping below
+    # guarantees all items in one group already share the same (c, d).
+    if out_kind in (OutKind.UNSAFE_LINEAR, OutKind.LINEAR_LE):
+        c_vec = out_specs[0].c
+        d_vec = out_specs[0].d
+    else:
+        c_vec, d_vec = _batch_attr('c'), _batch_attr('d')
     out_lb, out_ub = _batch_attr('lb'), _batch_attr('ub')
     batched_out = OutputSpec(kind=out_kind, y_true=y_true, margin=margins, c=c_vec, d=d_vec, lb=out_lb, ub=out_ub)
     
@@ -207,7 +214,12 @@ def _build_batched_model(
     
     # Create VerifiableModel and move to correct device
     vm = VerifiableModel(*layers)
-    model_device = next(pytorch_model.parameters()).device
+    # Parameterless ONNX-converted models (e.g. some VNN-COMP graphs that inline
+    # constants) have an empty .parameters() iterator — fall back to CPU.
+    try:
+        model_device = next(pytorch_model.parameters()).device
+    except StopIteration:
+        model_device = torch.device('cpu')
     vm = vm.to(model_device)
     
     return vm
@@ -259,19 +271,35 @@ def synthesize_models_from_specs(
         sps = len(spec_pairs) // len(labeled_tensors) if labeled_tensors else 1
         
         for idx, (in_spec, out_spec) in enumerate(spec_pairs):
-            lt = labeled_tensors[min(idx // sps if sps > 0 else 0, len(labeled_tensors) - 1)] 
-            gkey = (data_source, mid, in_spec.kind, out_spec.kind)
+            lt = labeled_tensors[min(idx // sps if sps > 0 else 0, len(labeled_tensors) - 1)]
+            cd_sig: Any = None
+            if out_spec.kind in (OutKind.UNSAFE_LINEAR, OutKind.LINEAR_LE) and out_spec.c is not None:
+                cd_sig = (
+                    tuple(out_spec.c.shape),
+                    out_spec.c.detach().cpu().reshape(-1).numpy().tobytes(),
+                    out_spec.d.detach().cpu().reshape(-1).numpy().tobytes() if out_spec.d is not None else None,
+                )
+            gkey = (data_source, mid, in_spec.kind, out_spec.kind, cd_sig)
             groups[gkey].append((lt, in_spec, out_spec, f"{data_source}:{model_name}:s{idx}"))
     
     # -------------------------------------------------------------------------
     # Synthesis Loop: Build batched models from grouped specs
     # -------------------------------------------------------------------------
     synthesis_models: Dict[Tuple[str, str, str, str], nn.Module] = {}
+    disjunct_counter: Dict[Tuple[str, str, str, str], int] = defaultdict(int)
     for gkey, grouped_specs in groups.items():
-        data_src, mid, in_kind, out_kind = gkey
+        data_src, mid, in_kind, out_kind, _cd_sig = gkey
         pytorch_model, rep_name = models[mid]
-        # Use representative model_name for the display key
-        display_key = (data_src, rep_name, in_kind, out_kind)
+        # Use representative model_name for the display key; if a single
+        # (data_src, model_name) expands into multiple UNSAFE_LINEAR disjuncts
+        # (e.g. ACAS Xu prop_10), suffix the disjunct index so display keys stay unique.
+        base_key = (data_src, rep_name, in_kind, out_kind)
+        idx = disjunct_counter[base_key]
+        disjunct_counter[base_key] = idx + 1
+        if idx == 0:
+            display_key = base_key
+        else:
+            display_key = (data_src, f"{rep_name}#d{idx}", in_kind, out_kind)
         vm = _build_batched_model(display_key, grouped_specs, pytorch_model)
         synthesis_models[display_key] = vm
     

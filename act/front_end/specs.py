@@ -63,6 +63,7 @@ class OutKind:
     TOP1_ROBUST = "TOP1_ROBUST"
     MARGIN_ROBUST = "MARGIN_ROBUST"
     RANGE = "RANGE"
+    UNSAFE_LINEAR = "UNSAFE_LINEAR"
 
 @dataclass
 class OutputSpec:

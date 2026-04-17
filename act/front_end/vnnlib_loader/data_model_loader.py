@@ -359,6 +359,68 @@ def list_downloaded_pairs(root_dir: Optional[str] = None) -> List[Dict[str, any]
     return all_instances
 
 
+def _parse_vnnlib_with_shape_probe(vnnlib_path, pytorch_model, input_shape):
+    """Parse VNNLib, reshape input tensor to a shape the model actually accepts.
+
+    Fast path: parse with the ONNX-declared ``input_shape``. If that raises
+    ``VNNLibParseError`` (shape-count mismatch), fall back to flat parsing and
+    probe the model for a working shape via ``_probe_model_shape``.
+    Raises ``RuntimeError`` if no working shape is found.
+    """
+    try:
+        tensor, meta = parse_vnnlib_to_tensors(vnnlib_path, input_shape=input_shape)
+        return tensor, meta
+    except VNNLibParseError as e:
+        logger.warning(f"Shape-matched parse failed ({e}); retrying with shape probe...")
+        tensor, meta = parse_vnnlib_to_tensors(vnnlib_path, input_shape=None)
+        probed = _probe_model_shape(pytorch_model, tensor.numel(), input_shape)
+        if probed is None:
+            raise RuntimeError(
+                f"VNNLIB parsing failed: could not find a working shape for "
+                f"{tensor.numel()}-element input in ONNX model (declared shape {input_shape})"
+            )
+        tensor = tensor.reshape(*probed)
+        meta['input_shape_probed'] = probed
+        logger.info(f"  ✓ Shape probe succeeded: reshaped to {probed}")
+        return tensor, meta
+
+
+def _probe_model_shape(pytorch_model, total_count: int, onnx_shape):
+    """Find a tensor shape with numel==total_count that the model accepts.
+
+    Returns the first shape whose dry-run forward pass succeeds, or None.
+    Candidates (in order): onnx_shape if numel matches; perfect-square (1,1,s,s);
+    ratio-based (k,*onnx_shape[1:]) when total_count is a multiple of onnx_numel;
+    flat (1,total_count).
+    """
+    import math
+
+    candidates = []
+    if onnx_shape:
+        onnx_numel = 1
+        for d in onnx_shape:
+            onnx_numel *= max(int(d), 1)
+        if onnx_numel == total_count:
+            candidates.append(tuple(onnx_shape))
+        elif onnx_numel > 0 and total_count % onnx_numel == 0 and len(onnx_shape) > 1:
+            k = total_count // onnx_numel
+            candidates.append((k,) + tuple(onnx_shape[1:]))
+    s = int(math.isqrt(total_count))
+    if s * s == total_count:
+        candidates.append((1, 1, s, s))
+    candidates.append((1, total_count))
+
+    for shape in candidates:
+        try:
+            x = torch.zeros(*shape)
+            with torch.no_grad():
+                pytorch_model(x)
+            return shape
+        except Exception:
+            continue
+    return None
+
+
 def load_vnnlib_pair(
     category: str,
     onnx_model: str,
@@ -450,17 +512,13 @@ def load_vnnlib_pair(
     
     # Parse VNNLIB to get input tensor
     logger.info("[3/3] Parsing VNNLIB specification...")
-    try:
-        input_tensor, vnnlib_metadata = parse_vnnlib_to_tensors(
-            vnnlib_path,
-            input_shape=input_shape
-        )
-        logger.info(
-            f"  ✓ Parsed VNNLIB: {vnnlib_metadata['num_inputs']} inputs, "
-            f"{vnnlib_metadata['num_outputs']} outputs"
-        )
-    except VNNLibParseError as e:
-        raise RuntimeError(f"VNNLIB parsing failed: {e}")
+    input_tensor, vnnlib_metadata = _parse_vnnlib_with_shape_probe(
+        vnnlib_path, pytorch_model, input_shape
+    )
+    logger.info(
+        f"  ✓ Parsed VNNLIB: {vnnlib_metadata['num_inputs']} inputs, "
+        f"{vnnlib_metadata['num_outputs']} outputs"
+    )
     
     # Extract ground truth label from VNNLIB comment (if available)
     ground_truth_label_int = extract_label_from_vnnlib(vnnlib_path)

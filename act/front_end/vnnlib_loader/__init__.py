@@ -67,7 +67,7 @@ from act.front_end.vnnlib_loader.onnx_converter import (
 # VNNLIB parsing utilities
 from act.front_end.vnnlib_loader.vnnlib_parser import (
     parse_vnnlib_to_tensors,
-    parse_vnnlib_to_specs,
+    parse_vnnlib_queries,
     validate_vnnlib_file,
     list_vnnlib_variables,
     VNNLibParseError
@@ -96,7 +96,7 @@ __all__ = [
     
     # VNNLIB parsing
     'parse_vnnlib_to_tensors',
-    'parse_vnnlib_to_specs',
+    'parse_vnnlib_queries',
     'validate_vnnlib_file',
     'list_vnnlib_variables',
     'VNNLibParseError'
