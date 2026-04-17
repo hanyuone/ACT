@@ -323,16 +323,29 @@ def hz_apply_relu(hz: HZono) -> HZono:
 
 
 def hz_apply_leaky_relu(hz: HZono, alpha_arg: float) -> HZono:
-    """Exact LeakyReLU via equality constraints + box equalities with slack.
+    """Exact LeakyReLU via the same encoding as ReLU.
 
-    Per unstable neuron: ng += 6, nb += 1, nc += 5.
+    Per unstable neuron: ng += 4 (xi1, xi2, xi3, xi4), nb += 1 (z), nc += 3
+    (graph eq 1, graph eq 2, linking eq) -- identical to hz_apply_relu.
+
+    Decomposition: y = max(s*x, x) where s = alpha_arg. On the unstable
+    branch, using the same switching mechanism as ReLU (z=+1 -> inactive
+    with xi2 forced to 1; z=-1 -> active with xi1 forced to 1), we set
+    the output as::
+
+        y_h = beta/2 + (s*alpha/2) xi1 - (beta/2) xi2 + (s*alpha/2) z
+
+    which degenerates exactly to ReLU's ``y_h = (beta/2)(1 - xi2)`` when
+    s = 0. The graph equalities (xi1+xi3+z=1, xi2+xi4-z=1) and the linking
+    equality (that ties x_h to xi1, xi2, z) are identical to ReLU.
     """
     dtype, device = hz.c.dtype, hz.c.device
     n = hz.c.shape[0]
     ng = hz.Gc.shape[1]
     nb = hz.Gb.shape[1]
     nc = hz.Ac.shape[0]
-    a = alpha_arg
+    s = alpha_arg
+    assert 0.0 <= s <= 1.0, f"hz_apply_leaky_relu: slope must be in [0, 1], got {s}"
 
     bounds = hz_compute_bounds(hz)
     lb = bounds.lb.flatten()
@@ -343,7 +356,7 @@ def hz_apply_leaky_relu(hz: HZono, alpha_arg: float) -> HZono:
     unstable = ~active & ~inactive
     k = int(unstable.sum().item())
 
-    out_Gc = torch.zeros((n, ng + 6 * k), dtype=dtype, device=device)
+    out_Gc = torch.zeros((n, ng + 4 * k), dtype=dtype, device=device)
     out_Gb = torch.zeros((n, nb + k), dtype=dtype, device=device)
     out_c = torch.zeros((n, 1), dtype=dtype, device=device)
 
@@ -353,9 +366,9 @@ def hz_apply_leaky_relu(hz: HZono, alpha_arg: float) -> HZono:
         out_Gb[active, :nb] = hz.Gb[active]
 
     if inactive.any():
-        out_c[inactive] = a * hz.c[inactive]
-        out_Gc[inactive, :ng] = a * hz.Gc[inactive]
-        out_Gb[inactive, :nb] = a * hz.Gb[inactive]
+        out_c[inactive] = s * hz.c[inactive]
+        out_Gc[inactive, :ng] = s * hz.Gc[inactive]
+        out_Gb[inactive, :nb] = s * hz.Gb[inactive]
 
     if k == 0:
         return HZono(
@@ -368,66 +381,57 @@ def hz_apply_leaky_relu(hz: HZono, alpha_arg: float) -> HZono:
         )
 
     unstable_idx = torch.where(unstable)[0]
-    l = lb[unstable_idx]
-    u = ub[unstable_idx]
+    alpha = lb[unstable_idx]
+    beta = ub[unstable_idx]
     t = torch.arange(k, device=device)
 
-    col_g1 = ng + t
-    col_g2 = ng + k + t
-    col_s1p = ng + 2 * k + t
-    col_s1m = ng + 3 * k + t
-    col_s2p = ng + 4 * k + t
-    col_s2m = ng + 5 * k + t
+    col_xi1 = ng + t
+    col_xi2 = ng + k + t
+    col_xi3 = ng + 2 * k + t
+    col_xi4 = ng + 3 * k + t
     col_z = nb + t
 
-    out_c[unstable_idx, 0] = (u + a * l) / 4.0
-    out_Gc[unstable_idx, col_g1] = a * l / 2.0
-    out_Gc[unstable_idx, col_g2] = -u / 2.0
-    out_Gb[unstable_idx, col_z] = (a * l - u) / 4.0
+    # Output encoding: y_h = beta/2 + (s*alpha/2) xi1 - (beta/2) xi2 + (s*alpha/2) z
+    out_c[unstable_idx, 0] = beta / 2.0
+    out_Gc[unstable_idx, col_xi1] = s * alpha / 2.0
+    out_Gc[unstable_idx, col_xi2] = -beta / 2.0
+    out_Gb[unstable_idx, col_z] = s * alpha / 2.0
 
-    ng_total = ng + 6 * k
-    nb_total = nb + k
+    ng_new = ng + 4 * k
+    nb_new = nb + k
 
-    eq_Ac = torch.zeros((5 * k, ng_total), dtype=dtype, device=device)
-    eq_Ab = torch.zeros((5 * k, nb_total), dtype=dtype, device=device)
-    eq_b = torch.zeros((5 * k, 1), dtype=dtype, device=device)
+    eq_Ac = torch.zeros((3 * k, ng_new), dtype=dtype, device=device)
+    eq_Ab = torch.zeros((3 * k, nb_new), dtype=dtype, device=device)
+    eq_b = torch.zeros((3 * k, 1), dtype=dtype, device=device)
 
-    r0 = 5 * t
-    r1 = 5 * t + 1
-    r2 = 5 * t + 2
-    r3 = 5 * t + 3
+    r1 = 3 * t
+    r2 = 3 * t + 1
 
-    eq_Ac[r0, col_g1] = 1.0
-    eq_Ac[r0, col_s1p] = 1.0
-    eq_Ab[r0, col_z] = 0.5
-    eq_b[r0, 0] = 0.5
+    # Graph equality 1: xi1 + xi3 + z = 1
+    eq_Ac[r1, col_xi1] = 1.0
+    eq_Ac[r1, col_xi3] = 1.0
+    eq_Ab[r1, col_z] = 1.0
+    eq_b[r1, 0] = 1.0
 
-    eq_Ac[r1, col_g1] = -1.0
-    eq_Ac[r1, col_s1m] = 1.0
-    eq_Ab[r1, col_z] = 0.5
-    eq_b[r1, 0] = 0.5
+    # Graph equality 2: xi2 + xi4 - z = 1
+    eq_Ac[r2, col_xi2] = 1.0
+    eq_Ac[r2, col_xi4] = 1.0
+    eq_Ab[r2, col_z] = -1.0
+    eq_b[r2, 0] = 1.0
 
-    eq_Ac[r2, col_g2] = 1.0
-    eq_Ac[r2, col_s2p] = 1.0
-    eq_Ab[r2, col_z] = -0.5
-    eq_b[r2, 0] = 0.5
-
-    eq_Ac[r3, col_g2] = -1.0
-    eq_Ac[r3, col_s2m] = 1.0
-    eq_Ab[r3, col_z] = -0.5
-    eq_b[r3, 0] = 0.5
-
+    # Linking equality: ties x_h to (xi1, xi2, z)
+    # Same form as ReLU; x_h has the same input expression.
     for j in range(k):
         idx_i = int(unstable_idx[j].item())
-        eq_Ac[5 * j + 4, :ng] = hz.Gc[idx_i]
-        eq_Ac[5 * j + 4, col_g1[j]] = -l[j] / 2.0
-        eq_Ac[5 * j + 4, col_g2[j]] = u[j] / 2.0
-        eq_Ab[5 * j + 4, :nb] = hz.Gb[idx_i]
-        eq_Ab[5 * j + 4, col_z[j]] = -(l[j] - u[j]) / 4.0
-        eq_b[5 * j + 4, 0] = (u[j] + l[j]) / 4.0 - hz.c[idx_i, 0]
+        eq_Ac[3 * j + 2, col_xi1[j]] = alpha[j] / 2.0
+        eq_Ac[3 * j + 2, col_xi2[j]] = -beta[j] / 2.0
+        eq_Ac[3 * j + 2, :ng] -= hz.Gc[idx_i]
+        eq_Ab[3 * j + 2, :nb] -= hz.Gb[idx_i]
+        eq_Ab[3 * j + 2, col_z[j]] = alpha[j] / 2.0
+        eq_b[3 * j + 2, 0] = hz.c[idx_i, 0] - beta[j] / 2.0
 
     old_Ac_ext = torch.cat(
-        [hz.Ac, torch.zeros((nc, 6 * k), dtype=dtype, device=device)], dim=1
+        [hz.Ac, torch.zeros((nc, 4 * k), dtype=dtype, device=device)], dim=1
     )
     old_Ab_ext = torch.cat(
         [hz.Ab, torch.zeros((nc, k), dtype=dtype, device=device)], dim=1

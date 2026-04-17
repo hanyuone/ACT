@@ -105,8 +105,11 @@ class ACTToTorch:
             VerifiableModel model with embedded constraint checking
 
         Raises:
+            NotImplementedError: If the net has multi-predecessor layers.
             ValueError: If no valid PyTorch layers can be created
         """
+        self._assert_chain_structure()
+
         torch_layers = []
         has_input_spec = False
         has_output_spec = False
@@ -348,3 +351,21 @@ class ACTToTorch:
                 m.load_state_dict(state_dict, strict=False)
 
         return m
+
+    def _assert_chain_structure(self) -> None:
+        """Fail-loud on DAG nets; silent drop would break soundness."""
+        preds = getattr(self.act_net, "preds", {}) or {}
+        dag_layers = [
+            (lid, self.act_net.by_id[lid].kind)
+            for lid, parents in preds.items()
+            if parents and len(parents) > 1
+        ]
+        if dag_layers:
+            preview = dag_layers[:5]
+            suffix = "..." if len(dag_layers) > 5 else ""
+            raise NotImplementedError(
+                f"ACTToTorch currently supports chain networks only. "
+                f"Found {len(dag_layers)} multi-predecessor layer(s): "
+                f"{preview}{suffix}. DAG support is deferred — this is "
+                f"intentional fail-loud to prevent silent unsoundness."
+            )
