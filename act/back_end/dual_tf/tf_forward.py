@@ -135,11 +135,18 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
             
         elif kind == "ADD":
             # ADD layer: z = x + y (+ bias if present)
-            # Get bounds from predecessor layers via x_src and y_src
-            x_src = layer.params.get("x_src")
-            y_src = layer.params.get("y_src")
-            
-            if x_src is not None and y_src is not None and x_src in bounds_dict and y_src in bounds_dict:
+            # Predecessor layer IDs come from the ACT Net graph (``net.preds``).
+            # The prior implementation read ``x_src`` / ``y_src`` from
+            # ``layer.params``, but ``NetFactory.create_network`` writes the
+            # operands into ``params["x_vars"]`` / ``params["y_vars"]``
+            # (variable IDs) and the predecessor *layer* IDs into
+            # ``net.preds[layer.id]``. The missing keys sent execution down
+            # the "keep current lb, ub" fallback, which yielded
+            # ``bounds_dict[ADD] == bounds_dict[main_pred]`` (ignoring the
+            # skip path) and produced *unsound* bounds on residual nets.
+            pred_ids = list(net.preds.get(lid, []) or [])
+            if len(pred_ids) >= 2 and pred_ids[0] in bounds_dict and pred_ids[1] in bounds_dict:
+                x_src, y_src = pred_ids[0], pred_ids[1]
                 lb_x, ub_x = bounds_dict[x_src].lb.flatten(), bounds_dict[x_src].ub.flatten()
                 lb_y, ub_y = bounds_dict[y_src].lb.flatten(), bounds_dict[y_src].ub.flatten()
                 

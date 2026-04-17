@@ -858,16 +858,32 @@ class ConfigSampler:
             if k in params:
                 params[k] = tuple(int(x) for x in params[k])
 
-        params["activation"] = rng.choice(self.available_activations_list).lower()
+        # TF-capability filtering for activation / pool_kind / downsample.
+        # These are deterministic overrides applied only when the YAML-sampled
+        # value is not supported by the current TF set. Using ``rng.choice``
+        # here would consume random state and break seed reproducibility with
+        # consumers (incl. upstream paper baselines); we fall back to the
+        # first allowed value instead, matching the pre-refactor convention.
+        sampled_act = str(params.get("activation", "")).lower()
+        if not self.available_activations:
+            pass  # nothing to filter against; leave as-is
+        elif sampled_act and sampled_act.upper() in self.available_activations:
+            params["activation"] = sampled_act
+        else:
+            params["activation"] = next(iter(self.available_activations_list)).lower()
 
         if "use_pooling" in params:
             if self.available_pool_kinds:
-                params["pool_kind"] = rng.choice(self.available_pool_kinds)
+                sampled_pool = params.get("pool_kind")
+                if sampled_pool not in self.available_pool_kinds:
+                    params["pool_kind"] = self.available_pool_kinds[0]
             else:
                 params["use_pooling"] = False
 
         if "downsample" in params:
-            params["downsample"] = rng.choice(self.available_downsamples)
+            sampled_ds = params.get("downsample")
+            if self.available_downsamples and sampled_ds not in self.available_downsamples:
+                params["downsample"] = self.available_downsamples[0]
 
         if "head_pool_to_1x1" in params and not self.can_head_pool:
             params["head_pool_to_1x1"] = False
