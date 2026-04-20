@@ -658,15 +658,17 @@ def load_dataset_model_pair(
                 model.fc = torch.nn.Linear(in_features, num_classes)
                 print(f"  ✓ Adjusted final layer: {in_features} → {num_classes} classes")
         elif hasattr(model, 'classifier'):
-            # For models like VGG, MobileNet
-            if isinstance(model.classifier, torch.nn.Sequential):
-                in_features = model.classifier[-1].in_features
-                if model.classifier[-1].out_features != num_classes:
-                    model.classifier[-1] = torch.nn.Linear(in_features, num_classes)
+            classifier = model.classifier
+            named_kids = list(classifier.named_children())
+            if named_kids:
+                last_name, last_child = named_kids[-1]
+                in_features = last_child.in_features
+                if last_child.out_features != num_classes:
+                    setattr(classifier, last_name, torch.nn.Linear(in_features, num_classes))
                     print(f"  ✓ Adjusted classifier: {in_features} → {num_classes} classes")
             else:
-                in_features = model.classifier.in_features
-                if model.classifier.out_features != num_classes:
+                in_features = classifier.in_features
+                if classifier.out_features != num_classes:
                     model.classifier = torch.nn.Linear(in_features, num_classes)
                     print(f"  ✓ Adjusted classifier: {in_features} → {num_classes} classes")
         

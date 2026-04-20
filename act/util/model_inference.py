@@ -75,8 +75,8 @@ def model_inference(models: Dict[Union[str, Tuple], nn.Module]) -> Dict[Union[st
     successful_models = {}  # Track successfully inferred models
     
     for combo_id, model in models.items():
-        # Extract input and label from InputLayer (first layer)
-        input_layer = model[0]
+        # Extract input and label from InputLayer (named child on VerifiableModel)
+        input_layer = model.input_layer
         if not hasattr(input_layer, 'input_tensor'):
             print(f"⚠️  Model {combo_id} missing input_tensor in InputLayer")
             failure_count += 1

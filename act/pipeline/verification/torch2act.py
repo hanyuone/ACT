@@ -778,7 +778,7 @@ class _LayerGraphBuilder:
         out_vars = self._alloc_ids(1)
         output_shape = (1, 1)
         layer_id = self._add_layer(
-            "MEAN",
+            LayerKind.MEAN.value,
             {"input_shape": self.shape, "output_shape": output_shape},
             self.prev_out, out_vars
         )

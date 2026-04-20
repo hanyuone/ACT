@@ -13,17 +13,19 @@
 # LayerKind → torch.nn.Module for restoration.
 #
 # Layer Routing:
-#   INPUT      → (skipped)
+#   INPUT      → InputLayer
 #   INPUT_SPEC → InputSpecLayer
-#   <MODEL>    → _ACT_TO_TORCH[kind] (if defined)
+#   <MODEL>    → ActGraphModule (arbitrary DAG restoration)
 #   ASSERT     → OutputSpecLayer
 #
 # ===---------------------------------------------------------------------===#
 
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, cast
+from collections import deque
+from typing import Set, List
 import importlib
-import torch
-import torch.nn as nn
+import torch  # pyright: ignore[reportMissingImports]
+import torch.nn as nn  # pyright: ignore[reportMissingImports]
 import logging
 
 from act.back_end.core import Net, Layer
@@ -71,6 +73,143 @@ _ACT_TO_TORCH = {
 }
 
 
+class ActGraphModule(nn.Module):
+    """DAG-aware nn.Module for ACT body graphs reconstructed by ACTToTorch.
+
+    Holds the body sub-graph between INPUT_SPEC and ASSERT. Performs forward by
+    topological-order traversal, caching activations per layer id. Handles:
+      - Module-backed layers (DENSE, CONV2D, RELU, ...): single-input nn.Module call.
+      - Functional layers (ADD, CONCAT, MUL, SCALE, BIAS): inline tensor ops; tensor
+        constants (SCALE["a"], BIAS["c"]) registered as buffers for .to() propagation.
+      - BN-fused pairs (SCALE + BIAS with is_batchnorm_decomposition): SCALE owns the
+        reconstructed BatchNorm module; BIAS's activation aliases SCALE's so successors
+        reading the BIAS id get the fused BN output.
+    """
+
+    def __init__(
+        self,
+        act_net,
+        topo_order,
+        layer_modules,
+        source_ids,
+        exit_id,
+        bn_aliases,
+        body_preds,
+    ):
+        super().__init__()
+        self.layers = nn.ModuleDict(
+            {str(lid): mod for lid, mod in layer_modules.items() if mod is not None}
+        )
+        self._net = act_net
+        self._topo = list(topo_order)
+        self._sources = set(source_ids)
+        self._exit = exit_id
+        self._bn_aliases = dict(bn_aliases)
+        self._body_preds = {k: list(v) for k, v in body_preds.items()}
+
+        for lid in self._topo:
+            layer = act_net.by_id[lid]
+            if str(lid) in self.layers:
+                continue
+            if lid in self._bn_aliases:
+                continue
+            kind = layer.kind
+            if kind == LayerKind.SCALE.value and isinstance(layer.params.get("a"), torch.Tensor):
+                self.register_buffer(f"_scale_a_{lid}", layer.params["a"].detach().clone())
+            elif kind == LayerKind.BIAS.value and isinstance(layer.params.get("c"), torch.Tensor):
+                self.register_buffer(f"_bias_c_{lid}", layer.params["c"].detach().clone())
+
+    def forward(self, x):
+        activations = {}
+        for lid in self._topo:
+            if lid in self._bn_aliases:
+                activations[lid] = activations[self._bn_aliases[lid]]
+                continue
+
+            pred_sources = self._body_preds.get(lid, [])
+            if pred_sources:
+                inp_tensors = []
+                for pred in pred_sources:
+                    if pred is None:
+                        inp_tensors.append(x)
+                        continue
+                    try:
+                        inp_tensors.append(activations[pred])
+                    except KeyError as e:
+                        raise RuntimeError(
+                            f"ActGraphModule: layer {lid} (kind={self._net.by_id[lid].kind}) "
+                            f"missing predecessor activation for layer id {e.args[0]}. "
+                            f"Check topological sort vs. body_preds."
+                        )
+            elif lid in self._sources:
+                inp_tensors = [x]
+            else:
+                raise RuntimeError(
+                    f"ActGraphModule: layer {lid} (kind={self._net.by_id[lid].kind}) "
+                    f"has no recorded predecessors and is not a source node."
+                )
+
+            mod = self.layers[str(lid)] if str(lid) in self.layers else None
+            layer = self._net.by_id[lid]
+
+            if mod is None:
+                out = self._apply_functional(layer, inp_tensors)
+            else:
+                if len(inp_tensors) > 1:
+                    raise NotImplementedError(
+                        f"ActGraphModule: module-backed layer {layer.kind} (id={lid}) "
+                        f"received {len(inp_tensors)} inputs; multi-input module dispatch "
+                        f"not implemented (current torch2act does not emit such nets)."
+                    )
+                out = mod(inp_tensors[0])
+            activations[lid] = out
+
+        if self._exit not in activations:
+            raise RuntimeError(
+                f"ActGraphModule: exit layer id {self._exit} has no activation. "
+                f"Topological order or exit_id inconsistent with body graph."
+            )
+        return activations[self._exit]
+
+    def _apply_functional(self, layer, inputs):
+        kind = layer.kind
+        if kind == LayerKind.ADD.value:
+            if len(inputs) < 2:
+                raise RuntimeError(
+                    f"ActGraphModule: ADD layer {layer.id} expects at least 2 inputs, "
+                    f"got {len(inputs)}."
+                )
+            out = inputs[0]
+            for t in inputs[1:]:
+                out = out + t
+            return out
+        if kind == LayerKind.CONCAT.value:
+            if len(inputs) < 2:
+                raise RuntimeError(
+                    f"ActGraphModule: CONCAT layer {layer.id} expects at least 2 inputs, "
+                    f"got {len(inputs)}."
+                )
+            return torch.cat(inputs, dim=layer.params.get("concat_dim", 1))
+        if kind == LayerKind.MUL.value:
+            if len(inputs) < 2:
+                raise RuntimeError(
+                    f"ActGraphModule: MUL layer {layer.id} expects at least 2 inputs, "
+                    f"got {len(inputs)}."
+                )
+            out = inputs[0]
+            for t in inputs[1:]:
+                out = out * t
+            return out
+        if kind == LayerKind.SCALE.value:
+            return inputs[0] * getattr(self, f"_scale_a_{layer.id}")
+        if kind == LayerKind.BIAS.value:
+            return inputs[0] + getattr(self, f"_bias_c_{layer.id}")
+        raise NotImplementedError(
+            f"ActGraphModule: functional layer kind '{kind}' (id={layer.id}) not supported. "
+            f"torch2act only emits ADD, CONCAT, MUL, SCALE, BIAS functionally."
+        )
+
+
 class ACTToTorch:
     """
     Convert ACT Net to PyTorch nn.Module using dynamic restoration.
@@ -105,130 +244,319 @@ class ACTToTorch:
             VerifiableModel model with embedded constraint checking
 
         Raises:
-            NotImplementedError: If the net has multi-predecessor layers.
-            ValueError: If no valid PyTorch layers can be created
+            ValueError: If ACT Net invariants are violated or restoration fails
         """
-        self._assert_chain_structure()
+        from act.front_end.verifiable_model import (
+            InputLayer,
+            InputSpecLayer,
+            OutputSpecLayer,
+            VerifiableModel,
+        )
+        from act.front_end.spec_creator_base import LabeledInputTensor
+        from act.front_end.specs import InputSpec, InKind, OutputSpec, OutKind
 
-        torch_layers = []
-        has_input_spec = False
-        has_output_spec = False
-
-        # Get target dtype/device once for all tensor conversions
         target_dtype = get_default_dtype()
         target_device = get_default_device()
 
-        # Track layers to skip (e.g., BIAS paired with SCALE for BatchNorm)
-        skip_layer_ids = set()
+        def _to_target_float_tensor(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                return value.to(dtype=target_dtype, device=target_device)
+            return value
 
-        for i, act_layer in enumerate(self.act_net.layers):
-            # Skip layers marked for skipping
-            if act_layer.id in skip_layer_ids:
+        def _to_target_tensor(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                return value.to(device=target_device)
+            return value
+
+        input_act = None
+        input_spec_acts = []
+        assert_act = None
+        body_acts = []
+
+        for idx, act_layer in enumerate(self.act_net.layers):
+            if act_layer.kind == LayerKind.INPUT.value:
+                if input_act is not None:
+                    raise ValueError(
+                        f"ACTToTorch expects exactly one INPUT layer, found ids "
+                        f"{input_act.id} and {act_layer.id}."
+                    )
+                input_act = act_layer
                 continue
 
-            kind = act_layer.kind
-            params = act_layer.params
-
-            # Handle wrapper layers specially
-            if kind == LayerKind.INPUT.value:
-                continue  # Skip INPUT layer (no-op)
-
-            if kind == LayerKind.INPUT_SPEC.value:
-                # Create InputSpecLayer for constraint checking
-                from act.front_end.verifiable_model import InputSpecLayer
-                from act.front_end.specs import InputSpec, InKind
-
-                # Build InputSpec from ACT layer (kind/eps in params)
-                kind_str = params["kind"]
-                spec_kind = getattr(InKind, kind_str)  # Convert string to enum
-                spec_dict = {"kind": spec_kind}
-                if "eps" in params:
-                    spec_dict["eps"] = params["eps"]
-
-                # Convert parameter tensors to device_manager dtype for consistency
-                for param_key in ["lb", "ub", "center", "A", "b"]:
-                    if param_key in params:
-                        tensor = params[param_key]
-                        spec_dict[param_key] = tensor.to(
-                            dtype=target_dtype, device=target_device
-                        )
-
-                spec = InputSpec(**spec_dict)
-                # InputSpecLayer now always returns tuples
-                torch_layers.append(InputSpecLayer(spec))
-                has_input_spec = True
+            if act_layer.kind == LayerKind.INPUT_SPEC.value:
+                input_spec_acts.append(act_layer)
                 continue
 
-            elif kind == LayerKind.ASSERT.value:
-                # Create OutputSpecLayer for constraint checking
-                from act.front_end.verifiable_model import OutputSpecLayer
-                from act.front_end.specs import OutputSpec, OutKind
-
-                # Build OutputSpec from ACT layer
-                kind_str = params["kind"]
-                spec_kind = getattr(OutKind, kind_str)  # Convert string to enum
-                spec_dict = {"kind": spec_kind}
-                if "y_true" in params:
-                    spec_dict["y_true"] = params["y_true"]
-                if "margin" in params:
-                    spec_dict["margin"] = params["margin"]
-                if "d" in params:
-                    spec_dict["d"] = params["d"]
-
-                # Convert parameter tensors to device_manager dtype for consistency
-                for param_key in ["c", "lb", "ub"]:
-                    if param_key in params:
-                        tensor = params[param_key]
-                        spec_dict[param_key] = tensor.to(
-                            dtype=target_dtype, device=target_device
-                        )
-
-                spec = OutputSpec(**spec_dict)
-                # OutputSpecLayer now always returns tuples
-                torch_layers.append(OutputSpecLayer(spec))
-                has_output_spec = True
+            if act_layer.kind == LayerKind.ASSERT.value:
+                if assert_act is not None:
+                    raise ValueError(
+                        f"ACTToTorch expects exactly one ASSERT layer, found ids "
+                        f"{assert_act.id} and {act_layer.id}."
+                    )
+                if idx != len(self.act_net.layers) - 1:
+                    raise ValueError(
+                        f"ASSERT layer {act_layer.id} must be the last ACT layer, "
+                        f"but appears at position {idx} of {len(self.act_net.layers) - 1}."
+                    )
+                assert_act = act_layer
                 continue
 
-            # SCALE with BatchNorm decomposition → Restore BatchNorm
-            if kind == LayerKind.SCALE.value and params.get(
-                "is_batchnorm_decomposition"
-            ):
-                # Find paired BIAS layer
-                bias_layer = self._find_paired_bias(i)
-                if bias_layer is not None:
-                    skip_layer_ids.add(bias_layer.id)
+            body_acts.append(act_layer)
 
-                bn_module = self._restore_batchnorm(act_layer)
-                if bn_module is not None:
-                    torch_layers.append(bn_module)
-                    continue
+        if input_act is None:
+            raise ValueError("ACTToTorch expects exactly one INPUT layer, found 0.")
+        if not input_spec_acts:
+            raise ValueError("ACTToTorch expects at least one INPUT_SPEC layer, found 0.")
+        if assert_act is None:
+            raise ValueError("ACTToTorch expects exactly one ASSERT layer, found 0.")
 
-            # Skip BIAS paired with SCALE (already handled)
-            if kind == LayerKind.BIAS.value and params.get("paired_with_scale"):
-                continue
+        ip = input_act.params
+        shape_value = ip.get("shape")
+        if not isinstance(shape_value, (list, tuple)):
+            raise ValueError(
+                f"ACTToTorch: INPUT layer {input_act.id} has invalid shape param {shape_value!r}."
+            )
+        shape = tuple(shape_value)
 
-            # Schema-driven restoration for all other layers
-            torch_layer = self._build_from_schema(act_layer)
-            if torch_layer is None:
-                # Skip if restore kind is 'skip' or 'graph'
-                continue
+        dv = ip.get("dtype")
+        if isinstance(dv, str):
+            dname = dv.split(".", 1)[1] if dv.startswith("torch.") else dv
+            try:
+                torch_dtype = getattr(torch, dname)
+            except AttributeError as exc:
+                raise ValueError(
+                    f"ACTToTorch: INPUT layer {input_act.id} has unknown dtype {dv!r}."
+                ) from exc
+        elif isinstance(dv, torch.dtype):
+            torch_dtype = dv
+        else:
+            raise ValueError(
+                f"ACTToTorch: INPUT layer {input_act.id} has invalid dtype param {dv!r}."
+            )
 
-            torch_layers.append(torch_layer)
+        labeled_input = ip.get("labeled_input")
+        if labeled_input is None:
+            dummy = torch.zeros(shape, dtype=torch_dtype, device=target_device)
+            labeled_input = LabeledInputTensor(tensor=dummy, label=None)
+        elif isinstance(labeled_input, LabeledInputTensor):
+            labeled_input = LabeledInputTensor(
+                tensor=labeled_input.tensor.to(device=target_device, dtype=torch_dtype),
+                label=labeled_input.label.to(device=target_device)
+                if labeled_input.label is not None
+                else None,
+            )
+        else:
+            raise ValueError(
+                f"ACTToTorch: INPUT layer {input_act.id} has invalid labeled_input type "
+                f"{type(labeled_input).__name__}."
+            )
 
-        if not torch_layers:
-            raise ValueError("No valid PyTorch layers found in ACT Net")
+        optional_kwargs = {}
+        for key in (
+            "desc",
+            "layout",
+            "dataset_name",
+            "num_classes",
+            "value_range",
+            "scale_hint",
+            "distribution",
+            "sample_id",
+            "domain",
+            "channels",
+        ):
+            if key in ip:
+                optional_kwargs[key] = ip[key]
 
-        # Return VerifiableModel for automatic constraint checking
-        from act.front_end.verifiable_model import VerifiableModel
-
-        model = VerifiableModel(*torch_layers)
-        model.eval()  # Set to evaluation mode by default
-
-        logger.info(
-            f"Created VerifiableModel with {len(torch_layers)} layers "
-            f"(INPUT_SPEC={has_input_spec}, OUTPUT_SPEC={has_output_spec})"
+        input_layer_mod = InputLayer(
+            labeled_input=labeled_input,
+            shape=shape,
+            dtype=torch_dtype,
+            **optional_kwargs,
         )
 
+        if len(input_spec_acts) > 1:
+            raise ValueError(
+                f"ACTToTorch currently supports exactly one INPUT_SPEC layer for restoration; "
+                f"found {len(input_spec_acts)} ids={[layer.id for layer in input_spec_acts]}."
+            )
+
+        input_spec_params = input_spec_acts[0].params
+        input_kind_str = input_spec_params.get("kind")
+        if not isinstance(input_kind_str, str):
+            raise ValueError(
+                f"ACTToTorch: INPUT_SPEC layer {input_spec_acts[0].id} has invalid kind "
+                f"param {input_kind_str!r}."
+            )
+        try:
+            input_spec_kind = getattr(InKind, input_kind_str)
+        except AttributeError as exc:
+            raise ValueError(
+                f"ACTToTorch: INPUT_SPEC layer {input_spec_acts[0].id} has unknown kind "
+                f"{input_kind_str!r}."
+            ) from exc
+        input_spec_dict = {"kind": input_spec_kind}
+        if "eps" in input_spec_params:
+            input_spec_dict["eps"] = _to_target_float_tensor(input_spec_params["eps"])
+        for param_key in ["lb", "ub", "center", "A", "b"]:
+            if param_key in input_spec_params:
+                input_spec_dict[param_key] = _to_target_float_tensor(
+                    input_spec_params[param_key]
+                )
+        input_spec_mod = InputSpecLayer(InputSpec(**input_spec_dict))
+
+        body_ids = {layer.id for layer in body_acts}
+        body_preds = {
+            lid: [p if p in body_ids else None for p in self.act_net.preds.get(lid, [])]
+            for lid in body_ids
+        }
+        body_succs = {
+            lid: [s for s in self.act_net.succs.get(lid, []) if s in body_ids]
+            for lid in body_ids
+        }
+
+        indegree = {
+            lid: sum(1 for pred in body_preds[lid] if pred is not None) for lid in body_ids
+        }
+        queue = deque(layer.id for layer in body_acts if indegree[layer.id] == 0)
+        topo_order = []
+        while queue:
+            lid = queue.popleft()
+            topo_order.append(lid)
+            for succ_id in body_succs.get(lid, []):
+                indegree[succ_id] -= 1
+                if indegree[succ_id] == 0:
+                    queue.append(succ_id)
+
+        if len(topo_order) != len(body_ids):
+            unresolved = [layer.id for layer in body_acts if layer.id not in topo_order]
+            raise ValueError(
+                f"ACTToTorch body graph contains a cycle or unresolved dependencies. "
+                f"Topological sort covered {len(topo_order)} of {len(body_ids)} body layers; "
+                f"remaining ids={unresolved}."
+            )
+
+        layer_modules: Dict[int, Optional[nn.Module]] = {}
+        skip_ids: Set[int] = set()
+        bn_aliases: Dict[int, int] = {}
+        layer_indices = {layer.id: idx for idx, layer in enumerate(self.act_net.layers)}
+
+        for act_layer in body_acts:
+            if act_layer.kind != LayerKind.SCALE.value:
+                continue
+            if not act_layer.params.get("is_batchnorm_decomposition"):
+                continue
+
+            scale_id = act_layer.id
+            bias_id = None
+            for succ_id in body_succs.get(scale_id, []):
+                succ_layer = self.act_net.by_id[succ_id]
+                if succ_layer.kind == LayerKind.BIAS.value and succ_layer.params.get(
+                    "paired_with_scale"
+                ):
+                    bias_id = succ_layer.id
+                    break
+            if bias_id is None:
+                bias_layer = self._find_paired_bias(layer_indices[scale_id])
+                if bias_layer is not None and bias_layer.id in body_ids:
+                    bias_id = bias_layer.id
+            if bias_id is None:
+                raise ValueError(
+                    f"ACTToTorch: SCALE layer {scale_id} is marked as batchnorm decomposition "
+                    f"but no paired BIAS layer was found."
+                )
+
+            bn_module = self._restore_batchnorm(act_layer)
+            if bn_module is None:
+                raise ValueError(
+                    f"ACTToTorch: failed to restore BatchNorm module from SCALE layer {scale_id}."
+                )
+
+            skip_ids.add(bias_id)
+            bn_aliases[bias_id] = scale_id
+            layer_modules[scale_id] = bn_module
+
+        for act_layer in body_acts:
+            lid = act_layer.id
+            if lid in skip_ids or lid in layer_modules:
+                continue
+            if act_layer.kind in {
+                LayerKind.SCALE.value,
+                LayerKind.BIAS.value,
+                LayerKind.ADD.value,
+                LayerKind.CONCAT.value,
+                LayerKind.MUL.value,
+            }:
+                layer_modules[lid] = None
+            else:
+                layer_modules[lid] = self._build_from_schema(act_layer)
+
+        assert_preds = self.act_net.preds.get(assert_act.id, [])
+        if len(assert_preds) != 1:
+            raise ValueError(
+                f"ACTToTorch: ASSERT layer {assert_act.id} must have exactly one predecessor; "
+                f"found {assert_preds}."
+            )
+        exit_id = assert_preds[0]
+        if exit_id is None or exit_id not in body_ids:
+            raise ValueError(
+                f"ACTToTorch: ASSERT layer {assert_act.id} must consume a body-layer output; "
+                f"got predecessor {exit_id}."
+            )
+
+        source_ids = {
+            lid for lid in body_ids
+            if all(p is None for p in body_preds[lid])
+        }
+        inner_model = ActGraphModule(
+            act_net=self.act_net,
+            topo_order=topo_order,
+            layer_modules=layer_modules,
+            source_ids=source_ids,
+            exit_id=exit_id,
+            bn_aliases=bn_aliases,
+            body_preds=body_preds,
+        )
+        inner_model = inner_model.to(device=target_device, dtype=torch_dtype)
+
+        output_params = assert_act.params
+        output_kind_str = output_params.get("kind")
+        if not isinstance(output_kind_str, str):
+            raise ValueError(
+                f"ACTToTorch: ASSERT layer {assert_act.id} has invalid kind param "
+                f"{output_kind_str!r}."
+            )
+        try:
+            output_spec_kind = getattr(OutKind, output_kind_str)
+        except AttributeError as exc:
+            raise ValueError(
+                f"ACTToTorch: ASSERT layer {assert_act.id} has unknown kind {output_kind_str!r}."
+            ) from exc
+        output_spec_dict = {"kind": output_spec_kind}
+        if "y_true" in output_params:
+            output_spec_dict["y_true"] = _to_target_tensor(output_params["y_true"])
+        if "margin" in output_params:
+            output_spec_dict["margin"] = _to_target_float_tensor(output_params["margin"])
+        if "d" in output_params:
+            output_spec_dict["d"] = _to_target_float_tensor(output_params["d"])
+        for param_key in ["c", "lb", "ub"]:
+            if param_key in output_params:
+                output_spec_dict[param_key] = _to_target_float_tensor(
+                    output_params[param_key]
+                )
+        output_spec_mod = OutputSpecLayer(OutputSpec(**output_spec_dict))
+
+        model = VerifiableModel(
+            input_layer=input_layer_mod,
+            input_spec=input_spec_mod,
+            model=inner_model,
+            output_spec=output_spec_mod,
+        )
+        model.eval()
+        logger.info(
+            f"Reconstructed VerifiableModel: body has {len(body_acts)} layer(s), "
+            f"inner_model type={type(inner_model).__name__}, "
+            f"INPUT_SPEC={len(input_spec_acts)}, BN_fused={len(bn_aliases)}."
+        )
         return model
 
     def _find_paired_bias(self, scale_idx: int) -> Optional[Layer]:
@@ -249,7 +577,7 @@ class ACTToTorch:
         """Restore BatchNorm from SCALE layer with batchnorm_* params."""
         params = scale_layer.params
 
-        bn_module_path = params.get("batchnorm_module")
+        bn_module_path = cast(str, params.get("batchnorm_module"))
         if not bn_module_path:
             return None
 
@@ -258,12 +586,12 @@ class ACTToTorch:
         cls = getattr(importlib.import_module(mod_name), cls_name)
 
         # Create BatchNorm instance
-        args = params.get("batchnorm_args", [])
-        kwargs = params.get("batchnorm_kwargs", {})
+        args = cast(List[Any], params.get("batchnorm_args", []))
+        kwargs = cast(Dict[str, Any], params.get("batchnorm_kwargs", {}))
         bn = cls(*args, **kwargs)
 
         # Load state from batchnorm_state
-        bn_state = params.get("batchnorm_state", {})
+        bn_state = cast(Dict[str, Any], params.get("batchnorm_state", {}))
         if bn_state:
             state_dict = {}
             for key in [
@@ -294,7 +622,7 @@ class ACTToTorch:
             if "requires_graph_restoration" in spec.get("params_optional", []):
                 logger.warning(
                     f"Skipping {kind} layer (id={act_layer.id}): "
-                    f"requires DAG structure, not supported in Sequential model"
+                    f"no direct nn.Module mapping; handled functionally by ActGraphModule"
                 )
             return None
 
@@ -351,21 +679,3 @@ class ACTToTorch:
                 m.load_state_dict(state_dict, strict=False)
 
         return m
-
-    def _assert_chain_structure(self) -> None:
-        """Fail-loud on DAG nets; silent drop would break soundness."""
-        preds = getattr(self.act_net, "preds", {}) or {}
-        dag_layers = [
-            (lid, self.act_net.by_id[lid].kind)
-            for lid, parents in preds.items()
-            if parents and len(parents) > 1
-        ]
-        if dag_layers:
-            preview = dag_layers[:5]
-            suffix = "..." if len(dag_layers) > 5 else ""
-            raise NotImplementedError(
-                f"ACTToTorch currently supports chain networks only. "
-                f"Found {len(dag_layers)} multi-predecessor layer(s): "
-                f"{preview}{suffix}. DAG support is deferred — this is "
-                f"intentional fail-loud to prevent silent unsoundness."
-            )

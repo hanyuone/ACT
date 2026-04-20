@@ -312,10 +312,10 @@ and run verification with **no external inputs or specs** passed at runtime.
 
 ## ✅ Wrapper Contract
 
-Your wrapped model is an `nn.Sequential` that includes:
+Your wrapped model is an `nn.Module` with **four named children**:
 
 ```
-InputLayer → InputSpecLayer → [optional Flatten] → Model → OutputSpecLayer
+input_layer (InputLayer) → input_spec (InputSpecLayer) → model (any nn.Module) → output_spec (OutputSpecLayer)
 ```
 
 - `InputLayer(shape=(1,...), center=?)` — declares the input variable block (symbolic).
@@ -376,7 +376,7 @@ class Net:
     def assert_last_is_validation(self): ...
 
 class TorchToACT:
-    def __init__(self, wrapped: nn.Sequential): ...
+    def __init__(self, wrapped: nn.Module): ...
     def run(self) -> Net: ...
 ```
 

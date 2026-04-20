@@ -132,6 +132,7 @@ class LayerKind(str, enum.Enum):
     POWER = "POWER"
     MIN = "MIN"
     MAX = "MAX"
+    MEAN = "MEAN"  # Reduction: y = x.mean(dim=..., keepdim=...)
     SCALE = "SCALE"  # Element-wise multiplication by constant: y = a * x
     BIAS = "BIAS"  # Element-wise addition of constant: y = x + c
 
@@ -508,6 +509,15 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     LayerKind.MAX.value: {
         "params_required": [],
         "params_optional": ["broadcast", "axis", "x_vars", "y_vars", "y_vars_list"],
+    },
+    LayerKind.MEAN.value: {
+        "params_required": [],
+        "params_optional": [
+            "dim",
+            "keepdim",
+            "input_shape",
+            "output_shape",
+        ],
     },
     LayerKind.SCALE.value: {
         "params_required": ["a"],
