@@ -944,7 +944,12 @@ from act.front_end.verifiable_model import VerifiableModel
 
 # Enable globally (affects all instances)
 VerifiableModel.set_strict_mode(True)
-model = VerifiableModel(*layers)
+model = VerifiableModel(
+    input_layer=input_layer,
+    input_spec=input_spec,
+    model=inner_model,
+    output_spec=output_spec,
+)
 
 try:
     result = model(input)  # Raises ValueError on violation

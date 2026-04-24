@@ -166,12 +166,13 @@ def _test_single_dataset_model(
                     in_features = model.fc.in_features
                     model.fc = torch.nn.Linear(in_features, num_classes)
                 elif hasattr(model, 'classifier'):
-                    if isinstance(model.classifier, torch.nn.Sequential):
-                        in_features = model.classifier[-1].in_features
-                        model.classifier[-1] = torch.nn.Linear(in_features, num_classes)
+                    classifier = model.classifier
+                    named_kids = list(classifier.named_children())
+                    if named_kids:
+                        last_name, last_child = named_kids[-1]
+                        setattr(classifier, last_name, torch.nn.Linear(last_child.in_features, num_classes))
                     else:
-                        in_features = model.classifier.in_features
-                        model.classifier = torch.nn.Linear(in_features, num_classes)
+                        model.classifier = torch.nn.Linear(classifier.in_features, num_classes)
                 elif hasattr(model, 'heads') and hasattr(model.heads, 'head'):
                     in_features = model.heads.head.in_features
                     model.heads.head = torch.nn.Linear(in_features, num_classes)

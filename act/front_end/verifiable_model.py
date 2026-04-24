@@ -30,12 +30,28 @@
 #
 # Batched Workflow:
 #   # 1. Build model with batched specs (N=3 samples)
+#   class TinyMLP(nn.Module):
+#       def __init__(self):
+#           super().__init__()
+#           self.flatten = nn.Flatten(start_dim=1)
+#           self.fc = nn.Linear(784, 10)
+#       def forward(self, x):
+#           return self.fc(self.flatten(x))
+#
+#   labeled_input = LabeledInputTensor(
+#       tensor=torch.zeros(3, 1, 28, 28), label=torch.tensor([5, 3, 7])
+#   )
 #   model = VerifiableModel(
-#       InputLayer(labeled_input, shape=(3, 1, 28, 28), dtype=torch.float32),
-#       InputSpecLayer(InputSpec(kind=InKind.BOX, lb=(3,1,28,28), ub=(3,1,28,28))),
-#       nn.Flatten(start_dim=1),
-#       nn.Linear(784, 10),
-#       OutputSpecLayer(OutputSpec(kind=OutKind.TOP1_ROBUST, y_true=[5,3,7]))
+#       input_layer=InputLayer(labeled_input, shape=(3, 1, 28, 28), dtype=torch.float32),
+#       input_spec=InputSpecLayer(InputSpec(
+#           kind=InKind.BOX,
+#           lb=torch.zeros(3, 1, 28, 28),
+#           ub=torch.ones(3, 1, 28, 28),
+#       )),
+#       model=TinyMLP(),
+#       output_spec=OutputSpecLayer(OutputSpec(
+#           kind=OutKind.TOP1_ROBUST, y_true=torch.tensor([5, 3, 7])
+#       )),
 #   )
 #
 #   # 2. Run: 3 samples verified in one forward pass
@@ -72,7 +88,7 @@ def prod(seq: Tuple[int, ...]) -> int:
     return p
 
 
-class VerifiableModel(nn.Sequential):
+class VerifiableModel(nn.Module):
     """
     verification wrapper for PyTorch models.
     
@@ -81,13 +97,17 @@ class VerifiableModel(nn.Sequential):
     
     Batched Architecture:
         Input: (N, C, H, W) or (N, features)
+        → InputLayer: declares symbolic input block (pass-through at inference)
         → InputSpecLayer: checks each sample's input constraints
-        → Model layers: processes entire batch
+        → model: inner network (any nn.Module — Sequential, ResNet, Transformer, ...)
         → OutputSpecLayer: checks each sample's output properties
         Output: Aggregated bool (all samples satisfied)
     
-    Args:
-        *args: Layers (InputLayer, InputSpecLayer, model, OutputSpecLayer)
+    Args (keyword-only):
+        input_layer: InputLayer declaring the symbolic input block.
+        input_spec: InputSpecLayer carrying input constraints (BOX/LINF_BALL/LIN_POLY).
+        model: inner nn.Module. Can be any graph (Sequential, DAG, skip-connection net).
+        output_spec: OutputSpecLayer carrying output property (TOP1/MARGIN/LINEAR_LE/RANGE).
     
     Returns:
         Dict with:
@@ -100,8 +120,12 @@ class VerifiableModel(nn.Sequential):
     # Class-level strict mode setting (shared across all instances)
     _strict_mode: bool = False
     
-    def __init__(self, *args):
-        super().__init__(*args)
+    def __init__(self, *, input_layer, input_spec, model, output_spec):
+        super().__init__()
+        self.input_layer = input_layer
+        self.input_spec = input_spec
+        self.model = model
+        self.output_spec = output_spec
     
     @classmethod
     def set_strict_mode(cls, enabled: bool) -> None:
@@ -115,37 +139,26 @@ class VerifiableModel(nn.Sequential):
         return cls._strict_mode
     
     def forward(self, x):
-        """
-        Forward pass with automatic constraint checking.
-        
-        Intercepts tuple returns from InputSpecLayer/OutputSpecLayer
-        and collects verification results.
-        """
         input_satisfied = True
         input_explanation = "No INPUT_SPEC layer"
         output_satisfied = True
         output_explanation = "No OUTPUT_SPEC layer"
-        
-        # Process through all layers
-        for i, module in enumerate(self):
-            result = module(x)
-            
-            # Check if layer returned constraint checking tuple
-            if isinstance(result, tuple) and len(result) == 3:
-                x, satisfied, explanation = result
-                
-                # Identify if this is input or output spec layer
-                # Input spec layers typically appear early (first few layers)
-                # Output spec layers typically appear at the end
-                if i < len(self) // 2:  # First half = likely INPUT_SPEC
-                    input_satisfied = satisfied
-                    input_explanation = explanation
-                else:  # Second half = likely OUTPUT_SPEC
-                    output_satisfied = satisfied
-                    output_explanation = explanation
-            else:
-                # Regular layer, just pass through
-                x = result
+
+        x = self.input_layer(x)
+
+        result = self.input_spec(x)
+        if isinstance(result, tuple) and len(result) == 3:
+            x, input_satisfied, input_explanation = result
+        else:
+            x = result
+
+        x = self.model(x)
+
+        result = self.output_spec(x)
+        if isinstance(result, tuple) and len(result) == 3:
+            x, output_satisfied, output_explanation = result
+        else:
+            x = result
         
         # Convert tensor satisfied to bool for dict output (backward compatible)
         # Spec layers now always return tensor, convert here

@@ -202,18 +202,15 @@ def _build_batched_model(
     # Merge into batched specs
     batched_lt, batched_in, batched_out = _merge_specs_to_batch(lts, in_specs, out_specs, in_kind, out_kind)
     
-    # Build layer stack
-    layers: List[nn.Module] = [
-        InputLayer(batched_lt, batched_lt.tensor.shape, batched_lt.tensor.dtype,
-                  layout=infer_layout_from_tensor(batched_lt.tensor), dataset_name=data_src),
-        InputSpecLayer(spec=batched_in),
-    ]
-    
-    # Add model and output spec layer
-    layers.extend([pytorch_model, OutputSpecLayer(spec=batched_out)])
-    
-    # Create VerifiableModel and move to correct device
-    vm = VerifiableModel(*layers)
+    vm = VerifiableModel(
+        input_layer=InputLayer(
+            batched_lt, batched_lt.tensor.shape, batched_lt.tensor.dtype,
+            layout=infer_layout_from_tensor(batched_lt.tensor), dataset_name=data_src,
+        ),
+        input_spec=InputSpecLayer(spec=batched_in),
+        model=pytorch_model,
+        output_spec=OutputSpecLayer(spec=batched_out),
+    )
     # Parameterless ONNX-converted models (e.g. some VNN-COMP graphs that inline
     # constants) have an empty .parameters() iterator — fall back to CPU.
     try:
@@ -306,7 +303,7 @@ def synthesize_models_from_specs(
     # -------------------------------------------------------------------------
     # Summary: Print statistics and return results
     # -------------------------------------------------------------------------
-    total_specs = sum(vm[0].input_tensor.shape[0] for vm in synthesis_models.values())
+    total_specs = sum(vm.input_layer.input_tensor.shape[0] for vm in synthesis_models.values())
     
     print(f"\n🎉 Synthesis Complete:")
     print(f"   Total specs: {total_specs}")
