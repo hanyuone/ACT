@@ -1,4 +1,4 @@
-#===- act/front_end/vnnlib/vnnlib_parser.py - VNNLIB Parser ----------====#
+#===- act/front_end/vnnlib_loader/vnnlib_parser.py - VNNLIB Parser ----====#
 # ACT: Abstract Constraint Transformer
 # Copyright (C) 2025– ACT Team
 #
@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, TYPE_CHECKING
+from typing import Dict, List, Tuple, Optional, Any, TYPE_CHECKING
 import logging
 import torch
 import re
@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 class VNNLibParseError(Exception):
     """Exception raised when VNNLIB parsing fails."""
     pass
+
+
+# -------------------------------------------------------------------------
+# Public API
+# -------------------------------------------------------------------------
 
 
 def parse_vnnlib_to_tensors(
@@ -65,9 +70,21 @@ def parse_vnnlib_to_tensors(
         # Extract variable declarations to determine shapes
         num_inputs = _extract_num_inputs(content)
         num_outputs = _extract_num_outputs(content)
-        
-        # Extract input bounds (X_i constraints)
-        input_bounds = _extract_input_bounds(content, num_inputs)
+
+        # Extract input bounds from top-level simple X-bound asserts only.
+        # Constraints inside (or ...) branches must not be intersected here —
+        # that would produce empty boxes for disjunctive-input properties
+        # (e.g. ACAS Xu prop_5..10).
+        try:
+            forms = _parse_all_forms(content)
+            simple_bodies = [
+                f[1] for f in forms
+                if isinstance(f, list) and len(f) >= 2 and f[0] == "assert"
+                and _is_simple_x_bound(f[1])
+            ]
+        except Exception:
+            simple_bodies = []
+        input_bounds = _extract_input_bounds(simple_bodies, num_inputs)
         
         # Create input tensor from bounds center
         input_values = []
@@ -117,247 +134,110 @@ def parse_vnnlib_to_tensors(
         raise VNNLibParseError(f"Failed to parse {vnnlib_path}: {str(e)}")
 
 
-def parse_vnnlib_to_specs(
+def parse_vnnlib_queries(
     vnnlib_path: Path,
     labeled_tensor: Optional['LabeledInputTensor'] = None
-) -> Tuple[InputSpec, OutputSpec]:
+) -> List[Tuple[InputSpec, OutputSpec]]:
     """
-    Parse VNNLIB file to create InputSpec and OutputSpec objects.
-    
-    Args:
-        vnnlib_path: Path to .vnnlib file
-        labeled_tensor: LabeledInputTensor containing input tensor and ground truth label.
-                       If provided, tensor.shape is used for reshaping bounds and
-                       label is used to promote RANGE to TOP1_ROBUST for classification.
-        
-    Returns:
-        Tuple of (InputSpec, OutputSpec)
-        
+    Parse a VNNLIB file into a list of verification queries.
+
+    Semantics:
+      - Multiple top-level ``(assert ...)`` forms are conjunctive (implicit AND).
+      - ``(or ...)`` inside an assert expands to multiple queries
+        (Cartesian product across all asserts).
+      - Inequalities involving only X are folded into the input BOX.
+      - Inequalities involving Y become rows of an UNSAFE_LINEAR OutputSpec.
+      - When ``labeled_tensor.label`` is provided and queries match the
+        classification pattern (Y_j - Y_true <= 0 for all j != true), the
+        result collapses to a single TOP1_ROBUST OutputSpec.
+
     Raises:
-        VNNLibParseError: If parsing fails
+        VNNLibParseError: If the file is missing or unparseable.
     """
+    if not vnnlib_path.exists():
+        raise VNNLibParseError(f"VNNLIB file not found: {vnnlib_path}")
     try:
         with open(vnnlib_path, 'r') as f:
             content = f.read()
-        
-        num_inputs = _extract_num_inputs(content)
-        num_outputs = _extract_num_outputs(content)
-        input_bounds = _extract_input_bounds(content, num_inputs)
-        
-        # Create InputSpec (BOX constraints)
-        lb_values = []
-        ub_values = []
-        for i in range(num_inputs):
-            if i in input_bounds:
-                lb, ub = input_bounds[i]
-            else:
-                lb, ub = float('-inf'), float('inf')
-            lb_values.append(lb)
-            ub_values.append(ub)
-        
-        lb_tensor = torch.tensor(lb_values)
-        ub_tensor = torch.tensor(ub_values)
-        
-        # Extract input_shape and true_label from labeled_tensor if provided
-        input_shape = labeled_tensor.tensor.shape if labeled_tensor is not None else None
-        true_label = labeled_tensor.label if labeled_tensor is not None else None
-        
-        if input_shape is not None:
-            # Reshape bounds to match input shape (which now includes batch dimension)
-            lb_tensor = lb_tensor.view(*input_shape)
-            ub_tensor = ub_tensor.view(*input_shape)
-        
-        input_spec = InputSpec(
-            kind=InKind.BOX,
-            lb=lb_tensor,
-            ub=ub_tensor
-        )
-        
-        # Create OutputSpec (LINEAR_LE constraints)
-        output_constraints = _extract_output_constraints(content, num_outputs)
-        
-        if output_constraints:
-            # Use first constraint as representative
-            c, d = output_constraints[0]
-            output_spec = OutputSpec(
-                kind=OutKind.LINEAR_LE,
-                c=torch.tensor(c),
-                d=torch.tensor(float(d)),
-            )
-        else:
-            # If true_label is provided, promote to TOP1_ROBUST
-            # for classification robustness properties. Otherwise, use RANGE.
-            if true_label is not None:
-                # true_label is already a tensor with correct device from labeled_tensor
-                output_spec = OutputSpec(
-                    kind=OutKind.TOP1_ROBUST,
-                    y_true=true_label.clone() if isinstance(true_label, torch.Tensor) else torch.tensor([int(true_label)], dtype=torch.int64),
-                )
-            else:
-                output_spec = OutputSpec(
-                    kind=OutKind.RANGE,
-                    lb=torch.tensor([float('-inf')] * num_outputs),
-                    ub=torch.tensor([float('inf')] * num_outputs)
-                )
-        
-        logger.info(f"Created specs from VNNLIB: {input_spec.kind}, {output_spec.kind}")
-        
-        return input_spec, output_spec
-        
     except Exception as e:
-        raise VNNLibParseError(f"Failed to create specs from {vnnlib_path}: {str(e)}")
+        raise VNNLibParseError(f"Failed to read {vnnlib_path}: {e}") from e
 
+    num_inputs = _extract_num_inputs(content)
+    num_outputs = _extract_num_outputs(content)
+    input_shape = labeled_tensor.tensor.shape if labeled_tensor is not None else None
+    true_label = labeled_tensor.label if labeled_tensor is not None else None
 
-def _extract_num_inputs(content: str) -> int:
-    """
-    Extract number of input variables from VNNLIB content.
-    
-    Looks for patterns like:
-    - (declare-const X_0 Real)
-    - (declare-const X_1 Real)
-    """
-    x_vars = set()
-    # Match X_<number>
-    pattern = r'X_(\d+)'
-    matches = re.findall(pattern, content)
-    for match in matches:
-        x_vars.add(int(match))
-    
-    if not x_vars:
-        raise VNNLibParseError("No input variables (X_i) found")
-    
-    # Number of inputs is max index + 1 (assuming 0-indexed)
-    return max(x_vars) + 1
+    # Pre-filter: simple single-variable X-bound asserts (the overwhelming majority
+    # in CIFAR-100-style files) are absorbed via the fast regex _extract_input_bounds
+    # and need NOT enter the Cartesian product. Only complex asserts (multi-variable,
+    # Y-involving, or (or/and) composition) are routed through the S-expr pipeline.
+    try:
+        forms = _parse_all_forms(content)
+    except VNNLibParseError:
+        raise
+    except Exception as e:
+        raise VNNLibParseError(f"S-expression parse failed: {e}") from e
+    asserts = [f for f in forms if isinstance(f, list) and len(f) >= 2 and f[0] == "assert"]
+    simple_assert_bodies = [f[1] for f in asserts if _is_simple_x_bound(f[1])]
+    complex_assert_bodies = [f[1] for f in asserts if not _is_simple_x_bound(f[1])]
 
+    # Base BOX uses top-level simple asserts only; X-bounds inside (or ...)
+    # must not be intersected or ACAS Xu prop_5..10 collapse to empty boxes.
+    bounds_dict = _extract_input_bounds(simple_assert_bodies, num_inputs)
+    base_in_spec = _build_input_spec(num_inputs, input_shape, bounds_dict, [])
 
-def _extract_num_outputs(content: str) -> int:
-    """
-    Extract number of output variables from VNNLIB content.
-    
-    Looks for patterns like:
-    - (declare-const Y_0 Real)
-    - (declare-const Y_1 Real)
-    """
-    y_vars = set()
-    # Match Y_<number>
-    pattern = r'Y_(\d+)'
-    matches = re.findall(pattern, content)
-    for match in matches:
-        y_vars.add(int(match))
-    
-    if not y_vars:
-        logger.warning("No output variables (Y_i) found in VNNLIB")
-        return 0
-    
-    return max(y_vars) + 1
+    if not complex_assert_bodies:
+        out_spec = _build_output_spec([], num_outputs, true_label)
+        logger.info(f"Parsed {vnnlib_path.name}: 1 query(ies) [input-only]")
+        return [(base_in_spec, out_spec)]
 
+    # S-expr parse only the complex asserts
+    per_assert: List[List[_Query]] = []
+    for body in complex_assert_bodies:
+        qs = _process_body(body, num_inputs, num_outputs)
+        if qs is None:
+            logger.debug(f"Skipping unparseable assert: {body}")
+            continue
+        per_assert.append(qs)
 
-def _extract_input_bounds(content: str, num_inputs: int) -> Dict[int, Tuple[float, float]]:
-    """
-    Extract lower and upper bounds for each input variable.
-    
-    Parses constraints like:
-    - (assert (>= X_0 0.5))  -> lower bound
-    - (assert (<= X_0 1.5))  -> upper bound
-    
-    Returns:
-        Dict mapping input index to (lower_bound, upper_bound)
-    """
-    bounds = {}
-    
-    # Initialize with infinity bounds
-    for i in range(num_inputs):
-        bounds[i] = [float('-inf'), float('inf')]
-    
-    # Match lower bounds: (>= X_i value) or (>= value X_i)
-    # Pattern 1: (>= X_i value) - groups[0]=idx, groups[1]=value
-    # Pattern 2: (>= value X_i) - groups[0]=value, groups[1]=idx
-    lb_pattern_1 = r'\(>=\s+X_(\d+)\s+([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\)'
-    lb_pattern_2 = r'\(>=\s+([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s+X_(\d+)\)'
-    
-    # Pattern 1: X_i comes first
-    for match in re.finditer(lb_pattern_1, content):
-        idx = int(match.group(1))  # Index
-        lb = float(match.group(2))  # Value
-        if idx < num_inputs:
-            bounds[idx][0] = max(bounds[idx][0], lb)
-    
-    # Pattern 2: Value comes first
-    for match in re.finditer(lb_pattern_2, content):
-        lb = float(match.group(1))  # Value
-        idx = int(match.group(2))  # Index
-        if idx < num_inputs:
-            bounds[idx][0] = max(bounds[idx][0], lb)
-    
-    # Match upper bounds: (<= X_i value) or (<= value X_i)
-    # Pattern 1: (<= X_i value) - groups[0]=idx, groups[1]=value
-    # Pattern 2: (<= value X_i) - groups[0]=value, groups[1]=idx
-    ub_pattern_1 = r'\(<=\s+X_(\d+)\s+([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\)'
-    ub_pattern_2 = r'\(<=\s+([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s+X_(\d+)\)'
-    
-    # Pattern 1: X_i comes first
-    for match in re.finditer(ub_pattern_1, content):
-        idx = int(match.group(1))  # Index
-        ub = float(match.group(2))  # Value
-        if idx < num_inputs:
-            bounds[idx][1] = min(bounds[idx][1], ub)
-    
-    # Pattern 2: Value comes first
-    for match in re.finditer(ub_pattern_2, content):
-        ub = float(match.group(1))  # Value
-        idx = int(match.group(2))  # Index
-        if idx < num_inputs:
-            bounds[idx][1] = min(bounds[idx][1], ub)
-    
-    # Convert to tuples and filter infinite bounds
-    result = {}
-    for i, (lb, ub) in bounds.items():
-        if lb != float('-inf') or ub != float('inf'):
-            result[i] = (lb, ub)
-    
-    return result
+    if not per_assert:
+        logger.warning(f"No parseable complex assertions in {vnnlib_path}; using input-only spec.")
+        out_spec = _build_output_spec([], num_outputs, true_label)
+        return [(base_in_spec, out_spec)]
 
+    complex_queries = _combine_conjunctive_queries(per_assert)
 
-def _extract_output_constraints(content: str, num_outputs: int) -> List[Tuple[List[float], float]]:
-    """
-    Extract output constraints (linear combinations of Y_i).
-    
-    Returns list of (coefficients, bias) tuples representing c^T * y <= d.
-    """
-    constraints = []
-    
-    # This is a simplified parser for common patterns
-    # Full VNNLIB can have complex nested assertions
-    
-    # Match patterns like: (<= (+ (* a0 Y_0) (* a1 Y_1) ...) d)
-    # This would require more sophisticated parsing for general VNNLIB
-    
-    # For now, return empty list (would need full SMT-LIB parser for complete support)
-    logger.debug("Output constraint extraction not fully implemented (requires full SMT-LIB parser)")
-    
-    return constraints
+    results: List[Tuple[InputSpec, OutputSpec]] = []
+    for q in complex_queries:
+        x_ineqs: _Query = []
+        y_ineqs: _Query = []
+        skip = False
+        for xc, yc, d in q:
+            if any(v != 0 for v in yc):
+                y_ineqs.append((xc, yc, d))
+            elif any(v != 0 for v in xc):
+                x_ineqs.append((xc, yc, d))
+            elif d < 0:
+                logger.debug(f"Infeasible constant constraint: 0 <= {d}")
+                skip = True
+                break
+        if skip:
+            continue
+        # Share the base InputSpec instance unless this query tightens X further
+        if x_ineqs:
+            in_spec = _build_input_spec(num_inputs, input_shape, bounds_dict, x_ineqs)
+        else:
+            in_spec = base_in_spec
+        out_spec = _build_output_spec(y_ineqs, num_outputs, true_label)
+        results.append((in_spec, out_spec))
 
+    if true_label is not None:
+        promoted = _try_promote_to_top1(results, num_outputs, true_label)
+        if promoted is not None:
+            results = [promoted]
 
-def _infer_property_type(content: str, num_outputs: int) -> str:
-    """
-    Infer the property type from VNNLIB content.
-    
-    Returns:
-        One of: 'classification', 'safety', 'unknown'
-    """
-    content_lower = content.lower()
-    
-    # Classification properties often involve comparisons between outputs
-    if 'y_' in content_lower and num_outputs > 1:
-        # Check for patterns like Y_i - Y_j > 0 (classification margin)
-        if re.search(r'y_\d+\s*[-]\s*y_\d+', content_lower):
-            return 'classification'
-    
-    # Safety properties typically have output range constraints
-    if num_outputs == 1 or 'range' in content_lower:
-        return 'safety'
-    
-    return 'unknown'
+    logger.info(f"Parsed {vnnlib_path.name}: {len(results)} query(ies)")
+    return results
 
 
 def validate_vnnlib_file(vnnlib_path: Path) -> bool:
@@ -436,3 +316,485 @@ def extract_label_from_vnnlib(vnnlib_path: Path) -> Optional[int]:
     except Exception as e:
         logger.debug(f"Failed to extract label from {vnnlib_path}: {e}")
         return None
+
+
+# -------------------------------------------------------------------------
+# Module-level regex patterns and type aliases
+# -------------------------------------------------------------------------
+
+
+_X_RE = re.compile(r"X_(\d+)")
+_Y_RE = re.compile(r"Y_(\d+)")
+_Ineq = Tuple[List[float], List[float], float]
+_Query = List[_Ineq]
+
+
+# -------------------------------------------------------------------------
+# Legacy regex extractors (used by parse_vnnlib_to_tensors; not part of Steps 1-5)
+# -------------------------------------------------------------------------
+
+
+def _extract_num_inputs(content: str) -> int:
+    """
+    Extract number of input variables from VNNLIB content.
+    
+    Looks for patterns like:
+    - (declare-const X_0 Real)
+    - (declare-const X_1 Real)
+    """
+    x_vars = {int(m) for m in _X_RE.findall(content)}
+    if not x_vars:
+        raise VNNLibParseError("No input variables (X_i) found")
+    # Number of inputs is max index + 1 (assuming 0-indexed)
+    return max(x_vars) + 1
+
+
+def _extract_num_outputs(content: str) -> int:
+    """
+    Extract number of output variables from VNNLIB content.
+    
+    Looks for patterns like:
+    - (declare-const Y_0 Real)
+    - (declare-const Y_1 Real)
+    """
+    y_vars = {int(m) for m in _Y_RE.findall(content)}
+    if not y_vars:
+        logger.warning("No output variables (Y_i) found in VNNLIB")
+        return 0
+    return max(y_vars) + 1
+
+
+def _extract_input_bounds(
+    simple_bodies: List[Any],
+    num_inputs: int,
+) -> Dict[int, Tuple[float, float]]:
+    """Extract per-variable [lb, ub] from top-level simple X-bound asserts.
+
+    ``simple_bodies`` is the list of assertion bodies that already passed
+    ``_is_simple_x_bound``. Constraints inside ``(or ...)`` branches must be
+    excluded by the caller — intersecting them here would produce empty boxes
+    for disjunctive-input properties (ACAS Xu prop_5..10).
+    """
+    bounds = {i: [float('-inf'), float('inf')] for i in range(num_inputs)}
+    for body in simple_bodies:
+        if not (isinstance(body, list) and len(body) == 3):
+            continue
+        op, left, right = body
+        if op not in ("<=", ">="):
+            continue
+        x_is_left = isinstance(left, str) and bool(_X_RE.fullmatch(left))
+        x_is_right = isinstance(right, str) and bool(_X_RE.fullmatch(right))
+        if x_is_left == x_is_right:
+            continue
+        x_tok = left if x_is_left else right
+        lit_tok = right if x_is_left else left
+        try:
+            val = float(lit_tok)
+        except (TypeError, ValueError):
+            continue
+        idx = int(_X_RE.fullmatch(x_tok).group(1))
+        if idx >= num_inputs:
+            continue
+        # (<= X val)  -> X <= val   (upper)
+        # (>= X val)  -> X >= val   (lower)
+        # (<= val X)  -> val <= X   -> X >= val (lower)
+        # (>= val X)  -> val >= X   -> X <= val (upper)
+        tighten_upper = (op == "<=" and x_is_left) or (op == ">=" and not x_is_left)
+        if tighten_upper:
+            bounds[idx][1] = min(bounds[idx][1], val)
+        else:
+            bounds[idx][0] = max(bounds[idx][0], val)
+    return {
+        i: (lb, ub)
+        for i, (lb, ub) in bounds.items()
+        if lb != float('-inf') or ub != float('inf')
+    }
+
+
+def _infer_property_type(content: str, num_outputs: int) -> str:
+    """
+    Infer the property type from VNNLIB content.
+    
+    Returns:
+        One of: 'classification', 'safety', 'unknown'
+    """
+    content_lower = content.lower()
+    
+    # Classification properties often involve comparisons between outputs
+    if 'y_' in content_lower and num_outputs > 1:
+        # Check for patterns like Y_i - Y_j > 0 (classification margin)
+        if re.search(r'y_\d+\s*[-]\s*y_\d+', content_lower):
+            return 'classification'
+    
+    # Safety properties typically have output range constraints
+    if num_outputs == 1 or 'range' in content_lower:
+        return 'safety'
+    
+    return 'unknown'
+
+
+# -------------------------------------------------------------------------
+# Helper: label coercion
+# -------------------------------------------------------------------------
+
+
+def _coerce_label_to_tensor(true_label: Any) -> torch.Tensor:
+    """Coerce int/tensor label to 1-D int64 tensor (defensive)."""
+    if isinstance(true_label, torch.Tensor):
+        return true_label.clone()
+    return torch.tensor([int(true_label)], dtype=torch.int64)
+
+
+# -------------------------------------------------------------------------
+# Step 1: S-expression tokenization and AST parsing
+# -------------------------------------------------------------------------
+
+
+def _tokenize_sexpr(text: str) -> List[str]:
+    lines = []
+    for raw in text.split("\n"):
+        idx = raw.find(";")
+        if idx >= 0:
+            raw = raw[:idx]
+        lines.append(raw)
+    text = " ".join(lines)
+    text = text.replace("(", " ( ").replace(")", " ) ")
+    return [str(tok) for tok in text.split()]
+
+
+def _parse_sexpr(tokens: List[str], pos: int) -> Tuple[Any, int]:
+    if pos >= len(tokens):
+        raise VNNLibParseError("Unexpected EOF in S-expression")
+    tok = tokens[pos]
+    if tok == "(":
+        result = []
+        pos += 1
+        while pos < len(tokens) and tokens[pos] != ")":
+            item, pos = _parse_sexpr(tokens, pos)
+            result.append(item)
+        if pos >= len(tokens):
+            raise VNNLibParseError("Unbalanced '('")
+        return result, pos + 1
+    if tok == ")":
+        raise VNNLibParseError(f"Unexpected ')' at pos {pos}")
+    return tok, pos + 1
+
+
+def _parse_all_forms(text: str) -> List[Any]:
+    tokens = _tokenize_sexpr(text)
+    out = []
+    pos = 0
+    while pos < len(tokens):
+        form, pos = _parse_sexpr(tokens, pos)
+        out.append(form)
+    return out
+
+
+# -------------------------------------------------------------------------
+# Step 2: Linear algebra on S-expressions
+# -------------------------------------------------------------------------
+
+
+def _parse_linear_atom(expr: Any, num_inputs: int, num_outputs: int) -> Optional[_Ineq]:
+    if not isinstance(expr, str):
+        return None
+    xm = _X_RE.fullmatch(expr)
+    if xm:
+        idx = int(xm.group(1))
+        if idx >= num_inputs:
+            return None
+        xc = [0.0] * num_inputs
+        xc[idx] = 1.0
+        return xc, [0.0] * num_outputs, 0.0
+    ym = _Y_RE.fullmatch(expr)
+    if ym:
+        idx = int(ym.group(1))
+        if idx >= num_outputs:
+            return None
+        yc = [0.0] * num_outputs
+        yc[idx] = 1.0
+        return [0.0] * num_inputs, yc, 0.0
+    try:
+        return [0.0] * num_inputs, [0.0] * num_outputs, float(expr)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_linear_expr(expr: Any, num_inputs: int, num_outputs: int) -> Optional[_Ineq]:
+    atom = _parse_linear_atom(expr, num_inputs, num_outputs)
+    if atom is not None:
+        return atom
+    if not isinstance(expr, list) or not expr:
+        return None
+    op = expr[0]
+    if op == "+":
+        xc = [0.0] * num_inputs
+        yc = [0.0] * num_outputs
+        const = 0.0
+        for sub in expr[1:]:
+            r = _parse_linear_expr(sub, num_inputs, num_outputs)
+            if r is None:
+                return None
+            sxc, syc, sd = r
+            xc = [a + b for a, b in zip(xc, sxc)]
+            yc = [a + b for a, b in zip(yc, syc)]
+            const += sd
+        return xc, yc, const
+    if op == "-":
+        if len(expr) == 2:
+            r = _parse_linear_expr(expr[1], num_inputs, num_outputs)
+            if r is None:
+                return None
+            sxc, syc, sd = r
+            return [-a for a in sxc], [-a for a in syc], -sd
+        if len(expr) == 3:
+            a = _parse_linear_expr(expr[1], num_inputs, num_outputs)
+            b = _parse_linear_expr(expr[2], num_inputs, num_outputs)
+            if a is None or b is None:
+                return None
+            axc, ayc, ad = a
+            bxc, byc, bd = b
+            return (
+                [x - y for x, y in zip(axc, bxc)],
+                [x - y for x, y in zip(ayc, byc)],
+                ad - bd,
+            )
+    if op == "*" and len(expr) == 3:
+        a = _parse_linear_expr(expr[1], num_inputs, num_outputs)
+        b = _parse_linear_expr(expr[2], num_inputs, num_outputs)
+        if a is None or b is None:
+            return None
+        axc, ayc, ad = a
+        bxc, byc, bd = b
+        a_is_const = all(v == 0 for v in axc) and all(v == 0 for v in ayc)
+        b_is_const = all(v == 0 for v in bxc) and all(v == 0 for v in byc)
+        if a_is_const:
+            return [ad * v for v in bxc], [ad * v for v in byc], ad * bd
+        if b_is_const:
+            return [bd * v for v in axc], [bd * v for v in ayc], ad * bd
+    return None
+
+
+def _parse_inequality(op: str, lhs: Any, rhs: Any, num_inputs: int, num_outputs: int) -> Optional[_Ineq]:
+    l = _parse_linear_expr(lhs, num_inputs, num_outputs)
+    r = _parse_linear_expr(rhs, num_inputs, num_outputs)
+    if l is None or r is None:
+        return None
+    lxc, lyc, ld = l
+    rxc, ryc, rd = r
+    xc = [a - b for a, b in zip(lxc, rxc)]
+    yc = [a - b for a, b in zip(lyc, ryc)]
+    d = rd - ld
+    if op == "<=":
+        return xc, yc, d
+    if op == ">=":
+        return [-v for v in xc], [-v for v in yc], -d
+    return None
+
+
+# -------------------------------------------------------------------------
+# Step 3: AND/OR composition and query assembly
+# -------------------------------------------------------------------------
+
+
+def _is_simple_x_bound(body: Any) -> bool:
+    """Fast check: is body a simple single-variable X bound (op X_i val) / (op val X_i)?
+
+    These asserts are fully handled by the regex-based :func:`_extract_input_bounds`
+    and do NOT need S-expression processing; skipping them avoids quadratic blow-up
+    from the Cartesian product when many X-bound asserts coexist with a large
+    disjunctive output (common in CIFAR-100-style classification files).
+    """
+    if not (isinstance(body, list) and len(body) == 3):
+        return False
+    op = body[0]
+    if op not in ("<=", ">="):
+        return False
+    left, right = body[1], body[2]
+    if not (isinstance(left, str) and isinstance(right, str)):
+        return False
+    left_is_x = bool(_X_RE.fullmatch(left))
+    right_is_x = bool(_X_RE.fullmatch(right))
+    if left_is_x == right_is_x:
+        return False
+    other = right if left_is_x else left
+    try:
+        float(other)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _process_body(body: Any, num_inputs: int, num_outputs: int) -> Optional[List[_Query]]:
+    if not (isinstance(body, list) and body):
+        return None
+    op = body[0]
+    if op == "and":
+        subs = [_process_body(c, num_inputs, num_outputs) for c in body[1:]]
+        subs = [s for s in subs if s is not None]
+        if not subs:
+            return [[]]
+        combined = [[]]
+        for sq in subs:
+            new_combined = []
+            for base in combined:
+                for q in sq:
+                    new_combined.append(base + q)
+            combined = new_combined
+        return combined
+    if op == "or":
+        all_q = []
+        for d in body[1:]:
+            sub = _process_body(d, num_inputs, num_outputs)
+            if sub is None:
+                continue
+            all_q.extend(sub)
+        return all_q if all_q else None
+    if op in ("<=", ">=") and len(body) == 3:
+        ineq = _parse_inequality(op, body[1], body[2], num_inputs, num_outputs)
+        if ineq is None:
+            return None
+        return [[ineq]]
+    return None
+
+
+def _combine_conjunctive_queries(qs: List[List[_Query]]) -> List[_Query]:
+    combined = [[]]
+    for q_list in qs:
+        new_combined = []
+        for base in combined:
+            for q in q_list:
+                new_combined.append(base + q)
+        combined = new_combined
+    return combined
+
+
+# -------------------------------------------------------------------------
+# Step 4 (+ Step 5 TOP1 promotion): Spec builders
+# -------------------------------------------------------------------------
+
+
+def _build_input_spec(
+    num_inputs: int,
+    input_shape: Optional[Tuple[int, ...]],
+    bounds_dict: Dict[int, Tuple[float, float]],
+    extra_x_ineqs: _Query,
+) -> InputSpec:
+    """Build an InputSpec BOX from regex-extracted base bounds + optional tightening.
+
+    ``bounds_dict`` is the output of :func:`_extract_input_bounds` — fast regex
+    per-variable (lb, ub) pairs. ``extra_x_ineqs`` is a (typically empty) list of
+    single-variable X inequalities from complex asserts (e.g. disjunctive X ranges)
+    that further refine the BOX for one particular query. Multi-variable X
+    constraints cannot be represented as a BOX and are silently ignored.
+    """
+    lb_vals = [bounds_dict.get(i, (float('-inf'), float('inf')))[0] for i in range(num_inputs)]
+    ub_vals = [bounds_dict.get(i, (float('-inf'), float('inf')))[1] for i in range(num_inputs)]
+    lb_tensor = torch.tensor(lb_vals)
+    ub_tensor = torch.tensor(ub_vals)
+    for xc, _yc, d in extra_x_ineqs:
+        nonzero = [(i, v) for i, v in enumerate(xc) if v != 0]
+        if len(nonzero) == 1:
+            idx, coef = nonzero[0]
+            bound = d / coef
+            if coef > 0 and bound < ub_tensor[idx].item():
+                ub_tensor[idx] = bound
+            elif coef < 0 and bound > lb_tensor[idx].item():
+                lb_tensor[idx] = bound
+    if input_shape is not None:
+        lb_tensor = lb_tensor.view(*input_shape)
+        ub_tensor = ub_tensor.view(*input_shape)
+    return InputSpec(kind=InKind.BOX, lb=lb_tensor, ub=ub_tensor)
+
+
+def _build_output_spec(
+    output_ineqs: _Query,
+    num_outputs: int,
+    true_label,
+) -> OutputSpec:
+    if not output_ineqs:
+        if true_label is not None:
+            y_true = _coerce_label_to_tensor(true_label)
+            return OutputSpec(kind=OutKind.TOP1_ROBUST, y_true=y_true)
+        return OutputSpec(
+            kind=OutKind.RANGE,
+            lb=torch.tensor([float('-inf')] * num_outputs),
+            ub=torch.tensor([float('inf')] * num_outputs),
+        )
+    rows_c = [list(yc) for _xc, yc, _d in output_ineqs]
+    rows_d = [float(d) for _xc, _yc, d in output_ineqs]
+    return OutputSpec(
+        kind=OutKind.UNSAFE_LINEAR,
+        c=torch.tensor(rows_c),
+        d=torch.tensor(rows_d),
+    )
+
+
+def _try_promote_to_top1(
+    queries: List[Tuple[InputSpec, OutputSpec]],
+    num_outputs: int,
+    true_label,
+) -> Optional[Tuple[InputSpec, OutputSpec]]:
+    """Collapse N UNSAFE_LINEAR queries into a single TOP1_ROBUST when possible.
+
+    Structural requirements:
+      - All queries share identical input BOX bounds.
+      - Every query has exactly ONE output inequality of the form
+        ``Y_other - Y_true <= 0`` (coefficients +1 / -1, RHS = 0).
+      - The set of ``other`` indices covers every class except ``true_label``.
+
+    Orientation (CRITICAL): VNNLIB uses BOTH ``(>= Y_j Y_true)`` and
+    ``(<= Y_true Y_j)``; after canonicalisation both yield the same <= form
+    but with opposite coefficient placement. Missing either orientation
+    regresses CIFAR-100 to ~99 queries/image. Both branches accepted below.
+    """
+    if not queries:
+        return None
+    t_idx = (int(true_label.item()) if isinstance(true_label, torch.Tensor)
+             else int(true_label))
+    first_in = queries[0][0]
+    if first_in.lb is None or first_in.ub is None:
+        return None
+    for in_spec, _ in queries[1:]:
+        if in_spec.lb is None or in_spec.ub is None:
+            return None
+        if not torch.equal(first_in.lb, in_spec.lb) or not torch.equal(first_in.ub, in_spec.ub):
+            return None
+    expected = {j for j in range(num_outputs) if j != t_idx}
+    covered = set()
+    for _, out_spec in queries:
+        if out_spec.kind != OutKind.UNSAFE_LINEAR:
+            return None
+        c_mat = out_spec.c
+        d_vec = out_spec.d
+        if c_mat is None or d_vec is None:
+            return None
+        if c_mat.dim() == 1:
+            c_mat = c_mat.unsqueeze(0)
+        if c_mat.shape[0] != 1 or d_vec.reshape(-1).shape[0] != 1:
+            return None
+        row = c_mat[0].tolist()
+        d_val = float(d_vec.reshape(-1)[0].item())
+        if abs(d_val) > 1e-6:
+            return None
+        nz = [(i, v) for i, v in enumerate(row) if abs(v) > 1e-9]
+        if len(nz) != 2:
+            return None
+        pos = [i for i, v in nz if v > 0]
+        neg = [i for i, v in nz if v < 0]
+        if len(pos) != 1 or len(neg) != 1:
+            return None
+        val_pos = [v for _, v in nz if v > 0][0]
+        val_neg = [v for _, v in nz if v < 0][0]
+        if abs(val_pos - 1.0) > 1e-6 or abs(val_neg + 1.0) > 1e-6:
+            return None
+        if pos[0] == t_idx:
+            covered.add(neg[0])
+        elif neg[0] == t_idx:
+            covered.add(pos[0])
+        else:
+            return None
+    if covered != expected:
+        return None
+    y_true = _coerce_label_to_tensor(true_label)
+    return queries[0][0], OutputSpec(kind=OutKind.TOP1_ROBUST, y_true=y_true)

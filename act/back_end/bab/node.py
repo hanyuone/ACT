@@ -70,9 +70,9 @@ class SubproblemBatch:
 
     @staticmethod
     def from_bounds(bounds: Bounds, depth: int = 0) -> SubproblemBatch:
-        """Wrap a single ``Bounds`` into a batch of size 1."""
-        lb = bounds.lb.detach().unsqueeze(0)  # (1, D)
-        ub = bounds.ub.detach().unsqueeze(0)  # (1, D)
+        """Wrap a single ``Bounds`` into a batch of size 1 (flattened to (1, D))."""
+        lb = bounds.lb.detach().reshape(1, -1)  # (1, D_flat)
+        ub = bounds.ub.detach().reshape(1, -1)  # (1, D_flat)
         depths = torch.tensor([depth], dtype=torch.long)
         return SubproblemBatch(lb=lb, ub=ub, depths=depths)
 

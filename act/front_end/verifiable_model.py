@@ -696,8 +696,7 @@ class OutputSpecLayer(nn.Module):
             
             # Works for both single and batched (c applied to each sample)
             y_2d = y.reshape(batch_size, -1)  # (batch, n_vars)
-            c_typed = self.c.to(dtype=y_2d.dtype, device=y_2d.device)
-            lhs = (y_2d @ c_typed)  # (batch,)
+            lhs = (y_2d @ self.c)  # (batch,)
             satisfied = lhs <= self.d  # (batch,) bool
             
             # Unified explanation format (consistent across all batch sizes)
@@ -724,6 +723,19 @@ class OutputSpecLayer(nn.Module):
             explanation = f"✅ OUTPUT RANGE: {n_ok}/{batch_size} satisfied"
             
             # Always return tensor (unified output format)
+            return (y, satisfied, explanation)
+        
+        elif self.kind == OutKind.UNSAFE_LINEAR:
+            if self.c is None or self.d is None:
+                return (y, True, "⚠️ OUTPUT UNSAFE_LINEAR: Missing c/d")
+            y_2d = y.reshape(batch_size, -1)
+            C = self.c if self.c.dim() >= 2 else self.c.unsqueeze(0)
+            d_vec = self.d.reshape(-1)
+            Cy = y_2d @ C.T
+            unsafe = (Cy <= d_vec).all(dim=1)
+            satisfied = ~unsafe
+            n_ok = satisfied.sum().item()
+            explanation = f"✅ OUTPUT UNSAFE_LINEAR: {n_ok}/{batch_size} safe (UNSAFE={batch_size - n_ok})"
             return (y, satisfied, explanation)
         
         else:

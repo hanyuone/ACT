@@ -26,7 +26,7 @@ from act.front_end.vnnlib_loader.data_model_loader import (
     load_vnnlib_pair,
     list_local_categories
 )
-from act.front_end.vnnlib_loader.vnnlib_parser import parse_vnnlib_to_specs
+from act.front_end.vnnlib_loader.vnnlib_parser import parse_vnnlib_queries
 
 logger = logging.getLogger(__name__)
 
@@ -225,19 +225,21 @@ class VNNLibSpecCreator(BaseSpecCreator):
         # Pass input_shape to ensure specs match tensor shape (not flattened)
         # Pass true_label to promote RANGE to TOP1_ROBUST for classification
         try:
-            input_spec, output_spec = parse_vnnlib_to_specs(
+            queries = parse_vnnlib_queries(
                 vnnlib_path,
-                labeled_tensor=labeled_tensor
+                labeled_tensor=labeled_tensor,
             )
+            if not queries:
+                raise RuntimeError("parse_vnnlib_queries returned no queries")
             logger.info(
-                f"Parsed VNNLIB specs: {input_spec.kind}, {output_spec.kind}"
+                f"Parsed VNNLIB specs: {len(queries)} queries, "
+                f"first kind=({queries[0][0].kind}, {queries[0][1].kind})"
             )
         except Exception as e:
             logger.error(f"Failed to parse VNNLIB specs: {e}")
             return None
         
-        # Create single spec pair from VNNLIB
-        spec_pairs = [(input_spec, output_spec)]
+        spec_pairs = list(queries)
         
         # Validate if requested
         if validate_shapes:
