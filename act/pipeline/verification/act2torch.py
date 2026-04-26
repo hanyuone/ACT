@@ -204,9 +204,52 @@ class ActGraphModule(nn.Module):
             return inputs[0] * getattr(self, f"_scale_a_{layer.id}")
         if kind == LayerKind.BIAS.value:
             return inputs[0] + getattr(self, f"_bias_c_{layer.id}")
+        if kind == LayerKind.TRANSPOSE.value:
+            perm = layer.params.get("perm")
+            if perm is None:
+                return inputs[0]
+            return inputs[0].permute(*perm).contiguous()
+        if kind == LayerKind.UNSQUEEZE.value:
+            dims = layer.params.get("dims") or []
+            out = inputs[0]
+            for d in sorted(dims):
+                out = out.unsqueeze(d)
+            return out
+        if kind == LayerKind.SQUEEZE.value:
+            dims = layer.params.get("dims") or []
+            out = inputs[0]
+            for d in sorted(dims, reverse=True):
+                out = out.squeeze(d)
+            return out
+        if kind == LayerKind.RESHAPE.value:
+            target = layer.params.get("target_shape") or layer.params.get("output_shape")
+            if target is None:
+                return inputs[0]
+            return inputs[0].reshape(*target)
+        if kind == LayerKind.MAX.value:
+            if len(inputs) < 2:
+                raise RuntimeError(
+                    f"ActGraphModule: MAX layer {layer.id} expects at least 2 inputs, "
+                    f"got {len(inputs)}."
+                )
+            out = inputs[0]
+            for t in inputs[1:]:
+                out = torch.maximum(out, t)
+            return out
+        if kind == LayerKind.MIN.value:
+            if len(inputs) < 2:
+                raise RuntimeError(
+                    f"ActGraphModule: MIN layer {layer.id} expects at least 2 inputs, "
+                    f"got {len(inputs)}."
+                )
+            out = inputs[0]
+            for t in inputs[1:]:
+                out = torch.minimum(out, t)
+            return out
         raise NotImplementedError(
             f"ActGraphModule: functional layer kind '{kind}' (id={layer.id}) not supported. "
-            f"torch2act only emits ADD, CONCAT, MUL, SCALE, BIAS functionally."
+            f"torch2act only emits ADD, CONCAT, MUL, SCALE, BIAS, TRANSPOSE, UNSQUEEZE, "
+            f"SQUEEZE, RESHAPE, MAX, MIN functionally."
         )
 
 
