@@ -93,8 +93,9 @@ common:
 
 family_selection:
   weighted:
-    mlp:   0.5        # 50% fully-connected networks
-    cnn2d: 0.5        # 50% 2-D convolutional networks
+    mlp:   0.5        # fully-connected networks
+    cnn2d: 0.5        # 2-D convolutional networks
+    rnn:   0.0        # disabled by default curently, only interval supports RNNs; bump to 1.0 for RNN self-tests
 
 
 # ============================================================================
@@ -268,6 +269,63 @@ families:
 
     lrelu_alpha:
       choice: [0.01, 0.1, 0.2]
+
+  # --------------------------------------------------------------------------
+  # 3.3  RNN  (recurrent: RNN / LSTM / GRU + Flatten + Dense head)
+  # --------------------------------------------------------------------------
+  #
+  # Single-layer recurrent cell with a flattened classifier head:
+  #   INPUT (1, T, F) -> RNN/LSTM/GRU -> FLATTEN -> DENSE(num_classes)
+  #
+  # Multi-layer (num_layers > 1) and bidirectional are supported by the
+  # serialization / restoration paths, but the interval transfer function
+  # currently unrolls only layer 0 — so we keep num_layers = 1 here to avoid
+  # silently coarse bounds. The cell type (RNN / LSTM / GRU) is sampled
+  # per-instance.
+  #
+  # Sequence length and feature width are kept small to control bounds
+  # explosion: an LSTM cell unrolled T times applies sigmoid/tanh interval
+  # widening at every step.
+
+  rnn:
+
+    # --- Input ---
+    # [batch, seq_len, input_size]; batch is always 1 for symbolic verification.
+    input_shape:
+      choice: [[1, 4, 3], [1, 6, 4]]
+
+    num_classes:
+      choice: [10]
+
+    # --- Cell type ---
+    cell:
+      weighted:
+        LSTM: 0.4
+        GRU:  0.3
+        RNN:  0.3
+
+    # --- Cell hyper-parameters ---
+    hidden_size:
+      choice: [8, 16]
+
+    num_layers:
+      const: 1
+
+    bidirectional:
+      # Disabled: interval_tf raises NotImplementedError on bidirectional RNN
+      # because the reverse-direction sweep over weight_*_l0_reverse is not
+      # implemented. Bump back above 0 once that lands.
+      probability: 0.0
+
+    batch_first:
+      const: true
+
+    use_bias:
+      const: true
+
+    # Vanilla-RNN nonlinearity (ignored for LSTM/GRU).
+    nonlinearity:
+      choice: [tanh, relu]
 
 
 # ============================================================================

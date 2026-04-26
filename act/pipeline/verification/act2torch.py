@@ -162,6 +162,11 @@ class ActGraphModule(nn.Module):
                         f"not implemented (current torch2act does not emit such nets)."
                     )
                 out = mod(inp_tensors[0])
+                # nn.RNN / LSTM / GRU return (output, hidden); MHA returns
+                # (output, attn_weights). Verification only consumes the
+                # primary output tensor, so drop the auxiliary state.
+                if isinstance(out, tuple):
+                    out = out[0]
             activations[lid] = out
 
         if self._exit not in activations:
@@ -660,6 +665,12 @@ class ACTToTorch:
             raise ValueError(f"Layer kind '{kind}' not found in REGISTRY")
         spec = REGISTRY[kind]
 
+        # Recurrent layers need bespoke construction (the schema's positional
+        # arg order does not line up with nn.RNN's constructor — see
+        # _build_rnn_family for the full reasoning).
+        if kind in (LayerKind.RNN.value, LayerKind.GRU.value, LayerKind.LSTM.value):
+            return self._build_rnn_family(act_layer)
+
         cls = _ACT_TO_TORCH.get(kind)
         if cls is None:
             if "requires_graph_restoration" in spec.get("params_optional", []):
@@ -722,3 +733,32 @@ class ACTToTorch:
                 m.load_state_dict(state_dict, strict=False)
 
         return m
+
+    def _build_rnn_family(self, act_layer: Layer) -> nn.Module:
+        """Build a single-layer nn.RNN / nn.LSTM / nn.GRU.
+        """
+        kind = act_layer.kind
+        params = act_layer.params
+        if int(params.get("num_layers", 1)) != 1:
+            raise ValueError(
+                f"ACTToTorch: {kind} layer {act_layer.id} has num_layers="
+                f"{params['num_layers']}, only single-layer is supported."
+            )
+
+        ctor_kwargs: Dict[str, Any] = {
+            "input_size":   int(params["input_size"]),
+            "hidden_size":  int(params["hidden_size"]),
+            "num_layers":   1,
+            "bidirectional": bool(params.get("bidirectional", False)),
+            "batch_first":  bool(params.get("batch_first", False)),
+            "bias":         isinstance(params.get("bias_ih_l0"), torch.Tensor),
+        }
+        if kind == LayerKind.RNN.value:
+            ctor_kwargs["nonlinearity"] = params.get("nonlinearity", "tanh")
+
+        rnn = _ACT_TO_TORCH[kind](**ctor_kwargs)
+        target_dtype = next(rnn.parameters()).dtype
+        sd = {k: v.detach().clone().to(dtype=target_dtype)
+              for k, v in params.items() if isinstance(v, torch.Tensor)}
+        rnn.load_state_dict(sd, strict=True)
+        return rnn

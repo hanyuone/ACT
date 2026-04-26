@@ -419,6 +419,9 @@ class _LayerGraphBuilder:
             nn.Sigmoid: lambda m: self._convert_activation(m, LayerKind.SIGMOID),
             nn.Tanh: lambda m: self._convert_activation(m, LayerKind.TANH),
             nn.LeakyReLU: lambda m: self._convert_activation(m, LayerKind.LRELU, {"negative_slope": m.negative_slope}),
+            nn.LSTM: lambda m: self._convert_rnn_family(m, LayerKind.LSTM),
+            nn.GRU: lambda m: self._convert_rnn_family(m, LayerKind.GRU),
+            nn.RNN: lambda m: self._convert_rnn_family(m, LayerKind.RNN),
         }
         
         # No-op modules (identity during inference)
@@ -639,7 +642,42 @@ class _LayerGraphBuilder:
         self._add_layer("BIAS", bias_params, self.prev_out, out_bias)
         self.prev_out = out_bias
     
-    def _convert_activation(self, mod: nn.Module, kind: LayerKind, 
+    def _convert_rnn_family(self, mod: Union[nn.RNN, nn.LSTM, nn.GRU], kind: LayerKind) -> None:
+        """Convert single-layer nn.RNN / nn.LSTM / nn.GRU.
+        """
+        if int(mod.num_layers) != 1:
+            raise ValueError(f"{kind.value}: num_layers={mod.num_layers} not supported (single-layer only).")
+        if kind == LayerKind.LSTM and int(getattr(mod, "proj_size", 0)) != 0:
+            raise ValueError(f"LSTM: proj_size={mod.proj_size} not supported.")
+
+        batch_first = bool(mod.batch_first)
+        if len(self.shape) != 3:
+            raise ValueError(f"{kind.value}: requires 3D input shape, got {self.shape}.")
+        batch, seq_len, in_feat = self.shape if batch_first else (self.shape[1], self.shape[0], self.shape[2])
+        directions = 2 if mod.bidirectional else 1
+        out_feat = int(mod.hidden_size) * directions
+        output_shape = (batch, seq_len, out_feat) if batch_first else (seq_len, batch, out_feat)
+
+        params: Dict[str, Any] = {
+            "input_size": int(mod.input_size), "hidden_size": int(mod.hidden_size),
+            "num_layers": 1, "bidirectional": bool(mod.bidirectional), "batch_first": batch_first,
+            "input_shape": self.shape, "output_shape": output_shape,
+        }
+        if kind == LayerKind.RNN:
+            params["nonlinearity"] = getattr(mod, "nonlinearity", "tanh")
+        # state_dict already contains exactly the keys nn.RNN's contract
+        # guarantees for the (bias?, bidirectional?) combination -- pull them
+        # all in. act2torch's load_state_dict(strict=True) will catch any
+        # shape mismatch on the round-trip.
+        for key, tensor in mod.state_dict().items():
+            params[key] = tensor.detach().clone()
+
+        out_vars = self._alloc_ids(batch * seq_len * out_feat)
+        self._add_layer(kind.value, params, self.prev_out, out_vars)
+        self.shape = output_shape
+        self.prev_out = out_vars
+
+    def _convert_activation(self, mod: nn.Module, kind: LayerKind,
                            extra_params: Optional[Dict[str, Any]] = None) -> None:
         """Convert activation function."""
         out_vars = self._same_size_forward()
