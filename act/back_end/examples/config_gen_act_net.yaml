@@ -95,7 +95,7 @@ family_selection:
   weighted:
     mlp:   0.5        # fully-connected networks
     cnn2d: 0.5        # 2-D convolutional networks
-    rnn:   0.0        # disabled by default curently, only interval supports RNNs; bump to 1.0 for RNN self-tests
+    rnn:   0.0        # disabled by default curently, only interval, hybridz supports RNNs; bump to 1.0 for RNN self-tests
 
 
 # ============================================================================
