@@ -299,6 +299,55 @@ def append_flatten(layers) -> None:
     layers.append({"kind": LayerKind.FLATTEN.value, "params": {"start_dim": 1}})
 
 
+def append_rnn_family(
+    layers: List[Dict[str, Any]],
+    *,
+    cell: str,
+    input_size: int,
+    hidden_size: int,
+    seq_len: int,
+    batch: int = 1,
+    num_layers: int = 1,
+    bidirectional: bool = False,
+    batch_first: bool = True,
+    use_bias: bool = True,
+    nonlinearity: str = "tanh",
+) -> Tuple[Tuple[int, ...], int]:
+    """Append an RNN / LSTM / GRU layer to the spec list.
+
+    Returns ``(output_shape, hidden_out)`` where ``hidden_out = hidden_size *
+    (2 if bidirectional else 1)``. Output layout follows ``batch_first``:
+    ``(B, T, hidden_out)`` if True else ``(T, B, hidden_out)``. Weights are
+    populated downstream by NetFactory.create_network.
+    """
+    cell = cell.upper()
+    if cell not in (LayerKind.RNN.value, LayerKind.LSTM.value, LayerKind.GRU.value):
+        raise ValueError(f"append_rnn_family: unknown cell {cell!r}")
+    directions = 2 if bidirectional else 1
+    hidden_out = int(hidden_size) * directions
+    if batch_first:
+        input_shape = [int(batch), int(seq_len), int(input_size)]
+        output_shape = [int(batch), int(seq_len), int(hidden_out)]
+    else:
+        input_shape = [int(seq_len), int(batch), int(input_size)]
+        output_shape = [int(seq_len), int(batch), int(hidden_out)]
+    params: Dict[str, Any] = {
+        "input_size": int(input_size),
+        "hidden_size": int(hidden_size),
+        "num_layers": int(num_layers),
+        "bidirectional": bool(bidirectional),
+        "batch_first": bool(batch_first),
+        "input_shape": input_shape,
+        "output_shape": output_shape,
+        # Carries through to weight generation; not consumed by interval TF.
+        "use_bias": bool(use_bias),
+    }
+    if cell == LayerKind.RNN.value:
+        params["nonlinearity"] = str(nonlinearity)
+    layers.append({"kind": cell, "params": params})
+    return tuple(output_shape), hidden_out
+
+
 # ============================================================================
 # TF-Driven Operator Injection
 # ============================================================================
@@ -433,6 +482,57 @@ def build_mlp_layers(layers: List[Dict[str, Any]], *, cfg: Dict[str, Any]) -> No
 
     append_dense(
         layers, in_features=in_feat, out_features=int(cfg["num_classes"]), use_bias=True
+    )
+
+
+def build_rnn_layers(layers: List[Dict[str, Any]], *, cfg: Dict[str, Any]) -> None:
+    """Generate a recurrent network: RNN/LSTM/GRU cell + Flatten + Dense head.
+
+    Layout (with batch_first=True, single direction):
+      INPUT (1, T, F)
+        -> RNN/LSTM/GRU         (1, T, H)
+        -> FLATTEN              (1, T*H)
+        -> DENSE(num_classes)   (1, C)
+
+    For bidirectional, hidden width doubles to 2H so the Dense input becomes
+    T*2H. The cell type is chosen via ``cfg["cell"]`` (RNN/LSTM/GRU).
+    """
+    shape = tuple(cfg["input_shape"])
+    if len(shape) != 3:
+        raise ValueError(f"RNN family expects input_shape (1, T, F); got {shape}")
+    batch, seq_len, in_feat = (int(s) for s in shape)
+    if batch != 1:
+        raise ValueError(f"RNN family currently restricted to batch=1; got batch={batch}")
+
+    cell = str(cfg.get("cell", LayerKind.LSTM.value)).upper()
+    hidden_size = int(cfg["hidden_size"])
+    num_layers = int(cfg.get("num_layers", 1))
+    bidirectional = bool(cfg.get("bidirectional", False))
+    batch_first = bool(cfg.get("batch_first", True))
+    nonlinearity = str(cfg.get("nonlinearity", "tanh"))
+    use_bias = bool(cfg.get("use_bias", True))
+
+    _, hidden_out = append_rnn_family(
+        layers,
+        cell=cell,
+        input_size=in_feat,
+        hidden_size=hidden_size,
+        seq_len=seq_len,
+        batch=batch,
+        num_layers=num_layers,
+        bidirectional=bidirectional,
+        batch_first=batch_first,
+        use_bias=use_bias,
+        nonlinearity=nonlinearity,
+    )
+
+    flat_size = seq_len * hidden_out
+    append_flatten(layers)
+    append_dense(
+        layers,
+        in_features=flat_size,
+        out_features=int(cfg["num_classes"]),
+        use_bias=True,
     )
 
 
@@ -761,6 +861,7 @@ class ConfigSampler:
     _FAMILY_REQUIRED_LAYERS = {
         "mlp": {LayerKind.DENSE.value, LayerKind.RELU.value},
         "cnn2d": {LayerKind.CONV2D.value, LayerKind.DENSE.value, LayerKind.RELU.value},
+        "rnn": {LayerKind.LSTM.value, LayerKind.FLATTEN.value, LayerKind.DENSE.value},
     }
 
     _ALL_ACTIVATIONS = frozenset(lk.value for lk in _ACTIVATIONS)
@@ -1094,6 +1195,43 @@ class NetFactory:
             return torch.randn(*shape) * 0.1
         return None
 
+    def _populate_rnn_weights(
+        self, kind: str, params: Dict[str, Any], dtype: torch.dtype
+    ) -> None:
+        """Generate weight_ih_l0 / weight_hh_l0 / bias_*_l0 (and reverse if
+        bidirectional) for an RNN/LSTM/GRU layer spec, then drop the
+        ``use_bias`` factory hint so it does not leak into Layer.params (the
+        REGISTRY does not list ``use_bias`` as a valid key)."""
+        gates = {LayerKind.RNN.value: 1, LayerKind.GRU.value: 3, LayerKind.LSTM.value: 4}[kind]
+        input_size = int(params["input_size"])
+        hidden_size = int(params["hidden_size"])
+        bidirectional = bool(params.get("bidirectional", False))
+        use_bias = bool(params.pop("use_bias", True))
+        rows = gates * hidden_size
+
+        # Small init scale matches DENSE/CONV (0.1) so generated bounds stay
+        # in a regime the interval domain can handle without exploding.
+        scale = 0.1
+        if "weight_ih_l0" not in params:
+            params["weight_ih_l0"] = torch.randn(rows, input_size, dtype=dtype) * scale
+        if "weight_hh_l0" not in params:
+            params["weight_hh_l0"] = torch.randn(rows, hidden_size, dtype=dtype) * scale
+        if use_bias:
+            if "bias_ih_l0" not in params:
+                params["bias_ih_l0"] = torch.zeros(rows, dtype=dtype)
+            if "bias_hh_l0" not in params:
+                params["bias_hh_l0"] = torch.zeros(rows, dtype=dtype)
+        if bidirectional:
+            if "weight_ih_l0_reverse" not in params:
+                params["weight_ih_l0_reverse"] = torch.randn(rows, input_size, dtype=dtype) * scale
+            if "weight_hh_l0_reverse" not in params:
+                params["weight_hh_l0_reverse"] = torch.randn(rows, hidden_size, dtype=dtype) * scale
+            if use_bias:
+                if "bias_ih_l0_reverse" not in params:
+                    params["bias_ih_l0_reverse"] = torch.zeros(rows, dtype=dtype)
+                if "bias_hh_l0_reverse" not in params:
+                    params["bias_hh_l0_reverse"] = torch.zeros(rows, dtype=dtype)
+
     def _input_spec_params(self, params, input_shape, dtype):
         if params["kind"] == InKind.BOX:
             return {
@@ -1163,6 +1301,11 @@ class NetFactory:
                 struct = f"{cfg.get('residual_channels', 32)}x{cfg.get('num_residual_blocks', 3)}"
             else:
                 struct = f"{cfg.get('base_channels', 16)}x{cfg.get('stages', 3)}x{cfg.get('blocks_per_stage', 2)}"
+        elif family == "rnn":
+            cell = str(cfg.get("cell", "LSTM")).lower()
+            bidi = "bi" if cfg.get("bidirectional") else ""
+            struct = f"{bidi}{cell}_h{cfg.get('hidden_size', 16)}"
+            family_tag = f"rnn_{cell}"
         else:
             struct = "default"
         return f"{family_tag}_{input_str}_{struct}_{seed}"
@@ -1199,6 +1342,8 @@ class NetFactory:
             build_mlp_layers(layers, cfg=cfg)
         elif instance["family"] == "cnn2d":
             build_cnn_layers(layers, cfg=cfg, rng=random.Random(int(instance["seed"])))
+        elif instance["family"] == "rnn":
+            build_rnn_layers(layers, cfg=cfg)
         else:
             raise ValueError(f"Unsupported family: {instance['family']}")
 
@@ -1290,6 +1435,10 @@ class NetFactory:
                 params["c"] = torch.zeros(len(in_vars), dtype=dtype)
             elif kind == LayerKind.SCALE.value and "a" not in params:
                 params["a"] = torch.ones(len(in_vars), dtype=dtype)
+            elif kind in (
+                LayerKind.RNN.value, LayerKind.LSTM.value, LayerKind.GRU.value,
+            ):
+                self._populate_rnn_weights(kind, params, dtype)
 
             params.pop("preds_indices", None)
 

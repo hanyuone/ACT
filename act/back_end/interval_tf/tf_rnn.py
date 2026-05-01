@@ -12,10 +12,7 @@
 
 
 import torch
-import torch.nn.functional as F
-from typing import List, Tuple, Optional
 from act.back_end.core import Bounds, Con, ConSet, Fact, Layer
-from act.back_end.utils import affine_bounds, pwl_meta, bound_var_interval, scale_interval
 
 
 def tf_lstm(L: Layer, Bin: Bounds) -> Fact:
@@ -25,10 +22,10 @@ def tf_lstm(L: Layer, Bin: Bounds) -> Fact:
     Handles LSTM cell computation with interval bounds propagation.
     """
     # Extract LSTM parameters
-    weight_ih = L.params["weight_ih"]  # input-to-hidden weights
-    weight_hh = L.params["weight_hh"]  # hidden-to-hidden weights
-    bias_ih = L.params.get("bias_ih", None)
-    bias_hh = L.params.get("bias_hh", None)
+    weight_ih = L.params["weight_ih_l0"]  # input-to-hidden weights
+    weight_hh = L.params["weight_hh_l0"]  # hidden-to-hidden weights
+    bias_ih = L.params.get("bias_ih_l0", None)
+    bias_hh = L.params.get("bias_hh_l0", None)
     
     # LSTM dimensions
     input_size = L.params["input_size"]
@@ -45,6 +42,12 @@ def tf_lstm(L: Layer, Bin: Bounds) -> Fact:
         batch_size, seq_len, _ = input_shape
     else:
         seq_len, batch_size, _ = input_shape
+    
+    # Bin arrives flat (analyze() stores Bounds as 1D over in_vars); reshape
+    # to the declared (batch, seq, feat) layout so per-step [:, t, :] /
+    # [t, :, :] indexing below works.
+    Bin = Bounds(Bin.lb.reshape(input_shape), Bin.ub.reshape(input_shape))
+    
     
     # For verification, we approximate LSTM with its linearized form
     # This is a conservative approximation using the worst-case bounds
@@ -93,12 +96,11 @@ def tf_lstm(L: Layer, Bin: Bounds) -> Fact:
         output_lb = torch.stack([b.lb for b in output_bounds_list], dim=0)
         output_ub = torch.stack([b.ub for b in output_bounds_list], dim=0)
     
-    # Handle bidirectional LSTM
     if bidirectional:
-        # Double the hidden size for bidirectional output
-        # For simplicity, we approximate backward pass with same bounds
-        output_lb = torch.cat([output_lb, output_lb], dim=-1)
-        output_ub = torch.cat([output_ub, output_ub], dim=-1)
+        raise NotImplementedError(
+            "tf_lstm: bidirectional=True not supported (reverse-direction "
+            "sweep over weight_*_l0_reverse not implemented)."
+        )
     
     B_output = Bounds(output_lb.view(-1), output_ub.view(-1))
     
@@ -126,10 +128,10 @@ def tf_gru(L: Layer, Bin: Bounds) -> Fact:
     Handles GRU cell computation with interval bounds propagation.
     """
     # Extract GRU parameters
-    weight_ih = L.params["weight_ih"]
-    weight_hh = L.params["weight_hh"]
-    bias_ih = L.params.get("bias_ih", None)
-    bias_hh = L.params.get("bias_hh", None)
+    weight_ih = L.params["weight_ih_l0"]
+    weight_hh = L.params["weight_hh_l0"]
+    bias_ih = L.params.get("bias_ih_l0", None)
+    bias_hh = L.params.get("bias_hh_l0", None)
     
     # GRU dimensions
     input_size = L.params["input_size"]
@@ -146,6 +148,10 @@ def tf_gru(L: Layer, Bin: Bounds) -> Fact:
         batch_size, seq_len, _ = input_shape
     else:
         seq_len, batch_size, _ = input_shape
+    
+    # Bin arrives flat (analyze() stores Bounds as 1D over in_vars); reshape
+    # to the declared (batch, seq, feat) layout so per-step [:, t, :] / [t, :, :] indexing below works.
+    Bin = Bounds(Bin.lb.reshape(input_shape), Bin.ub.reshape(input_shape))
     
     # Initialize hidden state bounds
     h_bounds = Bounds(
@@ -185,10 +191,12 @@ def tf_gru(L: Layer, Bin: Bounds) -> Fact:
         output_lb = torch.stack([b.lb for b in output_bounds_list], dim=0)
         output_ub = torch.stack([b.ub for b in output_bounds_list], dim=0)
     
-    # Handle bidirectional GRU
     if bidirectional:
-        output_lb = torch.cat([output_lb, output_lb], dim=-1)
-        output_ub = torch.cat([output_ub, output_ub], dim=-1)
+        # Same soundness issue as tf_lstm — see that function for details.
+        raise NotImplementedError(
+            "tf_gru: bidirectional=True not supported (reverse-direction "
+            "sweep over weight_*_l0_reverse not implemented)."
+        )
     
     B_output = Bounds(output_lb.view(-1), output_ub.view(-1))
     
@@ -216,10 +224,10 @@ def tf_rnn(L: Layer, Bin: Bounds) -> Fact:
     Handles simple RNN cell computation with interval bounds propagation.
     """
     # Extract RNN parameters
-    weight_ih = L.params["weight_ih"]
-    weight_hh = L.params["weight_hh"]
-    bias_ih = L.params.get("bias_ih", None)
-    bias_hh = L.params.get("bias_hh", None)
+    weight_ih = L.params["weight_ih_l0"]
+    weight_hh = L.params["weight_hh_l0"]
+    bias_ih = L.params.get("bias_ih_l0", None)
+    bias_hh = L.params.get("bias_hh_l0", None)
     
     # RNN dimensions
     input_size = L.params["input_size"]
@@ -236,6 +244,10 @@ def tf_rnn(L: Layer, Bin: Bounds) -> Fact:
         batch_size, seq_len, _ = input_shape
     else:
         seq_len, batch_size, _ = input_shape
+    
+    # Bin arrives flat (analyze() stores Bounds as 1D over in_vars); reshape
+    # to the declared (batch, seq, feat) layout so per-step [:, t, :] / [t, :, :] indexing below works.
+    Bin = Bounds(Bin.lb.reshape(input_shape), Bin.ub.reshape(input_shape))
     
     # Initialize hidden state bounds
     h_bounds = Bounds(
@@ -288,10 +300,12 @@ def tf_rnn(L: Layer, Bin: Bounds) -> Fact:
         output_lb = torch.stack([b.lb for b in output_bounds_list], dim=0)
         output_ub = torch.stack([b.ub for b in output_bounds_list], dim=0)
     
-    # Handle bidirectional RNN
     if bidirectional:
-        output_lb = torch.cat([output_lb, output_lb], dim=-1)
-        output_ub = torch.cat([output_ub, output_ub], dim=-1)
+        # Same soundness issue as tf_lstm — see that function for details.
+        raise NotImplementedError(
+            "tf_rnn: bidirectional=True not supported (reverse-direction "
+            "sweep over weight_*_l0_reverse not implemented)."
+        )
     
     B_output = Bounds(output_lb.view(-1), output_ub.view(-1))
     
@@ -439,7 +453,9 @@ def _gru_cell_bounds(x_bounds, h_bounds, weight_ih, weight_hh, bias_ih, bias_hh)
     
     # New gate computation: n = tanh(W_ih_n * x + W_hh_n * (r * h))
     rh_bounds = _multiply_bounds(r_bounds, h_bounds)
-    hh_n = _apply_linear_bounds(rh_bounds, weight_hh[:, 2*hidden_size:], bias_hh[2*hidden_size:] if bias_hh is not None else None)
+    # weight_hh has shape (3*H, H): rows index gates, cols index hidden.
+    # The "n" gate's hh sub-matrix is weight_hh[2H:3H, :] (rows), not [:, 2H:].
+    hh_n = _apply_linear_bounds(rh_bounds, weight_hh[2*hidden_size:3*hidden_size, :], bias_hh[2*hidden_size:3*hidden_size] if bias_hh is not None else None)
     
     n_bounds = Bounds(
         ih_all.lb[:, 2*hidden_size:] + hh_n.lb,
@@ -464,9 +480,12 @@ def _apply_linear_bounds(input_bounds, weight, bias=None):
     """Apply linear transformation to bounds."""
     W_pos = torch.clamp(weight, min=0)
     W_neg = torch.clamp(weight, max=0)
-    
-    result = affine_bounds(W_pos, W_neg, bias or torch.zeros(weight.shape[0]), input_bounds)
-    return result
+    if bias is None:
+        bias = torch.zeros(weight.shape[0], dtype=weight.dtype, device=weight.device)
+    # input_bounds.lb shape (..., in_features); weight shape (out, in).
+    out_lb = input_bounds.lb @ W_pos.T + input_bounds.ub @ W_neg.T + bias
+    out_ub = input_bounds.ub @ W_pos.T + input_bounds.lb @ W_neg.T + bias
+    return Bounds(out_lb, out_ub)
 
 
 def _apply_sigmoid_bounds(bounds):
