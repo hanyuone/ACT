@@ -14,7 +14,7 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 
 if ! conda env list | grep -q "^act-eran "; then
     echo "[ERAN] Creating conda env 'act-eran'..."
-    conda create -y -n act-eran python=3.8
+    conda create -y -n act-eran python=3.8 pip
 else
     echo "[ERAN] Conda env 'act-eran' already exists."
 fi
@@ -36,7 +36,8 @@ conda install -y -c conda-forge \
     pkg-config
 
 echo "[ERAN] Installing Python packages..."
-pip install -r eran_requirements.txt
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r eran_requirements.txt
 ERAN_DIR="$(cd ../../modules/eran && pwd)"
 echo "[ERAN] Switching to $ERAN_DIR"
 pushd "$ERAN_DIR" > /dev/null
