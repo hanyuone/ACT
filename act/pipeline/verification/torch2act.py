@@ -101,6 +101,7 @@ class _LayerGraphBuilder:
         
         # torch.fx specific
         self.fx_graph: Optional[fx.Graph] = None
+        self.traced_model: Optional[fx.GraphModule] = None
     
     # -------------------------------------------------------------------------
     # Public API
@@ -193,16 +194,81 @@ class _LayerGraphBuilder:
         self.prev_out = self.node_outputs[node_name]
         self.shape = self.node_shapes[node_name]
         return True
+
+    def _resolve_constant_tensor(self, node_name: str) -> Optional[torch.Tensor]:
+        """Return the tensor value of a get_attr fx node, or None if not a tensor get_attr."""
+        if self.fx_graph is None or self.traced_model is None:
+            return None
+        for n in self.fx_graph.nodes:
+            if n.name != node_name:
+                continue
+            if n.op != 'get_attr':
+                return None
+            target = str(n.target)
+            for resolver_name in ('get_buffer', 'get_parameter'):
+                resolver = getattr(self.traced_model, resolver_name, None)
+                if resolver is None:
+                    continue
+                try:
+                    val = resolver(target)
+                except (AttributeError, KeyError, RuntimeError):
+                    continue
+                if isinstance(val, torch.Tensor):
+                    return val.detach().clone()
+            return None
+        return None
+
+    def _resolve_slice_input_to_int_list(self, node_name: str) -> Optional[List[int]]:
+        """Read an OnnxSlice positional input (starts/ends/axes/steps) as an int list.
+
+        Resolves either from a get_attr initializer, or from an upstream layer
+        that stored a constant under ``params['shape_value']`` / ``params['value']``.
+        Returns None when neither source applies.
+        """
+        tensor = self._resolve_constant_tensor(node_name)
+        if tensor is not None:
+            return [int(x) for x in tensor.reshape(-1).tolist()]
+        if node_name in self.node_to_layer_id:
+            layer_id = self.node_to_layer_id[node_name]
+            if 0 <= layer_id < len(self.layers):
+                layer = self.layers[layer_id]
+                shape_value = layer.params.get("shape_value", layer.params.get("value"))
+                if isinstance(shape_value, torch.Tensor):
+                    return [int(x) for x in shape_value.reshape(-1).tolist()]
+        return None
+
+    def _broadcast_const_to_size(self, const: torch.Tensor, size: int) -> torch.Tensor:
+        """Broadcast a constant tensor to match a flat variable count.
+
+        Handles: scalars (numel==1), exact-size vectors, and integer-multiple
+        repetitions (e.g. shape (C,) broadcast to (C*spatial,) by repeat).
+        """
+        flat = const.reshape(-1)
+        if flat.numel() == 1:
+            return flat.expand(size).clone().to(self.dtype)
+        if flat.numel() == size:
+            return flat.clone().to(self.dtype)
+        if size % flat.numel() == 0:
+            return flat.repeat(size // flat.numel()).to(self.dtype)
+        if flat.numel() % size == 0:
+            return flat[:size].clone().to(self.dtype)
+        raise ValueError(
+            f"Cannot broadcast constant of shape {tuple(const.shape)} to flat size {size}"
+        )
     
     # -------------------------------------------------------------------------
     # Model Tracing (torch.fx only)
     # -------------------------------------------------------------------------
     
     def _extract_graph(self) -> None:
-        """Extract computation graph using torch.fx symbolic tracing."""
+        """Extract computation graph using torch.fx symbolic tracing.
+
+        Reuse a pre-traced GraphModule (e.g. from ``onnx2torch.convert``) so its
+        initializer buffers stay attached; re-tracing would lose them.
+        """
         try:
-            # Use fx.symbolic_trace to obtain a graph representation of the model from torch
-            traced = fx.symbolic_trace(self.model)
+            traced = self.model if isinstance(self.model, fx.GraphModule) else fx.symbolic_trace(self.model)
+            self.traced_model = traced
             self.fx_graph = traced.graph
             self.modules = dict(traced.named_modules())
             self._build_fx_graph_edges()
@@ -245,7 +311,28 @@ class _LayerGraphBuilder:
         module = self.modules.get(node.target)
         if module is None:
             raise ValueError(f"Module '{node.target}' not found in traced model")
-        
+
+        if 'onnx2torch' in type(module).__module__:
+            cls_name = type(module).__name__
+            handler = {
+                'OnnxBinaryMathOperation': self._convert_OnnxBinaryMathOperation,
+                'OnnxConcat': self._convert_OnnxConcat,
+                'OnnxFunction': self._convert_OnnxFunction,
+                'OnnxGather': self._convert_OnnxGather,
+                'OnnxMatMul': self._convert_OnnxMatMul,
+                'OnnxNeg': self._convert_OnnxNeg,
+                'OnnxReduceSumStaticAxes': self._convert_OnnxReduceSumStaticAxes,
+                'OnnxReshape': self._convert_OnnxReshape,
+                'OnnxSlice': self._convert_OnnxSlice,
+                'OnnxTranspose': self._convert_OnnxTranspose,
+            }.get(cls_name)
+            if handler is None:
+                raise NotImplementedError(
+                    f"Unsupported onnx2torch module {cls_name} at {node.name}"
+                )
+            handler(module, node)
+            return
+
         self._get_predecessor_state(node)
         self._convert_module(module)
         self._register_node(node.name)
@@ -418,6 +505,7 @@ class _LayerGraphBuilder:
             nn.SiLU: lambda m: self._convert_activation(m, LayerKind.SILU),
             nn.Sigmoid: lambda m: self._convert_activation(m, LayerKind.SIGMOID),
             nn.Tanh: lambda m: self._convert_activation(m, LayerKind.TANH),
+            nn.Softmax: self._convert_softmax,
             nn.LeakyReLU: lambda m: self._convert_activation(m, LayerKind.LRELU, {"negative_slope": m.negative_slope}),
             nn.LSTM: lambda m: self._convert_rnn_family(m, LayerKind.LSTM),
             nn.GRU: lambda m: self._convert_rnn_family(m, LayerKind.GRU),
@@ -693,7 +781,312 @@ class _LayerGraphBuilder:
 
         self._add_layer(kind.value, params, self.prev_out, out_vars)
         self.prev_out = out_vars
-    
+
+    def _convert_softmax(self, mod: nn.Module) -> None:
+        """Convert nn.Softmax to SOFTMAX layer."""
+        out_vars = self._same_size_forward()
+        axis = getattr(mod, 'dim', None)
+        if axis is None:
+            axis = -1
+        self._add_layer(LayerKind.SOFTMAX.value, {"axis": int(axis)}, self.prev_out, out_vars)
+        self.prev_out = out_vars
+
+    def _convert_OnnxNeg(self, mod: nn.Module, node: fx.Node) -> None:
+        """OnnxNeg: y = -x. Emitted as SCALE with a = -1."""
+        if not self._get_predecessor_state(node):
+            raise ValueError(f"OnnxNeg: missing predecessor for {node.name}")
+        size = len(self.prev_out)
+        out_vars = self._same_size_forward()
+        layer_id = self._add_layer(
+            LayerKind.SCALE.value,
+            {"a": torch.full((size,), -1.0, dtype=self.dtype),
+             "input_shape": self.shape, "output_shape": self.shape},
+            self.prev_out, out_vars,
+        )
+        self.prev_out = out_vars
+        self._register_node(node.name, layer_id)
+
+    def _convert_OnnxTranspose(self, mod: nn.Module, node: fx.Node) -> None:
+        """OnnxTranspose: y = x.permute(perm)."""
+        if not self._get_predecessor_state(node):
+            raise ValueError(f"OnnxTranspose: missing predecessor for {node.name}")
+        perm = tuple(int(p) for p in (getattr(mod, 'perm', None) or list(range(len(self.shape)))[::-1]))
+        if len(perm) != len(self.shape):
+            raise ValueError(f"OnnxTranspose: perm rank {len(perm)} != input rank {len(self.shape)}")
+        output_shape = tuple(self.shape[p] for p in perm)
+        out_vars = self._same_size_forward()
+        layer_id = self._add_layer(
+            LayerKind.TRANSPOSE.value, {"perm": perm}, self.prev_out, out_vars,
+        )
+        self.prev_out = out_vars
+        self.shape = output_shape
+        self._register_node(node.name, layer_id)
+
+    def _convert_OnnxReshape(self, mod: nn.Module, node: fx.Node) -> None:
+        """OnnxReshape with ONNX 0/-1 dim semantics (0 = keep input dim, -1 = infer)."""
+        if not self._get_predecessor_state(node):
+            raise ValueError(f"OnnxReshape: missing predecessor for {node.name}")
+        args = [a for a in node.args if isinstance(a, fx.Node)]
+        shape_tensor = self._resolve_constant_tensor(args[1].name) if len(args) >= 2 else None
+        if shape_tensor is None:
+            raise ValueError(f"OnnxReshape: cannot resolve target shape at {node.name}")
+        raw = [int(x) for x in shape_tensor.flatten().tolist()]
+        resolved = [int(self.shape[i]) if d == 0 else d for i, d in enumerate(raw)]
+        if -1 in resolved:
+            known = _prod([d for d in resolved if d != -1]) or 1
+            resolved[resolved.index(-1)] = _prod(self.shape) // known
+        output_shape = tuple(resolved)
+        out_vars = self._same_size_forward()
+        layer_id = self._add_layer(
+            LayerKind.RESHAPE.value, {"target_shape": output_shape}, self.prev_out, out_vars,
+        )
+        self.prev_out = out_vars
+        self.shape = output_shape
+        self._register_node(node.name, layer_id)
+
+    def _convert_OnnxConcat(self, mod: nn.Module, node: fx.Node) -> None:
+        """OnnxConcat: y = cat(*input_tensors, axis)."""
+        axis = int(getattr(mod, 'axis', 0))
+        args = [a for a in node.args if isinstance(a, fx.Node)]
+        if not args:
+            raise ValueError(f"OnnxConcat: no inputs at {node.name}")
+        all_vars: List[int] = []
+        shapes: List[Tuple[int, ...]] = []
+        for arg in args:
+            all_vars.extend(self.node_outputs[arg.name])
+            shapes.append(self.node_shapes[arg.name])
+        norm_axis = axis if axis >= 0 else axis + len(shapes[0])
+        out_shape = list(shapes[0])
+        out_shape[norm_axis] = sum(int(s[norm_axis]) for s in shapes)
+        output_shape = tuple(out_shape)
+        out_vars = self._alloc_ids(len(all_vars))
+        layer_id = self._add_layer(
+            LayerKind.CONCAT.value, {"concat_dim": axis}, all_vars, out_vars,
+        )
+        self.prev_out = out_vars
+        self.shape = output_shape
+        self._register_node(node.name, layer_id)
+
+    def _convert_OnnxReduceSumStaticAxes(self, mod: nn.Module, node: fx.Node) -> None:
+        """OnnxReduceSumStaticAxes: y = sum(x, axes, keepdim)."""
+        if not self._get_predecessor_state(node):
+            raise ValueError(f"OnnxReduceSumStaticAxes: missing predecessor for {node.name}")
+        axes = getattr(mod, '_axes', None) or list(range(len(self.shape)))
+        keepdims = bool(int(getattr(mod, '_keepdims', 1)))
+        norm_axes = sorted({(a + len(self.shape)) if a < 0 else a for a in (int(x) for x in axes)})
+        if keepdims:
+            output_shape = tuple(1 if i in norm_axes else int(d) for i, d in enumerate(self.shape))
+        else:
+            output_shape = tuple(int(d) for i, d in enumerate(self.shape) if i not in norm_axes) or (1,)
+        out_vars = self._alloc_ids(_prod(output_shape) or 1)
+        layer_id = self._add_layer(
+            LayerKind.REDUCE_SUM.value,
+            {"axes": list(norm_axes), "keepdims": int(keepdims),
+             "input_shape": self.shape, "output_shape": output_shape},
+            self.prev_out, out_vars,
+        )
+        self.prev_out = out_vars
+        self.shape = output_shape
+        self._register_node(node.name, layer_id)
+
+    def _convert_OnnxGather(self, mod: nn.Module, node: fx.Node) -> None:
+        """OnnxGather: numpy.take(x, indices, axis=_axis)."""
+        if not self._get_predecessor_state(node):
+            raise ValueError(f"OnnxGather: missing predecessor for {node.name}")
+        axis = int(getattr(mod, '_axis', 0))
+        args = [a for a in node.args if isinstance(a, fx.Node)]
+        idx = self._resolve_constant_tensor(args[1].name) if len(args) >= 2 else None
+        if idx is None:
+            raise ValueError(f"OnnxGather: cannot resolve indices at {node.name}")
+        indices = idx.detach().clone().to(torch.int64)
+        norm_axis = axis if axis >= 0 else axis + len(self.shape)
+        if indices.dim() == 0:
+            output_shape = tuple(self.shape[:norm_axis] + self.shape[norm_axis + 1:]) or (1,)
+        else:
+            output_shape = (*self.shape[:norm_axis], *indices.shape, *self.shape[norm_axis + 1:])
+        out_vars = self._alloc_ids(_prod(output_shape) or 1)
+        layer_id = self._add_layer(
+            LayerKind.GATHER.value,
+            {"indices": indices, "axis": axis,
+             "input_shape": self.shape, "output_shape": output_shape},
+            self.prev_out, out_vars,
+        )
+        self.prev_out = out_vars
+        self.shape = output_shape
+        self._register_node(node.name, layer_id)
+
+    def _convert_OnnxMatMul(self, mod: nn.Module, node: fx.Node) -> None:
+        """OnnxMatMul (var × const_W): emitted as a DENSE layer with W.T as weight, no bias."""
+        args = [a for a in node.args if isinstance(a, fx.Node)]
+        x_node, w_node = args[0], args[1]
+        if x_node.name not in self.node_outputs or w_node.name in self.node_outputs:
+            raise NotImplementedError(
+                f"OnnxMatMul at {node.name}: only var × const_W supported (Wave 10)"
+            )
+        W = self._resolve_constant_tensor(w_node.name)
+        if W is None or W.dim() != 2:
+            raise ValueError(f"OnnxMatMul: expected 2D constant weight at {node.name}")
+        self.prev_out = self.node_outputs[x_node.name].copy()
+        self.shape = self.node_shapes[x_node.name]
+        in_features, out_features = int(W.shape[0]), int(W.shape[1])
+        if len(self.prev_out) != in_features:
+            raise ValueError(
+                f"OnnxMatMul at {node.name}: input size {len(self.prev_out)} != weight in_features {in_features}"
+            )
+        if self.shape and int(self.shape[-1]) == in_features:
+            output_shape = tuple(self.shape[:-1]) + (out_features,)
+        else:
+            output_shape = (1, out_features)
+        out_vars = self._alloc_ids(_prod(output_shape) or out_features)
+        layer_id = self._add_layer(
+            LayerKind.DENSE.value,
+            {"weight": W.t().contiguous().detach().clone().to(self.dtype),
+             "in_features": in_features, "out_features": out_features,
+             "input_shape": self.shape, "output_shape": output_shape},
+            self.prev_out, out_vars,
+        )
+        self.prev_out = out_vars
+        self.shape = output_shape
+        self._register_node(node.name, layer_id)
+
+    def _convert_OnnxSlice(self, mod: nn.Module, node: fx.Node) -> None:
+        """OnnxSlice: y = x[starts:ends:steps along axes]."""
+        if not self._get_predecessor_state(node):
+            raise ValueError(f"OnnxSlice: missing predecessor for {node.name}")
+        args = [a for a in node.args if isinstance(a, fx.Node)]
+        if len(args) < 3:
+            raise ValueError(f"OnnxSlice at {node.name}: need at least 3 args")
+        starts = self._resolve_slice_input_to_int_list(args[1].name)
+        ends = self._resolve_slice_input_to_int_list(args[2].name)
+        if starts is None or ends is None:
+            raise ValueError(f"OnnxSlice at {node.name}: cannot resolve starts/ends")
+        axes = (self._resolve_slice_input_to_int_list(args[3].name)
+                if len(args) > 3 else None) or list(range(len(starts)))
+        steps = (self._resolve_slice_input_to_int_list(args[4].name)
+                 if len(args) > 4 else None) or [1] * len(starts)
+        rank = len(self.shape)
+        n_starts: List[int] = []
+        n_ends: List[int] = []
+        n_axes: List[int] = []
+        output_shape = list(self.shape)
+        for s, e, ax, st in zip(starts, ends, axes, steps):
+            ax = int(ax) + rank if int(ax) < 0 else int(ax)
+            dim = int(self.shape[ax])
+            st = int(st)
+            if st == 0:
+                raise ValueError(f"OnnxSlice at {node.name}: zero step")
+            s = int(s) + dim if int(s) < 0 else int(s)
+            e = int(e) + dim if int(e) < 0 else int(e)
+            if st > 0:
+                s, e = min(max(s, 0), dim), min(max(e, 0), dim)
+            else:
+                s, e = min(max(s, -1), dim - 1), min(max(e, -1), dim - 1)
+            output_shape[ax] = max(0, len(range(s, e, st)))
+            n_starts.append(s)
+            n_ends.append(e)
+            n_axes.append(ax)
+        out_shape = tuple(output_shape)
+        out_vars = self._alloc_ids(_prod(out_shape) or 1)
+        layer_id = self._add_layer(
+            LayerKind.SLICE.value,
+            {"starts": n_starts, "ends": n_ends, "axes": n_axes,
+             "input_shape": self.shape, "output_shape": out_shape},
+            self.prev_out, out_vars,
+        )
+        self.prev_out = out_vars
+        self.shape = out_shape
+        self._register_node(node.name, layer_id)
+
+    def _convert_OnnxBinaryMathOperation(self, mod: nn.Module, node: fx.Node) -> None:
+        """Add/Sub/Mul/Div: var-var → ADD/SUB/MUL/DIV; var-const → BIAS/SCALE (or SCALE+BIAS)."""
+        op_raw = getattr(getattr(mod, 'math_op_function', None), '__name__', '').lower()
+        op = {'add': 'add', 'sub': 'sub', 'mul': 'mul',
+              '_onnx_div': 'div', 'div': 'div'}.get(op_raw)
+        if op is None:
+            raise NotImplementedError(f"OnnxBinaryMathOperation: unrecognised op '{op_raw}' at {node.name}")
+        args = [a for a in node.args if isinstance(a, fx.Node)]
+        x, y = args[0], args[1]
+        x_var = x.name in self.node_outputs
+        y_var = y.name in self.node_outputs
+
+        if x_var and y_var:
+            xv, yv = self.node_outputs[x.name], self.node_outputs[y.name]
+            xs, ys = self.node_shapes[x.name], self.node_shapes[y.name]
+            if len(xv) != len(yv):
+                raise NotImplementedError(
+                    f"Var-var '{op}' size mismatch ({len(xv)} vs {len(yv)}) at {node.name}"
+                )
+            kind = {'add': LayerKind.ADD, 'sub': LayerKind.SUB,
+                    'mul': LayerKind.MUL, 'div': LayerKind.DIV}[op]
+            out_shape = xs if _prod(xs) >= _prod(ys) else ys
+            out_vars = self._alloc_ids(len(xv))
+            layer_id = self._add_layer(
+                kind.value,
+                {"x_vars": xv, "y_vars": yv,
+                 "input_shape": xs, "output_shape": out_shape},
+                xv + yv, out_vars,
+            )
+            self.prev_out = out_vars
+            self.shape = out_shape
+            self._register_node(node.name, layer_id)
+            return
+
+        if x_var:
+            var_node, const_node, var_first = x, y, True
+        else:
+            var_node, const_node, var_first = y, x, False
+        const = self._resolve_constant_tensor(const_node.name)
+        if const is None:
+            raise ValueError(f"OnnxBinaryMathOperation: cannot resolve constant at {node.name}")
+        self.prev_out = self.node_outputs[var_node.name].copy()
+        self.shape = self.node_shapes[var_node.name]
+        size = len(self.prev_out)
+        c = self._broadcast_const_to_size(const, size)
+
+        def emit(kind: LayerKind, key: str, t: torch.Tensor, register: bool) -> None:
+            out = self._same_size_forward()
+            lid = self._add_layer(
+                kind.value,
+                {key: t, "input_shape": self.shape, "output_shape": self.shape},
+                self.prev_out, out,
+            )
+            self.prev_out = out
+            if register:
+                self._register_node(node.name, lid)
+
+        if op == 'add':
+            emit(LayerKind.BIAS, "c", c, register=True)
+        elif op == 'sub':
+            if var_first:
+                emit(LayerKind.BIAS, "c", (-c).contiguous(), register=True)
+            else:
+                emit(LayerKind.SCALE, "a", torch.full((size,), -1.0, dtype=self.dtype), register=False)
+                emit(LayerKind.BIAS, "c", c.contiguous(), register=True)
+        elif op == 'mul':
+            emit(LayerKind.SCALE, "a", c, register=True)
+        else:  # 'div'
+            if not var_first:
+                raise NotImplementedError(f"const/var Div at {node.name} (Wave 10)")
+            emit(LayerKind.SCALE, "a", (1.0 / c).to(self.dtype), register=True)
+
+    def _convert_OnnxFunction(self, mod: nn.Module, node: fx.Node) -> None:
+        """OnnxFunction: dispatch by inner-function name (sign / abs / tanh)."""
+        func_name = getattr(getattr(mod, 'function', None), '__name__', '').lower()
+        kind = {'sign': LayerKind.SIGN, 'abs': LayerKind.ABS,
+                'tanh': LayerKind.TANH}.get(func_name)
+        if kind is None:
+            raise NotImplementedError(f"OnnxFunction({func_name}) at {node.name} (Wave 10)")
+        if not self._get_predecessor_state(node):
+            raise ValueError(f"OnnxFunction: missing predecessor for {node.name}")
+        out_vars = self._same_size_forward()
+        layer_id = self._add_layer(
+            kind.value,
+            {"input_shape": self.shape, "output_shape": self.shape},
+            self.prev_out, out_vars,
+        )
+        self.prev_out = out_vars
+        self._register_node(node.name, layer_id)
+
     # -------------------------------------------------------------------------
     # FX Function Handlers
     # -------------------------------------------------------------------------

@@ -133,6 +133,8 @@ class LayerKind(str, enum.Enum):
     MIN = "MIN"
     MAX = "MAX"
     MEAN = "MEAN"  # Reduction: y = x.mean(dim=..., keepdim=...)
+    REDUCE_SUM = "REDUCE_SUM"  # Reduction: y = x.sum(dim=..., keepdim=...)
+    SIGN = "SIGN"  # Element-wise sign: y = sign(x) ∈ {-1, 0, 1}
     SCALE = "SCALE"  # Element-wise multiplication by constant: y = a * x
     BIAS = "BIAS"  # Element-wise addition of constant: y = x + c
 
@@ -477,7 +479,10 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     LayerKind.SUB.value: {
         "params_required": [],
-        "params_optional": ["broadcast", "axis", "x_vars", "y_vars"],
+        "params_optional": [
+            "broadcast", "axis", "x_vars", "y_vars",
+            "input_shape", "output_shape",
+        ],
     },
     LayerKind.MUL.value: {
         "params_required": [],
@@ -496,7 +501,10 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     LayerKind.DIV.value: {
         "params_required": [],
-        "params_optional": ["broadcast", "axis", "x_vars", "y_vars"],
+        "params_optional": [
+            "broadcast", "axis", "x_vars", "y_vars",
+            "input_shape", "output_shape",
+        ],
     },
     LayerKind.POW.value: {
         "params_required": [],
@@ -518,6 +526,19 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
             "input_shape",
             "output_shape",
         ],
+    },
+    LayerKind.REDUCE_SUM.value: {
+        "params_required": [],
+        "params_optional": [
+            "axes",
+            "keepdims",
+            "input_shape",
+            "output_shape",
+        ],
+    },
+    LayerKind.SIGN.value: {
+        "params_required": [],
+        "params_optional": ["input_shape", "output_shape"],
     },
     LayerKind.SCALE.value: {
         "params_required": ["a"],
