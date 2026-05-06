@@ -137,6 +137,12 @@ class LayerKind(str, enum.Enum):
     SIGN = "SIGN"  # Element-wise sign: y = sign(x) ∈ {-1, 0, 1}
     SCALE = "SCALE"  # Element-wise multiplication by constant: y = a * x
     BIAS = "BIAS"  # Element-wise addition of constant: y = x + c
+    CONSTANT = "CONSTANT"  # Materialise an ONNX initializer tensor as point-bounded vars
+    MATMUL = "MATMUL"  # Bilinear matrix multiplication of two variable operands
+    COMPARE = "COMPARE"  # Element-wise comparison (eq/ne/lt/le/gt/ge) producing bool-typed vars
+    WHERE = "WHERE"  # Conditional select: y = where(cond, x, y_else)
+    SCATTER_ND = "SCATTER_ND"  # Write values into a tensor at given N-D indices
+    ARG_EXTREMUM = "ARG_EXTREMUM"  # argmax / argmin along an axis
 
     # Tensor plumbing
     CONCAT = "CONCAT"
@@ -512,11 +518,17 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     LayerKind.MIN.value: {
         "params_required": [],
-        "params_optional": ["broadcast", "axis", "x_vars", "y_vars", "y_vars_list"],
+        "params_optional": [
+            "broadcast", "axis", "x_vars", "y_vars", "y_vars_list",
+            "input_shape", "output_shape",
+        ],
     },
     LayerKind.MAX.value: {
         "params_required": [],
-        "params_optional": ["broadcast", "axis", "x_vars", "y_vars", "y_vars_list"],
+        "params_optional": [
+            "broadcast", "axis", "x_vars", "y_vars", "y_vars_list",
+            "input_shape", "output_shape",
+        ],
     },
     LayerKind.MEAN.value: {
         "params_required": [],
@@ -566,6 +578,34 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
             "batchnorm_kwargs",
             "batchnorm_state",
         ],
+    },
+    LayerKind.CONSTANT.value: {
+        "params_required": ["value"],
+        "params_optional": ["input_shape", "output_shape"],
+    },
+    LayerKind.MATMUL.value: {
+        "params_required": [],
+        "params_optional": [
+            "x_vars", "y_vars",
+            "x_shape", "y_shape",
+            "input_shape", "output_shape",
+        ],
+    },
+    LayerKind.COMPARE.value: {
+        "params_required": ["op"],
+        "params_optional": ["x_vars", "y_vars", "input_shape", "output_shape"],
+    },
+    LayerKind.WHERE.value: {
+        "params_required": [],
+        "params_optional": ["cond_vars", "x_vars", "y_vars", "input_shape", "output_shape"],
+    },
+    LayerKind.SCATTER_ND.value: {
+        "params_required": [],
+        "params_optional": ["data_vars", "indices_vars", "updates_vars", "input_shape", "output_shape"],
+    },
+    LayerKind.ARG_EXTREMUM.value: {
+        "params_required": ["op"],
+        "params_optional": ["axis", "keepdims", "input_shape", "output_shape"],
     },
     # =====================
     # Tensor plumbing

@@ -27,6 +27,28 @@ class ONNXConversionError(Exception):
     pass
 
 
+def _preprocess_onnx_for_onnx2torch(onnx_model):
+    """Workarounds for onnx2torch quirks. Called on both main and retry paths.
+
+    1. Symbolic batch dim (vit_2023): set first ``dim_value=0`` → 1. Must
+       ``ClearField('dim_param')`` first since ``dim_value`` / ``dim_param``
+       are a protobuf oneof. Only normalise the first dim; leave variable
+       spatial dims alone so we don't mask real shape-concreteness errors.
+    2. Empty Clip max input (cctsdb_yolo_2023): trim trailing empty input
+       slots so onnx2torch's clip.py doesn't see them as present.
+    """
+    for inp in onnx_model.graph.input:
+        dims = list(inp.type.tensor_type.shape.dim)
+        if dims and dims[0].dim_value == 0:
+            dims[0].ClearField('dim_param')
+            dims[0].dim_value = 1
+    for node in onnx_model.graph.node:
+        if node.op_type == 'Clip':
+            while len(node.input) > 1 and not node.input[-1]:
+                del node.input[-1]
+    return onnx_model
+
+
 def convert_onnx_to_pytorch(
     onnx_path: Path,
     simplify: bool = True
@@ -66,6 +88,8 @@ def convert_onnx_to_pytorch(
         except Exception as e:
             logger.warning(f"Opset upgrade failed ({e}), proceeding with original opset")
         
+        onnx_model = _preprocess_onnx_for_onnx2torch(onnx_model)
+
         # Optionally simplify
         if simplify:
             try:
@@ -103,6 +127,10 @@ def convert_onnx_to_pytorch(
                     f"retrying with simplify=False"
                 )
                 raw_model = onnx.load(str(onnx_path))
+                # Apply the same preprocessing here too -- without it, the
+                # fallback can hit the very issues the main path's
+                # _preprocess_onnx_for_onnx2torch was added to fix.
+                raw_model = _preprocess_onnx_for_onnx2torch(raw_model)
                 try:
                     from onnx import shape_inference
                     raw_model = shape_inference.infer_shapes(raw_model)
