@@ -85,6 +85,16 @@ class IntervalTF(TransferFunction):
         "MIN": lambda L, bounds, tf: tf_min(L, tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before)),
         LayerKind.SQUARE.value: lambda L, bounds, tf: tf_square(L, bounds),
         LayerKind.POWER.value: lambda L, bounds, tf: tf_power(L, bounds),
+        LayerKind.SIGN.value: lambda L, bounds, tf: tf_sign(L, bounds),
+        LayerKind.REDUCE_SUM.value: lambda L, bounds, tf: tf_reduce_sum(L, bounds),
+        LayerKind.CONSTANT.value: lambda L, bounds, tf: tf_constant(L, bounds),
+        LayerKind.COMPARE.value: lambda L, bounds, tf: tf_compare(L,
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1)),
+        LayerKind.WHERE.value: lambda L, bounds, tf: tf_where(L,
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1),
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 2)),
         
         # Tensor operations
         "RESHAPE": lambda L, bounds, tf: tf_reshape(L, bounds),

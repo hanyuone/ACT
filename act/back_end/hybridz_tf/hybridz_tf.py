@@ -74,6 +74,11 @@ class HybridzTF(TransferFunction):
         LayerKind.SOFTSIGN.value: lambda L, b, tf: interval_mlp.tf_softsign(L, b),
         LayerKind.SQUARE.value: lambda L, b, tf: interval_mlp.tf_square(L, b),
         LayerKind.POWER.value: lambda L, b, tf: interval_mlp.tf_power(L, b),
+        LayerKind.SIGN.value: lambda L, b, tf: hz_mlp.tf_sign(L, b, tf),
+        LayerKind.REDUCE_SUM.value: lambda L, b, tf: hz_mlp.tf_reduce_sum(L, b, tf),
+        LayerKind.CONSTANT.value: lambda L, b, tf: hz_mlp.tf_constant(L, b, tf),
+        LayerKind.COMPARE.value: lambda L, b, tf: hz_mlp.tf_compare(L, b, tf),
+        LayerKind.WHERE.value: lambda L, b, tf: hz_mlp.tf_where(L, b, tf),
         LayerKind.MAX.value: lambda L, b, tf: interval_mlp.tf_max(
             L, tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before)
         ),

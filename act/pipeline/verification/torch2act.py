@@ -174,14 +174,9 @@ class _LayerGraphBuilder:
     # tracks what conversion can produce without lying about end-to-end
     # readiness. Update when a downstream component gains support.
     _UNSUPPORTED_DOWNSTREAM: ClassVar[frozenset] = frozenset({
-        LayerKind.CONSTANT.value,
         LayerKind.MATMUL.value,
-        LayerKind.COMPARE.value,
-        LayerKind.WHERE.value,
         LayerKind.SCATTER_ND.value,
         LayerKind.ARG_EXTREMUM.value,
-        LayerKind.SIGN.value,
-        LayerKind.REDUCE_SUM.value,
         LayerKind.UPSAMPLE.value,
     })
     

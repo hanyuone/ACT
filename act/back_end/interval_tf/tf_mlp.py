@@ -195,6 +195,85 @@ def tf_concat(L: Layer, Bs: List[Bounds]) -> Fact:
     B=Bounds(torch.cat([b.lb for b in Bs],0), torch.cat([b.ub for b in Bs],0))
     C=ConSet(); C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
+def tf_constant(L: Layer, Bin: Bounds) -> Fact:
+    val = L.params["value"].flatten()
+    B = Bounds(val.clone(), val.clone())
+    C = ConSet(); C.add_box(L.id, L.out_vars, B)
+    return Fact(B, C)
+
+def tf_sign(L: Layer, Bin: Bounds) -> Fact:
+    l, u = Bin.lb, Bin.ub
+    lb = torch.sign(l)
+    ub = torch.sign(u)
+    B = Bounds(lb, ub)
+    C = ConSet(); C.add_box(L.id, L.out_vars, B)
+    return Fact(B, C)
+
+def _bcast(b: torch.Tensor, n: int) -> torch.Tensor:
+    if b.numel() == n: return b
+    if b.numel() == 1: return b.expand(n)
+    if n % b.numel() == 0: return b.repeat(n // b.numel())
+    raise ValueError(f"COMPARE/WHERE bcast: cannot align numel {b.numel()} -> {n}")
+
+
+def tf_compare(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
+    op = L.params["op"]
+    n = len(L.out_vars)
+    lb_x, ub_x = _bcast(Bx.lb, n), _bcast(Bx.ub, n)
+    lb_y, ub_y = _bcast(By.lb, n), _bcast(By.ub, n)
+    if op == "lt":
+        defin_t, defin_f = ub_x < lb_y, lb_x >= ub_y
+    elif op == "le":
+        defin_t, defin_f = ub_x <= lb_y, lb_x > ub_y
+    elif op == "gt":
+        defin_t, defin_f = lb_x > ub_y, ub_x <= lb_y
+    elif op == "ge":
+        defin_t, defin_f = lb_x >= ub_y, ub_x < lb_y
+    elif op == "eq":
+        is_pt = (lb_x == ub_x) & (lb_y == ub_y)
+        defin_t = is_pt & (lb_x == lb_y)
+        defin_f = (ub_x < lb_y) | (lb_x > ub_y)
+    elif op == "ne":
+        is_pt = (lb_x == ub_x) & (lb_y == ub_y)
+        defin_t = (ub_x < lb_y) | (lb_x > ub_y)
+        defin_f = is_pt & (lb_x == lb_y)
+    else:
+        raise ValueError(f"COMPARE: unknown op '{op}'")
+    z, o = torch.zeros_like(lb_x), torch.ones_like(lb_x)
+    lb = torch.where(defin_t, o, z)
+    ub = torch.where(defin_f, z, o)
+    B = Bounds(lb, ub); C = ConSet(); C.add_box(L.id, L.out_vars, B)
+    return Fact(B, C)
+
+
+def tf_where(L: Layer, Bcond: Bounds, Bx: Bounds, By: Bounds) -> Fact:
+    n = len(L.out_vars)
+    cond_lb, cond_ub = _bcast(Bcond.lb, n), _bcast(Bcond.ub, n)
+    lb_x, ub_x = _bcast(Bx.lb, n), _bcast(Bx.ub, n)
+    lb_y, ub_y = _bcast(By.lb, n), _bcast(By.ub, n)
+    cond_true = cond_lb >= 0.5
+    cond_false = cond_ub < 0.5
+    lb = torch.where(cond_true, lb_x, torch.where(cond_false, lb_y, torch.minimum(lb_x, lb_y)))
+    ub = torch.where(cond_true, ub_x, torch.where(cond_false, ub_y, torch.maximum(ub_x, ub_y)))
+    B = Bounds(lb, ub); C = ConSet(); C.add_box(L.id, L.out_vars, B)
+    return Fact(B, C)
+
+
+def tf_reduce_sum(L: Layer, Bin: Bounds) -> Fact:
+    axes = L.params.get("axes")
+    keepdims = bool(L.params.get("keepdims", 0))
+    in_shape = L.params.get("input_shape")
+    lb_in, ub_in = Bin.lb, Bin.ub
+    if in_shape is not None and len(in_shape) > 0:
+        lb_in = lb_in.view(*in_shape)
+        ub_in = ub_in.view(*in_shape)
+    dim = tuple(int(a) for a in axes) if axes else tuple(range(lb_in.dim()))
+    lb_out = lb_in.sum(dim=dim, keepdim=keepdims)
+    ub_out = ub_in.sum(dim=dim, keepdim=keepdims)
+    B = Bounds(lb_out.reshape(-1), ub_out.reshape(-1))
+    C = ConSet(); C.add_box(L.id, L.out_vars, B)
+    return Fact(B, C)
+
 def tf_bn(L: Layer, Bin: Bounds) -> Fact:
     A,c=L.params["A"],L.params["c"]
     lb=torch.where(A>=0, A*Bin.lb+c, A*Bin.ub+c); ub=torch.where(A>=0, A*Bin.ub+c, A*Bin.lb+c)

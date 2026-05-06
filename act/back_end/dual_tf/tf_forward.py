@@ -132,6 +132,90 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
             
         elif kind in [LayerKind.ASSERT.value, "ASSERT", "TRANSPOSE", "SQUEEZE", "UNSQUEEZE"]:
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
+
+        elif kind in [LayerKind.CONSTANT.value, "CONSTANT"]:
+            val = layer.params["value"].flatten().to(device=device, dtype=dtype)
+            lb, ub = val.clone(), val.clone()
+            bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
+            A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
+
+        elif kind in [LayerKind.SIGN.value, "SIGN"]:
+            lb = torch.sign(lb)
+            ub = torch.sign(ub)
+            bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
+            A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
+
+        elif kind in [LayerKind.COMPARE.value, "COMPARE"]:
+            pred_ids = list(net.preds.get(lid, []) or [])
+            if len(pred_ids) >= 2 and all(p in bounds_dict for p in pred_ids[:2]):
+                op = layer.params["op"]
+                n_out = len(layer.out_vars)
+                def _bc(t, n):
+                    if t.numel() == n: return t
+                    if t.numel() == 1: return t.expand(n)
+                    if n % t.numel() == 0: return t.repeat(n // t.numel())
+                    return t[:n]
+                lb_x = _bc(bounds_dict[pred_ids[0]].lb.flatten(), n_out)
+                ub_x = _bc(bounds_dict[pred_ids[0]].ub.flatten(), n_out)
+                lb_y = _bc(bounds_dict[pred_ids[1]].lb.flatten(), n_out)
+                ub_y = _bc(bounds_dict[pred_ids[1]].ub.flatten(), n_out)
+                if op == "lt":
+                    dt, df = ub_x < lb_y, lb_x >= ub_y
+                elif op == "le":
+                    dt, df = ub_x <= lb_y, lb_x > ub_y
+                elif op == "gt":
+                    dt, df = lb_x > ub_y, ub_x <= lb_y
+                elif op == "ge":
+                    dt, df = lb_x >= ub_y, ub_x < lb_y
+                elif op == "eq":
+                    pt = (lb_x == ub_x) & (lb_y == ub_y)
+                    dt, df = pt & (lb_x == lb_y), (ub_x < lb_y) | (lb_x > ub_y)
+                elif op == "ne":
+                    pt = (lb_x == ub_x) & (lb_y == ub_y)
+                    dt, df = (ub_x < lb_y) | (lb_x > ub_y), pt & (lb_x == lb_y)
+                else:
+                    raise ValueError(f"COMPARE forward: unknown op '{op}'")
+                z, o = torch.zeros_like(lb_x), torch.ones_like(lb_x)
+                lb = torch.where(dt, o, z)
+                ub = torch.where(df, z, o)
+            bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
+            A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
+
+        elif kind in [LayerKind.WHERE.value, "WHERE"]:
+            pred_ids = list(net.preds.get(lid, []) or [])
+            if len(pred_ids) >= 3 and all(p in bounds_dict for p in pred_ids[:3]):
+                n_out = len(layer.out_vars)
+                def _bc(t, n):
+                    if t.numel() == n: return t
+                    if t.numel() == 1: return t.expand(n)
+                    if n % t.numel() == 0: return t.repeat(n // t.numel())
+                    return t[:n]
+                cl = _bc(bounds_dict[pred_ids[0]].lb.flatten(), n_out)
+                cu = _bc(bounds_dict[pred_ids[0]].ub.flatten(), n_out)
+                xl = _bc(bounds_dict[pred_ids[1]].lb.flatten(), n_out)
+                xu = _bc(bounds_dict[pred_ids[1]].ub.flatten(), n_out)
+                yl = _bc(bounds_dict[pred_ids[2]].lb.flatten(), n_out)
+                yu = _bc(bounds_dict[pred_ids[2]].ub.flatten(), n_out)
+                ct = cl >= 0.5
+                cf = cu < 0.5
+                lb = torch.where(ct, xl, torch.where(cf, yl, torch.minimum(xl, yl)))
+                ub = torch.where(ct, xu, torch.where(cf, yu, torch.maximum(xu, yu)))
+            bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
+            A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
+
+        elif kind in [LayerKind.REDUCE_SUM.value, "REDUCE_SUM"]:
+            axes = layer.params.get("axes")
+            keepdims = bool(layer.params.get("keepdims", 0))
+            in_shape = layer.params.get("input_shape")
+            lb_in, ub_in = lb, ub
+            if in_shape is not None and len(in_shape) > 0:
+                lb_in = lb_in.view(*in_shape)
+                ub_in = ub_in.view(*in_shape)
+            dim = tuple(int(a) for a in axes) if axes else tuple(range(lb_in.dim()))
+            lb = lb_in.sum(dim=dim, keepdim=keepdims).reshape(-1)
+            ub = ub_in.sum(dim=dim, keepdim=keepdims).reshape(-1)
+            bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
+            A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
             
         elif kind == "ADD":
             # ADD layer: z = x + y (+ bias if present)
@@ -172,9 +256,11 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
             
         else:
-            import warnings
-            warnings.warn(f"forward_bounds: Unknown layer '{kind}', passing through")
-            bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
+            raise NotImplementedError(
+                f"DualTF.compute_forward_bounds: layer kind '{kind}' (id={lid}) has no "
+                f"forward handler. Implement an `elif` branch in tf_forward.py or remove "
+                f"the layer from the network."
+            )
     
     return bounds_dict
 

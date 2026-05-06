@@ -46,6 +46,11 @@ class DualTF(TransferFunction):
         "SIGMOID": "_backward_sigmoid", "TANH": "_backward_tanh",
         # Multi-input operations (residual connections)
         "ADD": "_backward_add",
+        LayerKind.CONSTANT.value: "_backward_identity",
+        LayerKind.SIGN.value: "_backward_identity",
+        LayerKind.REDUCE_SUM.value: "_backward_identity",
+        LayerKind.COMPARE.value: "_backward_identity",
+        LayerKind.WHERE.value: "_backward_identity",
     }
     
     def __init__(self):
@@ -124,8 +129,12 @@ class DualTF(TransferFunction):
             
             handler_name = self._BACKWARD_REGISTRY.get(k)
             if handler_name is None:
-                import warnings; warnings.warn(f"DualTF: unknown layer '{k}', using identity")
-                handler_name = "_backward_identity"
+                raise NotImplementedError(
+                    f"DualTF.compute_bound: layer kind '{k}' (id={layer.id}) has no "
+                    f"backward handler. Add an entry to DualTF._BACKWARD_REGISTRY and "
+                    f"implement the corresponding _backward_* method, or remove the "
+                    f"layer from the network."
+                )
             
             nu, contrib = getattr(self, handler_name)(layer, nu)
             obj = obj + contrib

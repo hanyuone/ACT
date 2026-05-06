@@ -118,6 +118,8 @@ class ActGraphModule(nn.Module):
                 self.register_buffer(f"_scale_a_{lid}", layer.params["a"].detach().clone())
             elif kind == LayerKind.BIAS.value and isinstance(layer.params.get("c"), torch.Tensor):
                 self.register_buffer(f"_bias_c_{lid}", layer.params["c"].detach().clone())
+            elif kind == LayerKind.CONSTANT.value and isinstance(layer.params.get("value"), torch.Tensor):
+                self.register_buffer(f"_const_value_{lid}", layer.params["value"].detach().clone())
 
     def forward(self, x):
         activations = {}
@@ -251,10 +253,49 @@ class ActGraphModule(nn.Module):
             for t in inputs[1:]:
                 out = torch.minimum(out, t)
             return out
+        if kind == LayerKind.CONSTANT.value:
+            val = getattr(self, f"_const_value_{layer.id}")
+            target_shape = layer.params.get("output_shape") or layer.params.get("input_shape")
+            if target_shape is not None:
+                return val.reshape(*target_shape).clone()
+            return val.clone()
+        if kind == LayerKind.SIGN.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: SIGN layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            return torch.sign(inputs[0])
+        if kind == LayerKind.REDUCE_SUM.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: REDUCE_SUM layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            axes = layer.params.get("axes")
+            keepdims = bool(layer.params.get("keepdims", 0))
+            if axes is None:
+                return torch.sum(inputs[0], keepdim=keepdims)
+            return torch.sum(inputs[0], dim=tuple(int(a) for a in axes), keepdim=keepdims)
+        if kind == LayerKind.COMPARE.value:
+            if len(inputs) != 2:
+                raise RuntimeError(
+                    f"ActGraphModule: COMPARE layer {layer.id} expects exactly 2 inputs, "
+                    f"got {len(inputs)}."
+                )
+            op = layer.params["op"]
+            return getattr(torch, op)(inputs[0], inputs[1]).to(inputs[0].dtype)
+        if kind == LayerKind.WHERE.value:
+            if len(inputs) != 3:
+                raise RuntimeError(
+                    f"ActGraphModule: WHERE layer {layer.id} expects exactly 3 inputs, "
+                    f"got {len(inputs)}."
+                )
+            return torch.where(inputs[0].bool(), inputs[1], inputs[2])
         raise NotImplementedError(
             f"ActGraphModule: functional layer kind '{kind}' (id={layer.id}) not supported. "
             f"torch2act only emits ADD, CONCAT, MUL, SCALE, BIAS, TRANSPOSE, UNSQUEEZE, "
-            f"SQUEEZE, RESHAPE, MAX, MIN functionally."
+            f"SQUEEZE, RESHAPE, MAX, MIN, CONSTANT, SIGN, REDUCE_SUM, COMPARE, WHERE functionally."
         )
 
 
