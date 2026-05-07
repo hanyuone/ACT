@@ -90,9 +90,15 @@ def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple
             Bjoin = Bounds(lb=first_bounds.lb.clone(), ub=first_bounds.ub.clone())
             Cjoin = ConSet()
             for con in after[preds_list[0]].cons: Cjoin.replace(con)
-            # Join with remaining predecessors (for DAG merge points)
+            # Join with remaining predecessors when shapes match (DAG merge points).
+            # Multi-input ops with heterogeneous predecessor shapes (MATMUL, CONCAT,
+            # SCATTER_ND, etc.) ignore Bin and pull each predecessor explicitly via
+            # get_predecessor_bounds; the join is meaningless for them so we skip
+            # rather than crash.
             for pid in preds_list[1:]:
-                Bjoin = box_join(Bjoin, after[pid].bounds)
+                pb = after[pid].bounds
+                if pb.lb.shape == Bjoin.lb.shape:
+                    Bjoin = box_join(Bjoin, pb)
                 for con in after[pid].cons: Cjoin.replace(con)
             before[lid] = Fact(Bjoin, Cjoin)
 

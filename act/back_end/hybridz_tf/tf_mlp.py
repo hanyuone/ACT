@@ -236,6 +236,35 @@ def tf_where(L, bounds, tf):
     )
 
 
+def tf_matmul(L, bounds, tf):
+    tf._hz_cache.pop(L.id, None)
+    return interval.tf_matmul(
+        L,
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1),
+    )
+
+
+def tf_arg_extremum(L, bounds, tf):
+    tf._hz_cache.pop(L.id, None)
+    return interval.tf_arg_extremum(L, bounds)
+
+
+def tf_upsample(L, bounds, tf):
+    tf._hz_cache.pop(L.id, None)
+    return interval.tf_upsample(L, bounds)
+
+
+def tf_scatter_nd(L, bounds, tf):
+    tf._hz_cache.pop(L.id, None)
+    return interval.tf_scatter_nd(
+        L,
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1),
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 2),
+    )
+
+
 def tf_reduce_sum(L, bounds, tf):
     hz_in = tf._hz_cache.get(L.id)
     fact = interval.tf_reduce_sum(L, bounds)

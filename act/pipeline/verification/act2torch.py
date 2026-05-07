@@ -292,10 +292,68 @@ class ActGraphModule(nn.Module):
                     f"got {len(inputs)}."
                 )
             return torch.where(inputs[0].bool(), inputs[1], inputs[2])
+        if kind == LayerKind.MATMUL.value:
+            if len(inputs) != 2:
+                raise RuntimeError(
+                    f"ActGraphModule: MATMUL layer {layer.id} expects exactly 2 inputs, "
+                    f"got {len(inputs)}."
+                )
+            return torch.matmul(inputs[0], inputs[1])
+        if kind == LayerKind.ARG_EXTREMUM.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: ARG_EXTREMUM layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            op = layer.params["op"]
+            axis = int(layer.params.get("axis", 0))
+            keepdims = bool(layer.params.get("keepdims", 0))
+            fn = torch.argmax if op == "argmax" else torch.argmin
+            return fn(inputs[0], dim=axis, keepdim=keepdims).to(inputs[0].dtype)
+        if kind == LayerKind.UPSAMPLE.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: UPSAMPLE layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            import torch.nn.functional as F
+            mode = str(layer.params.get("mode", "nearest")).lower()
+            scale_factor = layer.params.get("scale_factor")
+            size = layer.params.get("size")
+            kwargs = {"mode": mode}
+            if mode != "nearest" and layer.params.get("align_corners") is not None:
+                kwargs["align_corners"] = bool(layer.params["align_corners"])
+            if size is not None:
+                kwargs["size"] = tuple(int(s) for s in size)
+            elif scale_factor is not None:
+                kwargs["scale_factor"] = tuple(float(s) for s in scale_factor)
+            return F.interpolate(inputs[0], **kwargs)
+        if kind == LayerKind.EXPAND.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: EXPAND layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            target = layer.params.get("output_shape") or layer.params.get("shape")
+            if target is None:
+                return inputs[0].clone()
+            return inputs[0].broadcast_to(tuple(int(d) for d in target)).clone()
+        if kind == LayerKind.SCATTER_ND.value:
+            if len(inputs) != 3:
+                raise RuntimeError(
+                    f"ActGraphModule: SCATTER_ND layer {layer.id} expects exactly 3 inputs, "
+                    f"got {len(inputs)}."
+                )
+            data, idx, upd = inputs
+            out = data.clone()
+            idx_long = idx.long()
+            if idx_long.dim() == 1:
+                idx_long = idx_long.unsqueeze(-1)
+            indices_per_dim = tuple(idx_long[..., d] for d in range(idx_long.shape[-1]))
+            out.index_put_(indices_per_dim, upd, accumulate=False)
+            return out
         raise NotImplementedError(
-            f"ActGraphModule: functional layer kind '{kind}' (id={layer.id}) not supported. "
-            f"torch2act only emits ADD, CONCAT, MUL, SCALE, BIAS, TRANSPOSE, UNSQUEEZE, "
-            f"SQUEEZE, RESHAPE, MAX, MIN, CONSTANT, SIGN, REDUCE_SUM, COMPARE, WHERE functionally."
+            f"ActGraphModule: functional layer kind '{kind}' (id={layer.id}) not supported."
         )
 
 

@@ -203,6 +203,90 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
 
+        elif kind in [LayerKind.MATMUL.value, "MATMUL"]:
+            pred_ids = list(net.preds.get(lid, []) or [])
+            if len(pred_ids) >= 2 and all(p in bounds_dict for p in pred_ids[:2]):
+                x_shape = tuple(layer.params["x_shape"])
+                y_shape = tuple(layer.params["y_shape"])
+                A_lb = bounds_dict[pred_ids[0]].lb.view(*x_shape).unsqueeze(-1)
+                A_ub = bounds_dict[pred_ids[0]].ub.view(*x_shape).unsqueeze(-1)
+                B_lb = bounds_dict[pred_ids[1]].lb.view(*y_shape).unsqueeze(-3)
+                B_ub = bounds_dict[pred_ids[1]].ub.view(*y_shape).unsqueeze(-3)
+                c1, c2 = A_lb * B_lb, A_lb * B_ub
+                c3, c4 = A_ub * B_lb, A_ub * B_ub
+                lo = torch.minimum(torch.minimum(c1, c2), torch.minimum(c3, c4))
+                hi = torch.maximum(torch.maximum(c1, c2), torch.maximum(c3, c4))
+                lb = lo.sum(dim=-2).reshape(-1)
+                ub = hi.sum(dim=-2).reshape(-1)
+            bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
+            A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
+
+        elif kind in [LayerKind.ARG_EXTREMUM.value, "ARG_EXTREMUM"]:
+            in_shape = layer.params.get("input_shape")
+            axis = int(layer.params.get("axis", 0))
+            if in_shape is not None and axis < 0:
+                axis += len(in_shape)
+            axis_dim = int(in_shape[axis]) if in_shape else 1
+            n_out = len(layer.out_vars)
+            lb = torch.zeros(n_out, dtype=dtype, device=device)
+            ub = torch.full((n_out,), float(max(0, axis_dim - 1)), dtype=dtype, device=device)
+            bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
+            A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
+
+        elif kind in [LayerKind.UPSAMPLE.value, "UPSAMPLE"]:
+            in_shape = layer.params.get("input_shape")
+            out_shape = layer.params.get("output_shape")
+            mode = str(layer.params.get("mode", "nearest")).lower()
+            align_corners = layer.params.get("align_corners")
+            if in_shape is not None and out_shape is not None:
+                in_shape = tuple(int(d) for d in in_shape)
+                out_shape = tuple(int(d) for d in out_shape)
+                spatial = len(in_shape) - 2
+                if spatial < 1:
+                    in_shape = (1, 1) + in_shape
+                    out_shape = (1, 1) + out_shape
+                if mode == "nearest":
+                    torch_mode = "nearest"; ac_kwarg = {}
+                else:
+                    torch_mode = mode if mode in ("bilinear", "trilinear", "bicubic") else (
+                        "bilinear" if len(in_shape) == 4 else "trilinear")
+                    ac_kwarg = {"align_corners": bool(align_corners) if align_corners is not None else False}
+                tgt = out_shape[-(len(in_shape) - 2):]
+                lb = F.interpolate(lb.view(*in_shape), size=tgt, mode=torch_mode, **ac_kwarg).reshape(-1)
+                ub = F.interpolate(ub.view(*in_shape), size=tgt, mode=torch_mode, **ac_kwarg).reshape(-1)
+            bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
+            A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
+
+        elif kind in [LayerKind.EXPAND.value, "EXPAND"]:
+            in_shape = layer.params.get("input_shape")
+            out_shape = layer.params.get("output_shape") or layer.params.get("shape")
+            if in_shape is not None and out_shape is not None:
+                in_shape = tuple(int(d) for d in in_shape)
+                out_shape = tuple(int(d) for d in out_shape)
+                lb = lb.view(*in_shape).broadcast_to(out_shape).reshape(-1).clone()
+                ub = ub.view(*in_shape).broadcast_to(out_shape).reshape(-1).clone()
+            bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
+            A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
+
+        elif kind in [LayerKind.SCATTER_ND.value, "SCATTER_ND"]:
+            pred_ids = list(net.preds.get(lid, []) or [])
+            if len(pred_ids) >= 3 and all(p in bounds_dict for p in pred_ids[:3]):
+                d_lb = bounds_dict[pred_ids[0]].lb.flatten()
+                d_ub = bounds_dict[pred_ids[0]].ub.flatten()
+                u_lb = bounds_dict[pred_ids[2]].lb.flatten()
+                u_ub = bounds_dict[pred_ids[2]].ub.flatten()
+                n_out = len(layer.out_vars)
+                if d_lb.numel() != n_out:
+                    d_lb = d_lb[:n_out] if d_lb.numel() > n_out else d_lb.repeat((n_out + d_lb.numel() - 1) // d_lb.numel())[:n_out]
+                    d_ub = d_ub[:n_out] if d_ub.numel() > n_out else d_ub.repeat((n_out + d_ub.numel() - 1) // d_ub.numel())[:n_out]
+                if u_lb.numel() > 0:
+                    lb = torch.minimum(d_lb, u_lb.min().expand_as(d_lb))
+                    ub = torch.maximum(d_ub, u_ub.max().expand_as(d_ub))
+                else:
+                    lb, ub = d_lb, d_ub
+            bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
+            A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
+
         elif kind in [LayerKind.REDUCE_SUM.value, "REDUCE_SUM"]:
             axes = layer.params.get("axes")
             keepdims = bool(layer.params.get("keepdims", 0))

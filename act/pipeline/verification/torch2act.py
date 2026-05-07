@@ -154,32 +154,8 @@ class _LayerGraphBuilder:
         # Build and validate graph structure
         preds, succs = self._build_preds_succs()
 
-        # Capability gate: warn (don't fail) when the produced IR contains kinds
-        # the verifier / ACT->Torch path doesn't yet handle. These benchmarks
-        # convert correctly but later stages will raise NotImplementedError or
-        # silently skip. Surfacing here gives users one place to see the gap.
-        unsupported = sorted({l.kind for l in self.layers if l.kind in self._UNSUPPORTED_DOWNSTREAM})
-        if unsupported:
-            import logging
-            logging.getLogger(__name__).warning(
-                "ACT Net contains LayerKinds not yet supported in TF/exporter/act2torch: %s. "
-                "Conversion succeeded but verify_once() and ACT->Torch round-trip will fail "
-                "on these layers (Wave 10).", unsupported,
-            )
         return self.layers, preds, succs
 
-    # LayerKinds that are emitted by this builder but lack support in
-    # interval_tf / hybridz_tf / dual_tf, _ACT_TO_TORCH, ActGraphModule's
-    # functional dispatch, or SUPPORTED_EXPORT_OPS. Kept here so the gate
-    # tracks what conversion can produce without lying about end-to-end
-    # readiness. Update when a downstream component gains support.
-    _UNSUPPORTED_DOWNSTREAM: ClassVar[frozenset] = frozenset({
-        LayerKind.MATMUL.value,
-        LayerKind.SCATTER_ND.value,
-        LayerKind.ARG_EXTREMUM.value,
-        LayerKind.UPSAMPLE.value,
-    })
-    
     # -------------------------------------------------------------------------
     # Helper Methods
     # -------------------------------------------------------------------------

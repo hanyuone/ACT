@@ -644,11 +644,12 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     LayerKind.EXPAND.value: {
         "params_required": [],
-        "params_optional": ["shape"],
+        "params_optional": ["shape", "input_shape", "output_shape"],
     },
     LayerKind.UPSAMPLE.value: {
         "params_required": [],
-        "params_optional": ["mode", "align_corners", "scale_factor", "size"],
+        "params_optional": ["mode", "align_corners", "scale_factor", "size",
+                            "input_shape", "output_shape"],
     },
     # =====================
     # Sequences / attention

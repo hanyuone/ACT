@@ -51,6 +51,11 @@ class DualTF(TransferFunction):
         LayerKind.REDUCE_SUM.value: "_backward_identity",
         LayerKind.COMPARE.value: "_backward_identity",
         LayerKind.WHERE.value: "_backward_identity",
+        LayerKind.MATMUL.value: "_backward_identity",
+        LayerKind.ARG_EXTREMUM.value: "_backward_identity",
+        LayerKind.UPSAMPLE.value: "_backward_identity",
+        LayerKind.EXPAND.value: "_backward_identity",
+        LayerKind.SCATTER_ND.value: "_backward_identity",
     }
     
     def __init__(self):

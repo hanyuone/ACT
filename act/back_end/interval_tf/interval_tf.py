@@ -95,6 +95,15 @@ class IntervalTF(TransferFunction):
             tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
             tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1),
             tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 2)),
+        LayerKind.MATMUL.value: lambda L, bounds, tf: tf_matmul(L,
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1)),
+        LayerKind.ARG_EXTREMUM.value: lambda L, bounds, tf: tf_arg_extremum(L, bounds),
+        LayerKind.UPSAMPLE.value: lambda L, bounds, tf: tf_upsample(L, bounds),
+        LayerKind.SCATTER_ND.value: lambda L, bounds, tf: tf_scatter_nd(L,
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1),
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 2)),
         
         # Tensor operations
         "RESHAPE": lambda L, bounds, tf: tf_reshape(L, bounds),
