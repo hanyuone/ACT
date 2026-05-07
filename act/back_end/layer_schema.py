@@ -810,4 +810,5 @@ SUPPORTED_EXPORT_OPS = {
     "lstm",
     "gru",
     "rnn",
+    "upsample",
 }

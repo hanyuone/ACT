@@ -24,6 +24,7 @@ from act.back_end.solver.solver_hz import (
     hz_compute_bounds,
 )
 import act.back_end.interval_tf.tf_mlp as interval
+import act.back_end.interval_tf.tf_cnn as interval_cnn
 
 
 # ============================================================================
@@ -252,7 +253,7 @@ def tf_arg_extremum(L, bounds, tf):
 
 def tf_upsample(L, bounds, tf):
     tf._hz_cache.pop(L.id, None)
-    return interval.tf_upsample(L, bounds)
+    return interval_cnn.tf_upsample(L, bounds)
 
 
 def tf_scatter_nd(L, bounds, tf):

@@ -173,47 +173,6 @@ def tf_arg_extremum(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B, C)
 
 
-def tf_upsample(L: Layer, Bin: Bounds) -> Fact:
-    import torch.nn.functional as F
-    in_shape = L.params.get("input_shape")
-    out_shape = L.params.get("output_shape")
-    mode = str(L.params.get("mode", "nearest")).lower()
-    align_corners = L.params.get("align_corners")
-    if in_shape is None or out_shape is None:
-        n_out = len(L.out_vars)
-        lb = Bin.lb.flatten()
-        ub = Bin.ub.flatten()
-        if lb.numel() != n_out:
-            lb = lb.repeat((n_out + lb.numel() - 1) // lb.numel())[:n_out]
-            ub = ub.repeat((n_out + ub.numel() - 1) // ub.numel())[:n_out]
-        B = Bounds(lb, ub); C = ConSet(); C.add_box(L.id, L.out_vars, B)
-        return Fact(B, C)
-    in_shape = tuple(int(d) for d in in_shape)
-    out_shape = tuple(int(d) for d in out_shape)
-    if mode == "nearest":
-        torch_mode = "nearest"
-        ac_kwarg = {}
-    elif mode in ("linear", "bilinear", "trilinear", "bicubic"):
-        torch_mode = mode if mode != "linear" or len(in_shape) == 3 else (
-            "bilinear" if len(in_shape) == 4 else "trilinear")
-        ac_kwarg = {"align_corners": bool(align_corners) if align_corners is not None else False}
-    else:
-        torch_mode = "nearest"
-        ac_kwarg = {}
-    spatial_dims = len(in_shape) - 2
-    if spatial_dims < 1:
-        in_shape = (1, 1) + in_shape
-        out_shape = (1, 1) + out_shape
-    target_size = out_shape[-(len(in_shape) - 2):]
-    lb_t = Bin.lb.view(*in_shape)
-    ub_t = Bin.ub.view(*in_shape)
-    lb_out = F.interpolate(lb_t, size=target_size, mode=torch_mode, **ac_kwarg)
-    ub_out = F.interpolate(ub_t, size=target_size, mode=torch_mode, **ac_kwarg)
-    B = Bounds(lb_out.reshape(-1), ub_out.reshape(-1))
-    C = ConSet(); C.add_box(L.id, L.out_vars, B)
-    return Fact(B, C)
-
-
 def tf_scatter_nd(L: Layer, Bdata: Bounds, Bidx: Bounds, Bupdates: Bounds) -> Fact:
     n = len(L.out_vars)
     data_lb, data_ub = Bdata.lb.flatten(), Bdata.ub.flatten()
@@ -250,6 +209,7 @@ def tf_sign(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B, C)
 
 def _bcast(b: torch.Tensor, n: int) -> torch.Tensor:
+    b = b.reshape(-1)
     if b.numel() == n: return b
     if b.numel() == 1: return b.expand(n)
     if n % b.numel() == 0: return b.repeat(n // b.numel())
