@@ -16,6 +16,7 @@ import torch
 from collections import deque
 from typing import Dict, Tuple
 from act.back_end.core import Bounds, Fact, Net, ConSet
+from act.back_end.layer_schema import LayerKind
 from act.back_end.utils import box_join, changed_or_maskdiff, update_cache
 from act.back_end.transfer_functions import dispatch_tf, set_transfer_function_mode
 
@@ -60,7 +61,24 @@ def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple
     # Seed entry with provided Fact (includes all input constraints)
     before[entry_id] = entry_fact
 
-    WL = deque([entry_id])
+    # Seed every other zero-indegree source (e.g. CONSTANT layers emitted by
+    # torch2act for ONNX initializers). Without this, source-layer bounds stay
+    # at +/-inf forever because the worklist starts at entry_id and CONSTANTs
+    # have no predecessor that would ever push them on. (Oracle finding #5.)
+    seeds = [entry_id]
+    for L in net.layers:
+        if L.id == entry_id or net.preds.get(L.id):
+            continue
+        if L.kind == LayerKind.CONSTANT.value:
+            val = L.params["value"].flatten().to(
+                device=entry_fact.bounds.lb.device,
+                dtype=entry_fact.bounds.lb.dtype,
+            )
+            before[L.id] = Fact(bounds=Bounds(val.clone(), val.clone()), cons=ConSet())
+        # Other zero-indegree kinds (none today) would be seeded similarly.
+        seeds.append(L.id)
+
+    WL = deque(seeds)
     while WL:
         lid = WL.popleft(); L = net.by_id[lid]
 
@@ -72,9 +90,15 @@ def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple
             Bjoin = Bounds(lb=first_bounds.lb.clone(), ub=first_bounds.ub.clone())
             Cjoin = ConSet()
             for con in after[preds_list[0]].cons: Cjoin.replace(con)
-            # Join with remaining predecessors (for DAG merge points)
+            # Join with remaining predecessors when shapes match (DAG merge points).
+            # Multi-input ops with heterogeneous predecessor shapes (MATMUL, CONCAT,
+            # SCATTER_ND, etc.) ignore Bin and pull each predecessor explicitly via
+            # get_predecessor_bounds; the join is meaningless for them so we skip
+            # rather than crash.
             for pid in preds_list[1:]:
-                Bjoin = box_join(Bjoin, after[pid].bounds)
+                pb = after[pid].bounds
+                if pb.lb.shape == Bjoin.lb.shape:
+                    Bjoin = box_join(Bjoin, pb)
                 for con in after[pid].cons: Cjoin.replace(con)
             before[lid] = Fact(Bjoin, Cjoin)
 

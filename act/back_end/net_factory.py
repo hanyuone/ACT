@@ -820,22 +820,37 @@ def _generate_layer_variables(kind, i, vc, params, layers):
         pv = layers[i - 1].out_vars
         return list(pv), list(pv), vc
 
+    # Source layers (no predecessor): CONSTANT materialises a tensor whose
+    # shape is fully described by params. Treat ``output_shape`` (or its
+    # fallback ``input_shape``) as authoritative; do *not* inherit any
+    # in_vars from layers[i-1] -- that would invent a fake data dependency.
+    if kind == LayerKind.CONSTANT.value:
+        shape = params.get("output_shape") or params.get("input_shape") or [1]
+        n = torch.Size(shape).numel()
+        return [], list(range(vc, vc + n)), vc + n
+
     # Binary ops (x_vars + y_vars already populated by create_network)
     x_vars = params.get("x_vars", [])
     y_vars = params.get("y_vars", [])
     if x_vars and y_vars:
         in_vars = list(x_vars) + list(y_vars)
-        n_out = len(x_vars)
+        if "output_shape" in params:
+            n_out = torch.Size(params["output_shape"]).numel()
+        else:
+            n_out = len(x_vars)
         return in_vars, list(range(vc, vc + n_out)), vc + n_out
 
-    # Concat (multiple predecessors)
+    # Multi-predecessor ops (CONCAT, WHERE, SCATTER_ND)
     preds = params.get("preds_indices", [])
     if len(preds) > 1:
         in_vars = []
         for pidx in preds:
             if pidx < len(layers):
                 in_vars.extend(layers[pidx].out_vars)
-        n_out = len(in_vars)
+        if "output_shape" in params:
+            n_out = torch.Size(params["output_shape"]).numel()
+        else:
+            n_out = len(in_vars)
         return in_vars, list(range(vc, vc + n_out)), vc + n_out
 
     # Single predecessor — determine in_vars
@@ -1546,6 +1561,11 @@ class NetFactory:
             for idx in range(self.num_instances):
                 self._generate_one(idx, dtype, names)
 
+        print(
+            f"Generating {len(LAYER_TESTING_SPECS)} per-kind layer-testing examples..."
+        )
+        names.extend(self._generate_layer_testing_examples())
+
         if self.write_manifest:
             self._write_manifest(names)
 
@@ -1553,9 +1573,190 @@ class NetFactory:
         self._print_coverage_report()
         return names
 
+    def _generate_layer_testing_examples(self) -> List[str]:
+        names: List[str] = []
+        for name, build_spec in LAYER_TESTING_SPECS.items():
+            net = self.create_network(name, build_spec())
+            self.save_network(net, name)
+            names.append(name)
+            self.total_generated += 1
+            self._record(net)
+        return names
+
+
+# ============================================================================
+# Deterministic per-kind layer-testing examples
+# ============================================================================
+#
+# Each spec below is a NetFactory.create_network()-consumable dict that
+# exercises exactly one of the LayerKinds emitted by torch2act for VNN-COMP
+# coverage (CONSTANT, SIGN, REDUCE_SUM, COMPARE, WHERE, MATMUL,
+# ARG_EXTREMUM, UPSAMPLE, EXPAND, SCATTER_ND). NetFactory.generate() emits
+# them alongside the random benchmarks, so the existing CI steps
+# (--validate-verifier, --verify act2torch) iterate them with no extra
+# wiring.
+
+
+LAYER_TESTING_NAME_PREFIX = "layer_testing_"
+
+
+def _lt_input(shape: List[int], lb: float, ub: float) -> List[Dict[str, Any]]:
+    return [
+        {"kind": LayerKind.INPUT.value, "params": {"shape": [int(d) for d in shape]}},
+        {
+            "kind": LayerKind.INPUT_SPEC.value,
+            "params": {"kind": InKind.BOX, "lb_val": float(lb), "ub_val": float(ub)},
+        },
+    ]
+
+
+def _lt_const(value: torch.Tensor, shape: List[int]) -> Dict[str, Any]:
+    flat = value.detach().clone().reshape(-1)
+    s = [int(d) for d in shape]
+    return {
+        "kind": LayerKind.CONSTANT.value,
+        "params": {"value": flat, "input_shape": s, "output_shape": s},
+    }
+
+
+def _lt_assert_le(c_vec: List[float], d: float) -> Dict[str, Any]:
+    return {
+        "kind": LayerKind.ASSERT.value,
+        "params": {
+            "kind": OutKind.LINEAR_LE,
+            "c": [float(x) for x in c_vec],
+            "d": float(d),
+        },
+    }
+
+
+def _lt_spec_constant() -> Dict[str, Any]:
+    val = torch.tensor([1.0, -2.0, 3.5], dtype=get_default_dtype())
+    return {"layers": _lt_input([1, 3], -1.0, 1.0) + [
+        _lt_const(val, [3]),
+        {"kind": LayerKind.ADD.value, "params": {},
+         "inputs": {"x": 1, "y": 2}, "preds": [1, 2]},
+        _lt_assert_le([1.0, 0.0, 0.0], 100.0),
+    ]}
+
+
+def _lt_spec_sign() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 4], -2.0, 2.0) + [
+        {"kind": LayerKind.SIGN.value,
+         "params": {"input_shape": [1, 4], "output_shape": [1, 4]}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 5.0),
+    ]}
+
+
+def _lt_spec_reduce_sum() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 4], 0.0, 1.0) + [
+        {"kind": LayerKind.REDUCE_SUM.value,
+         "params": {"axes": [1], "keepdims": 0,
+                    "input_shape": [1, 4], "output_shape": [1]}},
+        _lt_assert_le([1.0], 100.0),
+    ]}
+
+
+def _lt_spec_compare() -> Dict[str, Any]:
+    dtype = get_default_dtype()
+    return {"layers": _lt_input([1, 3], 0.0, 1.0) + [
+        _lt_const(torch.tensor([0.5, 0.5, 0.5], dtype=dtype), [3]),
+        {"kind": LayerKind.COMPARE.value,
+         "params": {"op": "lt", "input_shape": [1, 3], "output_shape": [1, 3]},
+         "inputs": {"x": 1, "y": 2}, "preds": [1, 2]},
+        _lt_assert_le([1.0, 1.0, 1.0], 5.0),
+    ]}
+
+
+def _lt_spec_where() -> Dict[str, Any]:
+    dtype = get_default_dtype()
+    cond = torch.tensor([1.0, 0.0, 1.0], dtype=dtype)
+    other = torch.tensor([3.0, 4.0, 3.5], dtype=dtype)
+    return {"layers": _lt_input([1, 3], 1.0, 2.0) + [
+        _lt_const(cond, [3]),
+        _lt_const(other, [3]),
+        {"kind": LayerKind.WHERE.value,
+         "params": {"input_shape": [1, 3], "output_shape": [1, 3]},
+         "preds": [2, 1, 3]},
+        _lt_assert_le([1.0, 1.0, 1.0], 100.0),
+    ]}
+
+
+def _lt_spec_matmul() -> Dict[str, Any]:
+    dtype = get_default_dtype()
+    y = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=dtype)
+    return {"layers": _lt_input([1, 2, 3], 0.0, 1.0) + [
+        _lt_const(y, [3, 2]),
+        {"kind": LayerKind.MATMUL.value,
+         "params": {"x_shape": [2, 3], "y_shape": [3, 2],
+                    "input_shape": [2, 3], "output_shape": [2, 2]},
+         "inputs": {"x": 1, "y": 2}, "preds": [1, 2]},
+        _lt_assert_le([1.0, 0.0, 0.0, 0.0], 100.0),
+    ]}
+
+
+def _lt_spec_arg_extremum() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 2, 3], -1.0, 1.0) + [
+        {"kind": LayerKind.ARG_EXTREMUM.value,
+         "params": {"op": "argmax", "axis": 2, "keepdims": 0,
+                    "input_shape": [1, 2, 3], "output_shape": [1, 2]}},
+        _lt_assert_le([1.0, 0.0], 10.0),
+    ]}
+
+
+def _lt_spec_upsample() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 1, 2, 2], 1.0, 5.0) + [
+        {"kind": LayerKind.UPSAMPLE.value,
+         "params": {"mode": "nearest", "scale_factor": (2.0, 2.0),
+                    "input_shape": [1, 1, 2, 2], "output_shape": [1, 1, 4, 4]}},
+        _lt_assert_le([1.0] + [0.0] * 15, 100.0),
+    ]}
+
+
+def _lt_spec_expand() -> Dict[str, Any]:
+    dtype = get_default_dtype()
+    val = torch.tensor([[7.0]], dtype=dtype)
+    return {"layers": _lt_input([1, 3], 0.0, 1.0) + [
+        _lt_const(val, [1, 1]),
+        {"kind": LayerKind.EXPAND.value,
+         "params": {"shape": [1, 3], "input_shape": [1, 1], "output_shape": [1, 3]}},
+        {"kind": LayerKind.ADD.value, "params": {},
+         "inputs": {"x": 1, "y": 3}, "preds": [1, 3]},
+        _lt_assert_le([1.0, 0.0, 0.0], 100.0),
+    ]}
+
+
+def _lt_spec_scatter_nd() -> Dict[str, Any]:
+    dtype = get_default_dtype()
+    indices = torch.tensor([[0, 0], [0, 2]], dtype=dtype)
+    updates = torch.tensor([10.0, 20.0], dtype=dtype)
+    return {"layers": _lt_input([1, 4], -1.0, 1.0) + [
+        _lt_const(indices, [2, 2]),
+        _lt_const(updates, [2]),
+        {"kind": LayerKind.SCATTER_ND.value,
+         "params": {"input_shape": [1, 4], "output_shape": [1, 4]},
+         "preds": [1, 2, 3]},
+        _lt_assert_le([1.0, 0.0, 0.0, 0.0], 100.0),
+    ]}
+
+
+LAYER_TESTING_SPECS: Dict[str, Any] = {
+    f"{LAYER_TESTING_NAME_PREFIX}constant":     _lt_spec_constant,
+    f"{LAYER_TESTING_NAME_PREFIX}sign":         _lt_spec_sign,
+    f"{LAYER_TESTING_NAME_PREFIX}reduce_sum":   _lt_spec_reduce_sum,
+    f"{LAYER_TESTING_NAME_PREFIX}compare":      _lt_spec_compare,
+    f"{LAYER_TESTING_NAME_PREFIX}where":        _lt_spec_where,
+    f"{LAYER_TESTING_NAME_PREFIX}matmul":       _lt_spec_matmul,
+    f"{LAYER_TESTING_NAME_PREFIX}arg_extremum": _lt_spec_arg_extremum,
+    f"{LAYER_TESTING_NAME_PREFIX}upsample":     _lt_spec_upsample,
+    f"{LAYER_TESTING_NAME_PREFIX}expand":       _lt_spec_expand,
+    f"{LAYER_TESTING_NAME_PREFIX}scatter_nd":   _lt_spec_scatter_nd,
+}
+
 
 __all__ = [
     "NetFactory",
     "build_mlp_layers",
     "build_cnn_layers",
+    "LAYER_TESTING_SPECS",
 ]

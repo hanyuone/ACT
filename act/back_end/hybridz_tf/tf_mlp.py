@@ -24,6 +24,7 @@ from act.back_end.solver.solver_hz import (
     hz_compute_bounds,
 )
 import act.back_end.interval_tf.tf_mlp as interval
+import act.back_end.interval_tf.tf_cnn as interval_cnn
 
 
 # ============================================================================
@@ -194,6 +195,83 @@ def tf_mul(L, bounds, tf):
     )
     if hz_in is not None:
         return Fact(bounds=hz_compute_bounds(tf._hz_cache[L.id]), cons=fact.cons)
+    return fact
+
+
+def tf_constant(L, bounds, tf):
+    val = L.params["value"].flatten()
+    dtype, device = val.dtype, val.device
+    n = val.numel()
+    tf._hz_cache[L.id] = HZono(
+        c=val.view(-1, 1),
+        Gc=torch.zeros((n, 0), dtype=dtype, device=device),
+        Gb=torch.zeros((n, 0), dtype=dtype, device=device),
+        Ac=torch.zeros((0, 0), dtype=dtype, device=device),
+        Ab=torch.zeros((0, 0), dtype=dtype, device=device),
+        b=torch.zeros((0, 1), dtype=dtype, device=device),
+    )
+    return interval.tf_constant(L, bounds)
+
+
+def tf_sign(L, bounds, tf):
+    tf._hz_cache.pop(L.id, None)
+    return interval.tf_sign(L, bounds)
+
+
+def tf_compare(L, bounds, tf):
+    tf._hz_cache.pop(L.id, None)
+    return interval.tf_compare(
+        L,
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1),
+    )
+
+
+def tf_where(L, bounds, tf):
+    tf._hz_cache.pop(L.id, None)
+    return interval.tf_where(
+        L,
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1),
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 2),
+    )
+
+
+def tf_matmul(L, bounds, tf):
+    tf._hz_cache.pop(L.id, None)
+    return interval.tf_matmul(
+        L,
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1),
+    )
+
+
+def tf_arg_extremum(L, bounds, tf):
+    tf._hz_cache.pop(L.id, None)
+    return interval.tf_arg_extremum(L, bounds)
+
+
+def tf_upsample(L, bounds, tf):
+    tf._hz_cache.pop(L.id, None)
+    return interval_cnn.tf_upsample(L, bounds)
+
+
+def tf_scatter_nd(L, bounds, tf):
+    tf._hz_cache.pop(L.id, None)
+    return interval.tf_scatter_nd(
+        L,
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1),
+        tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 2),
+    )
+
+
+def tf_reduce_sum(L, bounds, tf):
+    hz_in = tf._hz_cache.get(L.id)
+    fact = interval.tf_reduce_sum(L, bounds)
+    if hz_in is not None:
+        dtype, device = hz_in.c.dtype, hz_in.c.device
+        tf._hz_cache[L.id] = hz_from_bounds(fact.bounds, dtype, device)
     return fact
 
 

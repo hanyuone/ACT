@@ -1009,7 +1009,11 @@ def _convert_OnnxResize(self, mod: nn.Module, node: fx.Node) -> None:
         size_param = tuple(int(x) for x in sizes_t.tolist())
     else:
         raise ValueError(f"OnnxResize at {node.name}: cannot resolve scales or sizes")
-    params: Dict[str, Any] = {"mode": str(getattr(mod, 'onnx_mode', 'nearest'))}
+    params: Dict[str, Any] = {
+        "mode": str(getattr(mod, 'onnx_mode', 'nearest')),
+        "input_shape": self.shape,
+        "output_shape": output_shape,
+    }
     if getattr(mod, 'align_corners', None) is not None:
         params["align_corners"] = bool(mod.align_corners)
     if scale_factor is not None:
@@ -1153,7 +1157,8 @@ def _convert_OnnxExpand(self, mod: nn.Module, node: fx.Node) -> None:
     out_vars = self._alloc_ids(_prod(broadcast_shape) or 1)
     layer_id = self._add_layer(
         LayerKind.EXPAND.value,
-        {"shape": broadcast_shape},
+        {"shape": broadcast_shape,
+         "input_shape": self.shape, "output_shape": broadcast_shape},
         self.prev_out, out_vars,
     )
     self.prev_out = out_vars
