@@ -36,8 +36,8 @@ import yaml
 from act.back_end.core import Layer, Net
 from act.back_end.layer_schema import LayerKind, REGISTRY
 from act.back_end.serialization.serialization import NetSerializer
-from act.front_end.specs import InKind, OutKind
-from act.util.device_manager import get_default_dtype
+from act.front_end.specs import InKind, OutKind, OutputSpec
+from act.util.device_manager import get_default_device, get_default_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -1265,15 +1265,30 @@ class NetFactory:
             return {"center": center, "lb": center - eps, "ub": center + eps}
         raise ValueError(f"Unsupported INPUT_SPEC kind '{params.get('kind')}'")
 
-    def _assert_params(self, params, dtype):
-        kind = params.get("kind")
-        if kind == OutKind.LINEAR_LE and isinstance(params.get("c"), list):
-            params["c"] = torch.as_tensor(params["c"], dtype=dtype)
-        elif kind == OutKind.RANGE:
-            for k in ("lb", "ub"):
-                if isinstance(params.get(k), list):
-                    params[k] = torch.as_tensor(params[k], dtype=dtype)
-        return params
+    def _assert_params(
+        self,
+        params: Dict[str, Any],
+        dtype: torch.dtype,
+        B: int,
+        n_out: int,
+    ) -> Dict[str, Any]:
+        """Encode raw ASSERT high-level params via ``OutputSpec.encode_linear``.
+
+        Replaces the previous ad-hoc list→tensor lifting; produces a params
+        dict carrying both the high-level fields (BaB) and pre-encoded
+        ``C`` / ``thresholds`` / ``M`` (verify_once).
+        """
+        kwargs = {
+            k: params[k] for k in ("y_true", "margin", "c", "d", "lb", "ub")
+            if k in params
+        }
+        spec = OutputSpec(kind=params["kind"], **kwargs)
+        return spec.encode_linear(
+            B=B,
+            n_out=n_out,
+            device=get_default_device(),
+            dtype=dtype,
+        )
 
     def _sample_instance(self, idx: int) -> Dict[str, Any]:
         temp_id = f"{self.name_prefix}{self.base_seed}_idx{idx:05d}"
@@ -1424,7 +1439,12 @@ class NetFactory:
                     self._input_spec_params(params, layers[0].params["shape"], dtype)
                 )
             elif kind == LayerKind.ASSERT.value:
-                params = self._assert_params(params, dtype)
+                # B from the InputLayer (layers[0]); n_out from this ASSERT's
+                # in_vars (which equal the upstream output variables).
+                B_assert = int(layers[0].params["shape"][0])
+                params = self._assert_params(
+                    params, dtype, B=B_assert, n_out=len(in_vars),
+                )
             elif kind == LayerKind.DENSE.value and "weight" not in params:
                 inf = int(params.get("in_features", 1))
                 outf = int(params.get("out_features", 1))
@@ -1740,6 +1760,58 @@ def _lt_spec_scatter_nd() -> Dict[str, Any]:
     ]}
 
 
+def _lt_spec_rnn_family(cell: str, hidden: int = 8, seq_len: int = 4,
+                        in_feat: int = 3, num_classes: int = 4) -> Dict[str, Any]:
+    layers = _lt_input([1, seq_len, in_feat], -1.0, 1.0)
+    build_rnn_layers(layers, cfg={
+        "input_shape": [1, seq_len, in_feat],
+        "cell": cell,
+        "hidden_size": hidden,
+        "num_layers": 1,
+        "bidirectional": False,
+        "batch_first": True,
+        "use_bias": True,
+        "nonlinearity": "tanh",
+        "num_classes": num_classes,
+    })
+    layers.append(_lt_assert_le([1.0] + [0.0] * (num_classes - 1), 100.0))
+    return {"layers": layers}
+
+
+def _lt_spec_lstm() -> Dict[str, Any]:
+    return _lt_spec_rnn_family("LSTM")
+
+
+def _lt_spec_gru() -> Dict[str, Any]:
+    return _lt_spec_rnn_family("GRU")
+
+
+def _lt_spec_rnn() -> Dict[str, Any]:
+    return _lt_spec_rnn_family("RNN")
+
+
+def _lt_spec_layernorm() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 8], -1.0, 1.0) + [
+        {"kind": LayerKind.LAYERNORM.value,
+         "params": {"input_shape": [1, 8], "output_shape": [1, 8]}},
+        _lt_assert_le([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 100.0),
+    ]}
+
+
+def _lt_spec_gelu() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 4], -2.0, 2.0) + [
+        {"kind": LayerKind.GELU.value, "params": {}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 100.0),
+    ]}
+
+
+def _lt_spec_softmax() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 4], -1.0, 1.0) + [
+        {"kind": LayerKind.SOFTMAX.value, "params": {"axis": -1}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 5.0),
+    ]}
+
+
 LAYER_TESTING_SPECS: Dict[str, Any] = {
     f"{LAYER_TESTING_NAME_PREFIX}constant":     _lt_spec_constant,
     f"{LAYER_TESTING_NAME_PREFIX}sign":         _lt_spec_sign,
@@ -1751,6 +1823,11 @@ LAYER_TESTING_SPECS: Dict[str, Any] = {
     f"{LAYER_TESTING_NAME_PREFIX}upsample":     _lt_spec_upsample,
     f"{LAYER_TESTING_NAME_PREFIX}expand":       _lt_spec_expand,
     f"{LAYER_TESTING_NAME_PREFIX}scatter_nd":   _lt_spec_scatter_nd,
+    f"{LAYER_TESTING_NAME_PREFIX}lstm":         _lt_spec_lstm,
+    f"{LAYER_TESTING_NAME_PREFIX}gru":          _lt_spec_gru,
+    f"{LAYER_TESTING_NAME_PREFIX}rnn":          _lt_spec_rnn,
+    f"{LAYER_TESTING_NAME_PREFIX}gelu":         _lt_spec_gelu,
+    f"{LAYER_TESTING_NAME_PREFIX}softmax":      _lt_spec_softmax,
 }
 
 

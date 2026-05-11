@@ -141,64 +141,76 @@ def tf_div(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
     return Fact(B, C)
 
 def tf_matmul(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
+    batch_size = Bx.lb.shape[0]
     x_shape = tuple(L.params["x_shape"])
     y_shape = tuple(L.params["y_shape"])
-    A_lb = Bx.lb.view(*x_shape).unsqueeze(-1)
-    A_ub = Bx.ub.view(*x_shape).unsqueeze(-1)
-    B_lb = By.lb.view(*y_shape).unsqueeze(-3)
-    B_ub = By.ub.view(*y_shape).unsqueeze(-3)
+    A_lb = Bx.lb.view(batch_size, *x_shape).unsqueeze(-1)
+    A_ub = Bx.ub.view(batch_size, *x_shape).unsqueeze(-1)
+    B_lb = By.lb.view(batch_size, *y_shape).unsqueeze(-3)
+    B_ub = By.ub.view(batch_size, *y_shape).unsqueeze(-3)
     c1, c2 = A_lb * B_lb, A_lb * B_ub
     c3, c4 = A_ub * B_lb, A_ub * B_ub
     lo = torch.minimum(torch.minimum(c1, c2), torch.minimum(c3, c4))
     hi = torch.maximum(torch.maximum(c1, c2), torch.maximum(c3, c4))
-    out_lb = lo.sum(dim=-2).reshape(-1)
-    out_ub = hi.sum(dim=-2).reshape(-1)
+    out_lb = lo.sum(dim=-2).reshape(batch_size, -1)
+    out_ub = hi.sum(dim=-2).reshape(batch_size, -1)
     Bres = Bounds(out_lb, out_ub)
     C = ConSet(); C.add_box(L.id, L.out_vars, Bres)
     return Fact(Bres, C)
 
 
 def tf_arg_extremum(L: Layer, Bin: Bounds) -> Fact:
+    batch_size = Bin.lb.shape[0]
     in_shape = L.params.get("input_shape")
     axis = int(L.params.get("axis", 0))
     if in_shape is not None and axis < 0:
         axis += len(in_shape)
     axis_dim = int(in_shape[axis]) if in_shape else 1
     n_out = len(L.out_vars)
-    lb = torch.zeros(n_out, dtype=Bin.lb.dtype, device=Bin.lb.device)
-    ub = torch.full((n_out,), float(max(0, axis_dim - 1)),
-                    dtype=Bin.lb.dtype, device=Bin.lb.device)
-    B = Bounds(lb, ub)
-    C = ConSet(); C.add_box(L.id, L.out_vars, B)
-    return Fact(B, C)
+    lb = Bin.lb.new_zeros(batch_size, n_out)
+    ub = Bin.lb.new_full((batch_size, n_out), float(max(0, axis_dim - 1)))
+    Bout = Bounds(lb, ub)
+    C = ConSet(); C.add_box(L.id, L.out_vars, Bout)
+    return Fact(Bout, C)
 
 
 def tf_scatter_nd(L: Layer, Bdata: Bounds, Bidx: Bounds, Bupdates: Bounds) -> Fact:
+    batch_size = Bdata.lb.shape[0]
     n = len(L.out_vars)
-    data_lb, data_ub = Bdata.lb.flatten(), Bdata.ub.flatten()
-    if data_lb.numel() != n:
-        data_lb = data_lb[:n] if data_lb.numel() > n else data_lb.repeat((n + data_lb.numel() - 1) // data_lb.numel())[:n]
-        data_ub = data_ub[:n] if data_ub.numel() > n else data_ub.repeat((n + data_ub.numel() - 1) // data_ub.numel())[:n]
+    data_lb = Bdata.lb.view(batch_size, -1)
+    data_ub = Bdata.ub.view(batch_size, -1)
+    if data_lb.shape[1] != n:
+        repeat = (n + data_lb.shape[1] - 1) // data_lb.shape[1]
+        data_lb = data_lb[:, :n] if data_lb.shape[1] > n else data_lb.repeat(1, repeat)[:, :n]
+        data_ub = data_ub[:, :n] if data_ub.shape[1] > n else data_ub.repeat(1, repeat)[:, :n]
     if Bupdates.lb.numel() > 0:
-        u_min = Bupdates.lb.min().expand_as(data_lb)
-        u_max = Bupdates.ub.max().expand_as(data_ub)
+        updates_lb = Bupdates.lb.view(batch_size, -1)
+        updates_ub = Bupdates.ub.view(batch_size, -1)
+        u_min = updates_lb.min(dim=1, keepdim=True).values.expand(batch_size, n)
+        u_max = updates_ub.max(dim=1, keepdim=True).values.expand(batch_size, n)
         lb = torch.minimum(data_lb, u_min)
         ub = torch.maximum(data_ub, u_max)
     else:
         lb, ub = data_lb, data_ub
-    B = Bounds(lb, ub)
-    C = ConSet(); C.add_box(L.id, L.out_vars, B)
-    return Fact(B, C)
+    Bout = Bounds(lb, ub)
+    C = ConSet(); C.add_box(L.id, L.out_vars, Bout)
+    return Fact(Bout, C)
 
 def tf_concat(L: Layer, Bs: List[Bounds]) -> Fact:
-    B=Bounds(torch.cat([b.lb for b in Bs],0), torch.cat([b.ub for b in Bs],0))
+    B=Bounds(torch.cat([b.lb for b in Bs], dim=-1), torch.cat([b.ub for b in Bs], dim=-1))
     C=ConSet(); C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_constant(L: Layer, Bin: Bounds) -> Fact:
-    val = L.params["value"].flatten()
-    B = Bounds(val.clone(), val.clone())
-    C = ConSet(); C.add_box(L.id, L.out_vars, B)
-    return Fact(B, C)
+    # CONSTANT bounds come from L.params["value"], not from Bin. The graph
+    # may carry spurious predecessor edges (e.g. ONNX initializers wired to
+    # topological ancestors) whose Bounds have unrelated shape; ignoring
+    # Bin keeps the output shaped to L.out_vars regardless of routing.
+    B_size = Bin.lb.shape[0]
+    val = L.params["value"].reshape(-1).to(Bin.lb)
+    val_b = val.unsqueeze(0).expand(B_size, -1).contiguous()
+    Bout = Bounds(val_b.clone(), val_b.clone())
+    C = ConSet(); C.add_box(L.id, L.out_vars, Bout)
+    return Fact(Bout, C)
 
 def tf_sign(L: Layer, Bin: Bounds) -> Fact:
     l, u = Bin.lb, Bin.ub
@@ -208,19 +220,32 @@ def tf_sign(L: Layer, Bin: Bounds) -> Fact:
     C = ConSet(); C.add_box(L.id, L.out_vars, B)
     return Fact(B, C)
 
-def _bcast(b: torch.Tensor, n: int) -> torch.Tensor:
-    b = b.reshape(-1)
-    if b.numel() == n: return b
-    if b.numel() == 1: return b.expand(n)
-    if n % b.numel() == 0: return b.repeat(n // b.numel())
-    raise ValueError(f"COMPARE/WHERE bcast: cannot align numel {b.numel()} -> {n}")
+def _bcast(b: torch.Tensor, B: int, n: int) -> torch.Tensor:
+    if b.dim() == 0:
+        return b.reshape(1, 1).expand(B, n)
+    if b.dim() == 1:
+        if b.numel() == 1:
+            return b.reshape(1, 1).expand(B, n)
+        if b.numel() == n:
+            return b.reshape(1, n).expand(B, n)
+    if b.dim() == 2:
+        if b.shape == (B, n):
+            return b
+        if b.shape == (1, n):
+            return b.expand(B, n)
+        if b.shape == (B, 1):
+            return b.expand(B, n)
+        if b.shape == (1, 1):
+            return b.expand(B, n)
+    raise ValueError(f"COMPARE/WHERE bcast: cannot align shape {tuple(b.shape)} -> {(B, n)}")
 
 
 def tf_compare(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
     op = L.params["op"]
+    batch_size = Bx.lb.shape[0]
     n = len(L.out_vars)
-    lb_x, ub_x = _bcast(Bx.lb, n), _bcast(Bx.ub, n)
-    lb_y, ub_y = _bcast(By.lb, n), _bcast(By.ub, n)
+    lb_x, ub_x = _bcast(Bx.lb, batch_size, n), _bcast(Bx.ub, batch_size, n)
+    lb_y, ub_y = _bcast(By.lb, batch_size, n), _bcast(By.ub, batch_size, n)
     if op == "lt":
         defin_t, defin_f = ub_x < lb_y, lb_x >= ub_y
     elif op == "le":
@@ -242,37 +267,39 @@ def tf_compare(L: Layer, Bx: Bounds, By: Bounds) -> Fact:
     z, o = torch.zeros_like(lb_x), torch.ones_like(lb_x)
     lb = torch.where(defin_t, o, z)
     ub = torch.where(defin_f, z, o)
-    B = Bounds(lb, ub); C = ConSet(); C.add_box(L.id, L.out_vars, B)
-    return Fact(B, C)
+    Bout = Bounds(lb, ub); C = ConSet(); C.add_box(L.id, L.out_vars, Bout)
+    return Fact(Bout, C)
 
 
 def tf_where(L: Layer, Bcond: Bounds, Bx: Bounds, By: Bounds) -> Fact:
+    batch_size = Bcond.lb.shape[0]
     n = len(L.out_vars)
-    cond_lb, cond_ub = _bcast(Bcond.lb, n), _bcast(Bcond.ub, n)
-    lb_x, ub_x = _bcast(Bx.lb, n), _bcast(Bx.ub, n)
-    lb_y, ub_y = _bcast(By.lb, n), _bcast(By.ub, n)
+    cond_lb, cond_ub = _bcast(Bcond.lb, batch_size, n), _bcast(Bcond.ub, batch_size, n)
+    lb_x, ub_x = _bcast(Bx.lb, batch_size, n), _bcast(Bx.ub, batch_size, n)
+    lb_y, ub_y = _bcast(By.lb, batch_size, n), _bcast(By.ub, batch_size, n)
     cond_true = cond_lb >= 0.5
     cond_false = cond_ub < 0.5
     lb = torch.where(cond_true, lb_x, torch.where(cond_false, lb_y, torch.minimum(lb_x, lb_y)))
     ub = torch.where(cond_true, ub_x, torch.where(cond_false, ub_y, torch.maximum(ub_x, ub_y)))
-    B = Bounds(lb, ub); C = ConSet(); C.add_box(L.id, L.out_vars, B)
-    return Fact(B, C)
+    Bout = Bounds(lb, ub); C = ConSet(); C.add_box(L.id, L.out_vars, Bout)
+    return Fact(Bout, C)
 
 
 def tf_reduce_sum(L: Layer, Bin: Bounds) -> Fact:
+    batch_size = Bin.lb.shape[0]
     axes = L.params.get("axes")
     keepdims = bool(L.params.get("keepdims", 0))
     in_shape = L.params.get("input_shape")
     lb_in, ub_in = Bin.lb, Bin.ub
     if in_shape is not None and len(in_shape) > 0:
-        lb_in = lb_in.view(*in_shape)
-        ub_in = ub_in.view(*in_shape)
-    dim = tuple(int(a) for a in axes) if axes else tuple(range(lb_in.dim()))
+        lb_in = lb_in.view(batch_size, *in_shape)
+        ub_in = ub_in.view(batch_size, *in_shape)
+    dim = tuple(int(a) + 1 for a in axes) if axes else tuple(range(1, lb_in.dim()))
     lb_out = lb_in.sum(dim=dim, keepdim=keepdims)
     ub_out = ub_in.sum(dim=dim, keepdim=keepdims)
-    B = Bounds(lb_out.reshape(-1), ub_out.reshape(-1))
-    C = ConSet(); C.add_box(L.id, L.out_vars, B)
-    return Fact(B, C)
+    Bout = Bounds(lb_out.reshape(batch_size, -1), ub_out.reshape(batch_size, -1))
+    C = ConSet(); C.add_box(L.id, L.out_vars, Bout)
+    return Fact(Bout, C)
 
 def tf_bn(L: Layer, Bin: Bounds) -> Fact:
     A,c=L.params["A"],L.params["c"]
@@ -426,40 +453,44 @@ def tf_unsqueeze(L: Layer, Bin: Bounds) -> Fact:
 def tf_tile(L: Layer, Bin: Bounds) -> Fact:
     """Tile: repeat tensor along dimensions"""
     # Conservative bounds: same as input for each repetition
+    batch_size = Bin.lb.shape[0]
     repeats = L.params.get("repeats")
     inp_shape = tuple(L.params["input_shape"])
-    x_lb = Bin.lb.view(*inp_shape)
-    x_ub = Bin.ub.view(*inp_shape)
-    out_lb = x_lb.repeat(*repeats)
-    out_ub = x_ub.repeat(*repeats)
-    B = Bounds(out_lb.reshape(-1), out_ub.reshape(-1))
+    x_lb = Bin.lb.view(batch_size, *inp_shape)
+    x_ub = Bin.ub.view(batch_size, *inp_shape)
+    out_lb = x_lb.repeat(1, *repeats)
+    out_ub = x_ub.repeat(1, *repeats)
+    B = Bounds(out_lb.reshape(batch_size, -1), out_ub.reshape(batch_size, -1))
     C = ConSet()
     C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {"tag": f"tile:{L.id}", "repeats": repeats}))
     C.add_box(L.id, L.out_vars, B); return Fact(B, C)
 
 def tf_expand(L: Layer, Bin: Bounds) -> Fact:
+    batch_size = Bin.lb.shape[0]
     in_shape = L.params.get("input_shape")
     out_shape = L.params.get("output_shape") or L.params.get("shape")
     n_out = len(L.out_vars)
     if in_shape is not None and out_shape is not None:
         in_shape = tuple(int(d) for d in in_shape)
         out_shape = tuple(int(d) for d in out_shape)
-        lb = Bin.lb.view(*in_shape).broadcast_to(out_shape).reshape(-1).clone()
-        ub = Bin.ub.view(*in_shape).broadcast_to(out_shape).reshape(-1).clone()
-    elif Bin.lb.numel() == n_out:
+        lb = Bin.lb.view(batch_size, *in_shape).broadcast_to(batch_size, *out_shape).reshape(batch_size, -1).clone()
+        ub = Bin.ub.view(batch_size, *in_shape).broadcast_to(batch_size, *out_shape).reshape(batch_size, -1).clone()
+    elif Bin.lb.shape[1] == n_out:
         lb, ub = Bin.lb.clone(), Bin.ub.clone()
     else:
-        repeat = (n_out + Bin.lb.numel() - 1) // Bin.lb.numel()
-        lb = Bin.lb.repeat(repeat)[:n_out].clone()
-        ub = Bin.ub.repeat(repeat)[:n_out].clone()
-    B = Bounds(lb, ub)
-    C = ConSet(); C.add_box(L.id, L.out_vars, B)
-    return Fact(B, C)
+        width = Bin.lb.shape[1]
+        repeat = (n_out + width - 1) // width
+        lb = Bin.lb.repeat(1, repeat)[:, :n_out].clone()
+        ub = Bin.ub.repeat(1, repeat)[:, :n_out].clone()
+    Bout = Bounds(lb, ub)
+    C = ConSet(); C.add_box(L.id, L.out_vars, Bout)
+    return Fact(Bout, C)
     
 def tf_slice(L: Layer, Bin: Bounds) -> Fact:
+    batch_size = Bin.lb.shape[0]
     inp_shape = tuple(L.params["input_shape"])  # e.g. (1, 3, 32, 32)
-    x_lb = Bin.lb.view(*inp_shape)
-    x_ub = Bin.ub.view(*inp_shape)
+    x_lb = Bin.lb.view(batch_size, *inp_shape)
+    x_ub = Bin.ub.view(batch_size, *inp_shape)
 
     starts = L.params.get("starts", [])
     ends   = L.params.get("ends", [])
@@ -467,21 +498,23 @@ def tf_slice(L: Layer, Bin: Bounds) -> Fact:
     steps  = L.params.get("steps", [1] * len(axes))
 
     # Build slice objects for each dimension
-    slices = [slice(None)] * len(inp_shape)
+    slices = [slice(None)] * (len(inp_shape) + 1)
     for i, axis in enumerate(axes):
+        axis = int(axis)
         s = starts[i]
         e = ends[i]
         st = steps[i]
         if e > inp_shape[axis]:
             e = inp_shape[axis]
-        slices[axis] = slice(s, e, st)
+        slices[axis + 1] = slice(s, e, st)
 
     out_lb = x_lb[tuple(slices)]
     out_ub = x_ub[tuple(slices)]
-    assert out_lb.numel() == len(L.out_vars), f"slice out_vars length {len(L.out_vars)} != output elements {out_lb.numel()}"
+    assert out_lb.shape[0] == batch_size, f"slice batch mismatch {out_lb.shape[0]} != {batch_size}"
+    assert out_lb[0].numel() == len(L.out_vars), f"slice out_vars length {len(L.out_vars)} != output elements {out_lb[0].numel()}"
     assert torch.all(out_lb <= out_ub), "slice produced invalid bounds (lb > ub)"
 
-    B = Bounds(out_lb.reshape(-1), out_ub.reshape(-1))
+    Bout = Bounds(out_lb.reshape(batch_size, -1), out_ub.reshape(batch_size, -1))
 
     C = ConSet()
     C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
@@ -492,16 +525,17 @@ def tf_slice(L: Layer, Bin: Bounds) -> Fact:
         "steps": steps,
         "input_shape": inp_shape,
     }))
-    C.add_box(L.id, L.out_vars, B)
-    return Fact(B, C)
+    C.add_box(L.id, L.out_vars, Bout)
+    return Fact(Bout, C)
 
 
 def tf_gather(L: Layer, Bin: Bounds) -> Fact:
 
+    batch_size = Bin.lb.shape[0]
     inp_shape = tuple(L.params["input_shape"])
     axis = int(L.params.get("axis", 0))
-    x_lb = Bin.lb.view(*inp_shape)
-    x_ub = Bin.ub.view(*inp_shape)
+    x_lb = Bin.lb.view(batch_size, *inp_shape)
+    x_ub = Bin.ub.view(batch_size, *inp_shape)
 
     raw_idx = L.params["indices"]
     if isinstance(raw_idx, (list, tuple)):
@@ -509,10 +543,10 @@ def tf_gather(L: Layer, Bin: Bounds) -> Fact:
     else:
         indices = raw_idx.to(x_lb.device).long()
 
-    out_lb = torch.index_select(x_lb, dim=axis, index=indices)
-    out_ub = torch.index_select(x_ub, dim=axis, index=indices)
+    out_lb = torch.index_select(x_lb, dim=axis + 1, index=indices)
+    out_ub = torch.index_select(x_ub, dim=axis + 1, index=indices)
 
-    B = Bounds(out_lb.reshape(-1), out_ub.reshape(-1))
+    Bout = Bounds(out_lb.reshape(batch_size, -1), out_ub.reshape(batch_size, -1))
 
     C = ConSet()
     C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
@@ -522,16 +556,17 @@ def tf_gather(L: Layer, Bin: Bounds) -> Fact:
         "input_shape": inp_shape,
         "output_shape": list(out_lb.shape),
     }))
-    C.add_box(L.id, L.out_vars, B)
-    return Fact(B, C)
+    C.add_box(L.id, L.out_vars, Bout)
+    return Fact(Bout, C)
 
 def tf_index_select(L: Layer, Bin: Bounds) -> Fact:
 
+    batch_size = Bin.lb.shape[0]
     inp_shape = tuple(L.params["input_shape"])
     dim = int(L.params["dim"])
     assert 0 <= dim < len(inp_shape), f"index_select dim {dim} out of range for input shape {inp_shape}"
-    x_lb = Bin.lb.view(*inp_shape)
-    x_ub = Bin.ub.view(*inp_shape)
+    x_lb = Bin.lb.view(batch_size, *inp_shape)
+    x_ub = Bin.ub.view(batch_size, *inp_shape)
 
     raw_idx = L.params["indices"]
     if isinstance(raw_idx, (list, tuple)):
@@ -540,12 +575,13 @@ def tf_index_select(L: Layer, Bin: Bounds) -> Fact:
         indices = raw_idx.to(x_lb.device).long()
     assert indices.numel() > 0, "index_select received empty indices"
 
-    out_lb = torch.index_select(x_lb, dim=dim, index=indices)
-    out_ub = torch.index_select(x_ub, dim=dim, index=indices)
-    assert out_lb.numel() == len(L.out_vars), f"index_select out_vars length {len(L.out_vars)} != output elements {out_lb.numel()}"
+    out_lb = torch.index_select(x_lb, dim=dim + 1, index=indices)
+    out_ub = torch.index_select(x_ub, dim=dim + 1, index=indices)
+    assert out_lb.shape[0] == batch_size, f"index_select batch mismatch {out_lb.shape[0]} != {batch_size}"
+    assert out_lb[0].numel() == len(L.out_vars), f"index_select out_vars length {len(L.out_vars)} != output elements {out_lb[0].numel()}"
     assert torch.all(out_lb <= out_ub), "index_select produced invalid bounds (lb > ub)"
 
-    B = Bounds(out_lb.reshape(-1), out_ub.reshape(-1))
+    B = Bounds(out_lb.reshape(batch_size, -1), out_ub.reshape(batch_size, -1))
 
     C = ConSet()
     C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {

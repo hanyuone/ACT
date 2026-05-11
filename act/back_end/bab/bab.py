@@ -19,7 +19,7 @@ import os
 import sys
 import tempfile
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -45,8 +45,58 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# CE validation
+# CE validation (single-instance contract)
+#
+# BaB operates on single-instance subproblems by construction: each BaB node
+# encodes one MILP for one (input box, ASSERT) pair, with existential
+# encoding of y_true / margin. The `_bab_*` helpers below enforce B=1 at
+# the API boundary so that batched callers from `verify_once` cannot
+# accidentally pipe [B, ...] tensors into BaB. This is NOT a violation of
+# the "native batching, B=1 if sequential" mandate (PR #64 review):
+# batched verify_once is still natively batched; BaB simply isn't a
+# batched algorithm by construction.
 # ---------------------------------------------------------------------------
+
+
+def _bab_scalar(val: Any, name: str) -> float:
+    """Single-instance scalar extraction for BaB CE validation; mirrors
+    ``verifier._b1_scalar``. Rejects multi-element tensors (B>1)."""
+    if isinstance(val, torch.Tensor):
+        if val.numel() != 1:
+            raise ValueError(
+                f"BaB CE validation requires B=1; '{name}' has "
+                f"numel={val.numel()}, shape={tuple(val.shape)}"
+            )
+        return float(val.item())
+    return float(val)
+
+
+def _bab_int(val: Any, name: str) -> int:
+    if isinstance(val, torch.Tensor):
+        if val.numel() != 1:
+            raise ValueError(
+                f"BaB CE validation requires B=1; '{name}' has "
+                f"numel={val.numel()}, shape={tuple(val.shape)}"
+            )
+        return int(val.item())
+    return int(val)
+
+
+def _bab_vec(val: Any, name: str, expected_len: int) -> torch.Tensor:
+    t = val if isinstance(val, torch.Tensor) else torch.as_tensor(val)
+    if t.dim() == 2:
+        if t.shape[0] != 1:
+            raise ValueError(
+                f"BaB CE validation requires B=1; '{name}' has "
+                f"shape={tuple(t.shape)}"
+            )
+        t = t[0]
+    if t.dim() != 1 or t.shape[0] != expected_len:
+        raise ValueError(
+            f"BaB CE validation: '{name}' must reduce to [{expected_len}]; "
+            f"got shape={tuple(t.shape)}"
+        )
+    return t
 
 
 def check_violation_at_point(net: Net, x: torch.Tensor, assert_layer) -> bool:
@@ -55,45 +105,64 @@ def check_violation_at_point(net: Net, x: torch.Tensor, assert_layer) -> bool:
     if not success:
         return False
     y = output.squeeze(0)
+    n_out = y.shape[0]
 
     k = assert_layer.params.get("kind")
 
     if k == OutKind.TOP1_ROBUST:
-        t = int(assert_layer.params["y_true"])
-        mask = torch.ones(y.shape[0], dtype=torch.bool)
+        t = _bab_int(assert_layer.params["y_true"], "y_true")
+        mask = torch.ones(n_out, dtype=torch.bool)
         mask[t] = False
         return (y[mask] - y[t]).max().item() >= 0.0
 
     if k == OutKind.MARGIN_ROBUST:
-        t = int(assert_layer.params["y_true"])
-        margin = float(assert_layer.params["margin"])
-        mask = torch.ones(y.shape[0], dtype=torch.bool)
+        t = _bab_int(assert_layer.params["y_true"], "y_true")
+        margin = _bab_scalar(assert_layer.params["margin"], "margin")
+        mask = torch.ones(n_out, dtype=torch.bool)
         mask[t] = False
         return (y[mask] - y[t]).max().item() >= margin
 
     if k == OutKind.LINEAR_LE:
-        c = torch.as_tensor(assert_layer.params["c"])
-        d = float(assert_layer.params["d"])
+        c = _bab_vec(assert_layer.params["c"], "c", n_out).to(y.dtype)
+        d = _bab_scalar(assert_layer.params["d"], "d")
         return (c @ y).item() >= d + 1e-8
 
     if k == OutKind.RANGE:
-        lb = assert_layer.params.get("lb")
-        ub = assert_layer.params.get("ub")
-        if lb is not None:
-            lb_t = torch.as_tensor(lb)
+        lb_raw = assert_layer.params.get("lb")
+        ub_raw = assert_layer.params.get("ub")
+        if lb_raw is not None:
+            lb_t = _bab_vec(lb_raw, "lb", n_out).to(y.dtype)
             if (y < lb_t - 1e-8).any():
                 return True
-        if ub is not None:
-            ub_t = torch.as_tensor(ub)
+        if ub_raw is not None:
+            ub_t = _bab_vec(ub_raw, "ub", n_out).to(y.dtype)
             if (y > ub_t + 1e-8).any():
                 return True
         return False
 
     if k == OutKind.UNSAFE_LINEAR:
-        C = torch.as_tensor(assert_layer.params["c"])
+        c_raw = assert_layer.params["c"]
+        C = c_raw if isinstance(c_raw, torch.Tensor) else torch.as_tensor(c_raw)
+        if C.dim() == 3:
+            if C.shape[0] != 1:
+                raise ValueError(
+                    f"BaB CE validation requires B=1; UNSAFE_LINEAR c has "
+                    f"shape={tuple(C.shape)}"
+                )
+            C = C[0]
         if C.dim() == 1:
             C = C.unsqueeze(0)
-        d_vec = torch.as_tensor(assert_layer.params["d"]).reshape(-1)
+        d_raw = assert_layer.params["d"]
+        d_t = d_raw if isinstance(d_raw, torch.Tensor) else torch.as_tensor(d_raw)
+        if d_t.dim() == 2:
+            if d_t.shape[0] != 1:
+                raise ValueError(
+                    f"BaB CE validation requires B=1; UNSAFE_LINEAR d has "
+                    f"shape={tuple(d_t.shape)}"
+                )
+            d_t = d_t[0]
+        d_vec = d_t.reshape(-1).to(y.dtype)
+        C = C.to(y.dtype)
         Cy = C @ y.reshape(-1)
         in_unsafe_region = (Cy <= d_vec + 1e-8).all()
         return bool(in_unsafe_region.item())

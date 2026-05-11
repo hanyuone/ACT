@@ -678,17 +678,32 @@ class ACTToTorch:
             raise ValueError(
                 f"ACTToTorch: ASSERT layer {assert_act.id} has unknown kind {output_kind_str!r}."
             ) from exc
+        # OutputSpec dataclass + OutputSpecLayer.forward expect single-sample
+        # high-level fields (c: [n_out], d: scalar, y_true: [1] or scalar,
+        # margin: scalar, lb/ub: [n_out]). The on-disk ASSERT params are the
+        # batched encoded form produced by OutputSpec.encode_linear
+        # (c: [B, n_out], d: [B], y_true: [B], margin: [B], lb/ub: [B, n_out]).
+        # All sample slots carry the same value, so extracting index 0 reduces
+        # without losing information.
+        def _unbatch_first(t: torch.Tensor) -> torch.Tensor:
+            if t.dim() >= 1 and t.shape[0] >= 1:
+                return t[0]
+            return t
+
         output_spec_dict = {"kind": output_spec_kind}
         if "y_true" in output_params:
-            output_spec_dict["y_true"] = _to_target_tensor(output_params["y_true"])
+            yt = _to_target_tensor(output_params["y_true"])
+            output_spec_dict["y_true"] = _unbatch_first(yt).reshape(1)
         if "margin" in output_params:
-            output_spec_dict["margin"] = _to_target_float_tensor(output_params["margin"])
+            mt = _to_target_float_tensor(output_params["margin"])
+            output_spec_dict["margin"] = _unbatch_first(mt).reshape(1)
         if "d" in output_params:
-            output_spec_dict["d"] = _to_target_float_tensor(output_params["d"])
+            dt = _to_target_float_tensor(output_params["d"])
+            output_spec_dict["d"] = _unbatch_first(dt).reshape(1)
         for param_key in ["c", "lb", "ub"]:
             if param_key in output_params:
-                output_spec_dict[param_key] = _to_target_float_tensor(
-                    output_params[param_key]
+                output_spec_dict[param_key] = _unbatch_first(
+                    _to_target_float_tensor(output_params[param_key])
                 )
         output_spec_mod = OutputSpecLayer(OutputSpec(**output_spec_dict))
 

@@ -60,6 +60,11 @@ jobs:
           cd ${{ github.workspace }}
           coverage run -p --source=act -m act.pipeline --verify act2torch --device cpu --dtype float64
 
+      - name: Run Verifier Self-Tests (float64)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p --source=act -m act.back_end.verifier
+
       # Level 1: Counterexample/Soundness Validation
 
       - name: Run Counterexample Validation (float64)

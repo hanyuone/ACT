@@ -476,22 +476,34 @@ class InputSpecLayer(nn.Module):
             if key not in schema["params_required"] + schema["params_optional"]:
                 raise ValueError(f"InputSpecLayer has unknown param: {key}")
 
-    def to_act_layers(self, layer_id_start: int, in_vars: List[int]) -> Tuple[List, List[int]]:
-        """Convert to ACT Layer(s) - INPUT_SPEC doesn't create new vars"""
-        params = {"kind": self.kind}  # kind is now in params
+    def to_act_layers(
+        self,
+        layer_id_start: int,
+        in_vars: List[int],
+        B: int = 1,
+    ) -> Tuple[List, List[int]]:
+        """Convert to ACT Layer(s) - INPUT_SPEC doesn't create new vars.
+
+        ``B`` is accepted for signature parity with ``OutputSpecLayer`` so
+        callers can pass the batch dim uniformly; currently unused because
+        ``InputSpec`` tensors are already batched at construction time
+        (lb/ub/center carry the leading B dim from the wrapped tensors).
+        """
+        del B
+        params = {"kind": self.kind}
         for name in ("lb", "ub", "center", "A", "b"):
             val = getattr(self, name, None)
             if val is not None:
                 params[name] = val
         if self.eps is not None:
             params["eps"] = self.eps
-        
+
         layer = create_layer(
             id=layer_id_start,
             kind=LayerKind.INPUT_SPEC.value,
             params=params,
             in_vars=in_vars,
-            out_vars=in_vars  # INPUT_SPEC doesn't change variables
+            out_vars=in_vars,
         )
         return [layer], in_vars
 
@@ -608,46 +620,54 @@ class OutputSpecLayer(nn.Module):
         self._validate_schema()
 
     def _validate_schema(self):
-        """Validate parameters against ASSERT layer schema"""
-        schema = REGISTRY[LayerKind.ASSERT.value]
-        params = {"kind": self.kind}
-        for name in ("c", "lb", "ub"):
-            val = getattr(self, name, None)
-            if val is not None:
-                params[name] = val
-        if self.y_true is not None:
-            params["y_true"] = self.y_true
-        if self.margin is not None:
-            params["margin"] = self.margin
-        if self.d is not None:
-            params["d"] = self.d
-        
-        # Check schema compliance
-        for key in schema["params_required"]:
-            if key not in params:
-                raise ValueError(f"OutputSpecLayer missing required param: {key}")
+        """Pre-flight kind validation; full ASSERT-layer schema (including
+        pre-encoded ``C`` / ``thresholds`` / ``M``) is enforced at
+        ``to_act_layers`` time via ``create_layer``.
+        """
+        supported = (
+            OutKind.LINEAR_LE, OutKind.UNSAFE_LINEAR,
+            OutKind.TOP1_ROBUST, OutKind.MARGIN_ROBUST, OutKind.RANGE,
+        )
+        if self.kind not in supported:
+            raise ValueError(
+                f"OutputSpecLayer: unsupported kind {self.kind!r}; "
+                f"expected one of {supported}"
+            )
 
-    def to_act_layers(self, layer_id_start: int, in_vars: List[int]) -> Tuple[List, List[int]]:
-        """Convert to ACT Layer(s) - ASSERT doesn't create new vars"""
-        # Build unified params dict
-        params = {"kind": self.kind}
-        for name in ("c", "lb", "ub"):
-            val = getattr(self, name, None)
-            if val is not None:
-                params[name] = val
-        if self.y_true is not None:
-            params["y_true"] = self.y_true
-        if self.margin is not None:
-            params["margin"] = self.margin
-        if self.d is not None:
-            params["d"] = self.d
-        
+    def to_act_layers(
+        self,
+        layer_id_start: int,
+        in_vars: List[int],
+        B: int = 1,
+    ) -> Tuple[List, List[int]]:
+        """Build the ACT ASSERT Layer for this output spec.
+
+        Encodes the spec via ``OutputSpec.encode_linear``, producing a
+        params dict with both high-level fields (for the BaB MILP path)
+        and pre-encoded ``C`` / ``thresholds`` / ``M`` (for ``verify_once``).
+
+        Args:
+            layer_id_start: numeric id to assign to the new ASSERT layer.
+            in_vars: variable ids carrying the network output values that
+                this assert constrains (``out_vars == in_vars`` for ASSERT).
+            B: batch size of the surrounding net; flows from the InputLayer's
+                ``shape[0]``. Defaults to 1 for backward-compatible callers.
+        """
+        from act.util.device_manager import (
+            get_default_device, get_default_dtype,
+        )
+        n_out = len(in_vars)
+        device = get_default_device()
+        dtype = get_default_dtype()
+        params = self.spec.encode_linear(
+            B=B, n_out=n_out, device=device, dtype=dtype,
+        )
         layer = create_layer(
             id=layer_id_start,
             kind=LayerKind.ASSERT.value,
             params=params,
             in_vars=in_vars,
-            out_vars=in_vars  # ASSERT doesn't change variables
+            out_vars=in_vars,
         )
         return [layer], in_vars
 

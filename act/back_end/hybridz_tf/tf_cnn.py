@@ -78,11 +78,11 @@ def tf_maxpool2d(L, bounds, tf):
 # --- HZ conv2d (zonotope domain) ---
 
 def _conv2d_generators(
-    G, weight, C, H, W, stride, padding, dilation, groups, n_out, dtype, device
+    G, weight, C, H, W, stride, padding, dilation, groups, n_out
 ):
     """Apply conv2d to a generator matrix (Gc or Gb)."""
     if G.shape[1] == 0:
-        return torch.zeros((n_out, 0), dtype=dtype, device=device)
+        return G.new_zeros(n_out, 0)
     ncols = G.shape[1]
     imgs = G.t().contiguous().view(ncols, C, H, W)
     out = F.conv2d(
@@ -101,7 +101,6 @@ def hz_conv2d(
     hz: HZono, weight, bias, stride, padding, dilation, groups, input_shape
 ) -> HZono:
     """Apply conv2d to a hybrid zonotope: convolve center and each generator column."""
-    dtype, device = hz.c.dtype, hz.c.device
     # Inline shape extraction (no parse_input_shape dependency)
     if len(input_shape) == 4:
         _, C, H, W = input_shape
@@ -109,13 +108,13 @@ def hz_conv2d(
         C, H, W = input_shape
     else:
         raise ValueError(f"Unexpected input_shape={input_shape}, expected 3D or 4D")
-    weight = weight.to(dtype=dtype, device=device)
+    weight = weight.to(hz.c)
 
     c_img = hz.c.view(C, H, W).unsqueeze(0)
     out_c = F.conv2d(
         c_img,
         weight,
-        bias=bias.to(dtype=dtype, device=device) if bias is not None else None,
+        bias=bias.to(hz.c) if bias is not None else None,
         stride=stride,
         padding=padding,
         dilation=dilation,
@@ -125,10 +124,10 @@ def hz_conv2d(
     n_out = new_c.shape[0]
 
     new_Gc = _conv2d_generators(
-        hz.Gc, weight, C, H, W, stride, padding, dilation, groups, n_out, dtype, device
+        hz.Gc, weight, C, H, W, stride, padding, dilation, groups, n_out
     )
     new_Gb = _conv2d_generators(
-        hz.Gb, weight, C, H, W, stride, padding, dilation, groups, n_out, dtype, device
+        hz.Gb, weight, C, H, W, stride, padding, dilation, groups, n_out
     )
 
     return HZono(

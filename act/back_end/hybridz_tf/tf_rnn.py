@@ -25,12 +25,11 @@ def tf_lstm(L: Layer, Bin: Bounds, tf) -> Fact:
     cfg = _read_rnn_config(L, op_name="tf_lstm")
     seq_lb, seq_ub = _seq_view(Bin, cfg)
     B, T, H = cfg["batch"], cfg["seq_len"], cfg["hidden_size"]
-    dtype, device = Bin.lb.dtype, Bin.lb.device
 
-    h_lb = torch.zeros(B, H, dtype=dtype, device=device)
-    h_ub = torch.zeros(B, H, dtype=dtype, device=device)
-    c_lb = torch.zeros(B, H, dtype=dtype, device=device)
-    c_ub = torch.zeros(B, H, dtype=dtype, device=device)
+    h_lb = Bin.lb.new_zeros(B, H)
+    h_ub = Bin.lb.new_zeros(B, H)
+    c_lb = Bin.lb.new_zeros(B, H)
+    c_ub = Bin.lb.new_zeros(B, H)
 
     out_lb_steps, out_ub_steps = [], []
     for t in range(T):
@@ -50,10 +49,9 @@ def tf_gru(L: Layer, Bin: Bounds, tf) -> Fact:
     cfg = _read_rnn_config(L, op_name="tf_gru")
     seq_lb, seq_ub = _seq_view(Bin, cfg)
     B, T, H = cfg["batch"], cfg["seq_len"], cfg["hidden_size"]
-    dtype, device = Bin.lb.dtype, Bin.lb.device
 
-    h_lb = torch.zeros(B, H, dtype=dtype, device=device)
-    h_ub = torch.zeros(B, H, dtype=dtype, device=device)
+    h_lb = Bin.lb.new_zeros(B, H)
+    h_ub = Bin.lb.new_zeros(B, H)
 
     out_lb_steps, out_ub_steps = [], []
     for t in range(T):
@@ -77,10 +75,9 @@ def tf_rnn(L: Layer, Bin: Bounds, tf) -> Fact:
 
     seq_lb, seq_ub = _seq_view(Bin, cfg)
     B, T, H = cfg["batch"], cfg["seq_len"], cfg["hidden_size"]
-    dtype, device = Bin.lb.dtype, Bin.lb.device
 
-    h_lb = torch.zeros(B, H, dtype=dtype, device=device)
-    h_ub = torch.zeros(B, H, dtype=dtype, device=device)
+    h_lb = Bin.lb.new_zeros(B, H)
+    h_ub = Bin.lb.new_zeros(B, H)
 
     out_lb_steps, out_ub_steps = [], []
     W = cfg["weights"]

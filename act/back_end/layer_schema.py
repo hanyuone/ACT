@@ -232,14 +232,14 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
         ],
     },
     LayerKind.ASSERT.value: {
-        "params_required": ["kind"],
+        "params_required": ["kind", "C", "thresholds", "M"],
         "params_optional": [
-            "c",  # Tensor: coefficient vector for LINEAR_LE (c^T y <= d)
-            "lb",  # Tensor: lower bounds for RANGE
-            "ub",  # Tensor: upper bounds for RANGE
-            "d",  # Scalar: threshold for LINEAR_LE (c^T y <= d)
-            "y_true",  # Scalar int: true class index for TOP1_ROBUST / MARGIN_ROBUST
-            "margin",  # Scalar float: margin threshold for MARGIN_ROBUST
+            "c",
+            "lb",
+            "ub",
+            "d",
+            "y_true",
+            "margin",
         ],
     },
     # =====================
