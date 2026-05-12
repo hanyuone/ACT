@@ -64,33 +64,34 @@ class TensorEncoder:
     @staticmethod
     def decode_tensor(tensor_dict: Dict[str, Any], target_device: Optional[str] = None) -> torch.Tensor:
         """Convert JSON dictionary back to PyTorch tensor.
-        
-        Note: Always converts to device_manager's default dtype for runtime consistency.
-        This allows loading float64 JSON files in float32 runtime and vice versa.
+
+        Floating-point tensors are normalized to device_manager's default
+        dtype so JSONs serialized at float64 still load cleanly into a
+        float32 runtime (and vice versa). Integer / bool dtypes are
+        preserved as-is — coercing them to float breaks invariants in
+        downstream consumers (e.g. ``y_true`` must stay ``torch.long`` for
+        ``y[arange(B), y_true]`` advanced indexing in
+        ``OutputSpecLayer.forward``).
         """
         if not HAS_TORCH:
             raise ACTSerializationError("PyTorch not available for tensor decoding")
-            
-        # Decode base64 data
+
         encoded_data = tensor_dict["data"]
         buffer = io.BytesIO(base64.b64decode(encoded_data.encode('utf-8')))
         np_array = np.load(buffer)
-        
-        # Create tensor and convert to runtime dtype
-        # IMPORTANT: We always use device_manager's dtype for consistency
-        from act.util.device_manager import get_default_dtype
-        target_dtype = get_default_dtype()
-        tensor = torch.from_numpy(np_array).to(dtype=target_dtype)
-        
-        # Move to device
+
+        tensor = torch.from_numpy(np_array)
+        if tensor.is_floating_point():
+            from act.util.device_manager import get_default_dtype
+            tensor = tensor.to(dtype=get_default_dtype())
+
         device = target_device or tensor_dict.get("device", "cpu")
         if device != "cpu":
             tensor = tensor.to(device)
-            
-        # Set requires_grad
+
         if tensor_dict.get("requires_grad", False):
             tensor.requires_grad_(True)
-            
+
         return tensor
 
 class LayerSerializer:

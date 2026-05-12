@@ -1278,7 +1278,7 @@ def main():
     wrapped_models = model_synthesis()
     print(f"  Generated {len(wrapped_models)} wrapped models")
     
-    # Step 2: Test all models with inference (input data now stored in models)
+    # Step 2: Test all models with inference (each wrapped model carries its own input data).
     print("\n Step 2: Testing model inference...")
     successful_models = model_inference(wrapped_models)
     print(f"  {len(successful_models)} models passed inference tests")

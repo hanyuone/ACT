@@ -160,8 +160,8 @@ class VerifiableModel(nn.Module):
         else:
             x = result
         
-        # Convert tensor satisfied to bool for dict output (backward compatible)
-        # Spec layers now always return tensor, convert here
+        # Spec layers always return tensors; collapse them to a single
+        # bool for the dict-shaped output expected by callers.
         if isinstance(input_satisfied, torch.Tensor):
             input_satisfied = bool(input_satisfied.all().item())
         if isinstance(output_satisfied, torch.Tensor):
@@ -232,7 +232,7 @@ class InputLayer(nn.Module):
         if shape[0] < 1:
             raise ValueError(f"Batch size must be >= 1, got {shape[0]}")
         
-        # Core attributes (dtype now required)
+        # Core attributes (dtype is required by callers downstream).
         self.shape = tuple(shape)
         self._batched = shape[0] > 1  # Track if batched for to_act_layers
         self.dtype = dtype  # REQUIRED
@@ -460,7 +460,7 @@ class InputSpecLayer(nn.Module):
     def _validate_schema(self):
         """Validate parameters against INPUT_SPEC layer schema"""
         schema = REGISTRY[LayerKind.INPUT_SPEC.value]
-        params = {"kind": self.kind}  # kind is now in params
+        params = {"kind": self.kind}
         for name in ("lb", "ub", "center", "A", "b"):
             val = getattr(self, name, None)
             if val is not None:
@@ -651,7 +651,7 @@ class OutputSpecLayer(nn.Module):
             in_vars: variable ids carrying the network output values that
                 this assert constrains (``out_vars == in_vars`` for ASSERT).
             B: batch size of the surrounding net; flows from the InputLayer's
-                ``shape[0]``. Defaults to 1 for backward-compatible callers.
+                ``shape[0]``. Defaults to 1 when the caller has no batch context.
         """
         from act.util.device_manager import (
             get_default_device, get_default_dtype,
@@ -713,7 +713,7 @@ class OutputSpecLayer(nn.Module):
             max_other = other_scores.max(dim=1)[0]  # (batch,)
             
             actual_margin = true_scores - max_other  # (batch,)
-            margin_threshold = self.margin  # Always tensor now (even for n=1)
+            margin_threshold = self.margin  # always a tensor, including the n=1 case
             satisfied = actual_margin >= margin_threshold  # (batch,) bool
             
             # Unified explanation format (consistent across all batch sizes)
@@ -726,17 +726,16 @@ class OutputSpecLayer(nn.Module):
         elif self.kind == OutKind.LINEAR_LE:
             if self.c is None or self.d is None:
                 return (y, True, "⚠️ OUTPUT LINEAR_LE: Missing c/d")
-            
-            # Works for both single and batched (c applied to each sample)
+
             y_2d = y.reshape(batch_size, -1)  # (batch, n_vars)
-            lhs = (y_2d @ self.c)  # (batch,)
-            satisfied = lhs <= self.d  # (batch,) bool
-            
-            # Unified explanation format (consistent across all batch sizes)
+            # c is [n_out] (single-sample) or [B, n_out] (batch-native).
+            # Element-wise multiply + sum gives a per-lane lhs in both cases
+            # (broadcasts when c is 1-D); plain matmul would mismatch on the
+            # batch-native shape.
+            lhs = (y_2d * self.c).sum(dim=1)  # (batch,)
+            satisfied = lhs <= self.d.reshape(-1)  # (batch,) bool
             n_ok = satisfied.sum().item()
             explanation = f"✅ OUTPUT LINEAR_LE: {n_ok}/{batch_size} satisfied"
-            
-            # Always return tensor (unified output format)
             return (y, satisfied, explanation)
         
         elif self.kind == OutKind.RANGE:
@@ -762,10 +761,20 @@ class OutputSpecLayer(nn.Module):
             if self.c is None or self.d is None:
                 return (y, True, "⚠️ OUTPUT UNSAFE_LINEAR: Missing c/d")
             y_2d = y.reshape(batch_size, -1)
-            C = self.c if self.c.dim() >= 2 else self.c.unsqueeze(0)
-            d_vec = self.d.reshape(-1)
-            Cy = y_2d @ C.T
-            unsafe = (Cy <= d_vec).all(dim=1)
+            # c shape branches:
+            #   [n_out]          single-row legacy → promote to [1, n_out]
+            #   [N, n_out]       single-sample, N rows
+            #   [B, N, n_out]    batch-native, per-lane rows
+            # d shape pairs naturally: [1] / [N] / [B, N]. y is in {Cy <= d}
+            # iff ALL rows hold; safe iff NOT in the polytope.
+            if self.c.dim() == 3:
+                Cy = torch.einsum("bmn,bn->bm", self.c, y_2d)  # [B, N]
+                d_per_lane = self.d  # [B, N]
+            else:
+                C = self.c if self.c.dim() == 2 else self.c.unsqueeze(0)
+                Cy = y_2d @ C.T  # [B, N]
+                d_per_lane = self.d.reshape(-1)  # [N]
+            unsafe = (Cy <= d_per_lane).all(dim=1)
             satisfied = ~unsafe
             n_ok = satisfied.sum().item()
             explanation = f"✅ OUTPUT UNSAFE_LINEAR: {n_ok}/{batch_size} safe (UNSAFE={batch_size - n_ok})"

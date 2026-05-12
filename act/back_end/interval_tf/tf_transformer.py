@@ -50,10 +50,16 @@ def tf_layernorm(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_gelu(L: Layer, Bin: Bounds) -> Fact:
-    f=lambda x: 0.5*x*(1+torch.tanh(torch.sqrt(torch.tensor(2.0/torch.pi))*(x+0.044715*(x**3))))
-    B=Bounds(f(Bin.lb), f(Bin.ub)); C=ConSet()
+    GELU_MIN_X = -0.7517916
+    GELU_MIN_Y = -0.17004
+    f = lambda x: 0.5*x*(1+torch.tanh(torch.sqrt(torch.tensor(2.0/torch.pi))*(x+0.044715*(x**3))))
+    f_lb, f_ub = f(Bin.lb), f(Bin.ub)
+    contains_min = (Bin.lb <= GELU_MIN_X) & (Bin.ub >= GELU_MIN_X)
+    lb = torch.where(contains_min, torch.full_like(f_lb, GELU_MIN_Y), torch.minimum(f_lb, f_ub))
+    ub = torch.maximum(f_lb, f_ub)
+    B = Bounds(lb, ub); C = ConSet()
     C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"gelu:{L.id}","segs":pwl_meta(Bin.lb,Bin.ub,3)}))
-    C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+    C.add_box(L.id, L.out_vars, B); return Fact(B, C)
 
 def tf_att_scores(L: Layer, Bq: Bounds, Bk: Bounds) -> Fact:
     batch_size = Bq.lb.shape[0]

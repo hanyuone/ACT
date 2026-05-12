@@ -1263,6 +1263,18 @@ class NetFactory:
             )
             eps = float(params.get("eps", 0.0))
             return {"center": center, "lb": center - eps, "ub": center + eps}
+        if params["kind"] == InKind.LIN_POLY:
+            A = params.get("A")
+            b = params.get("b")
+            if A is None or b is None:
+                raise ValueError(
+                    "LIN_POLY INPUT_SPEC requires both 'A' and 'b' tensors "
+                    "(constraint A @ x_flat <= b)."
+                )
+            return {
+                "A": torch.as_tensor(A, dtype=dtype),
+                "b": torch.as_tensor(b, dtype=dtype),
+            }
         raise ValueError(f"Unsupported INPUT_SPEC kind '{params.get('kind')}'")
 
     def _assert_params(
@@ -1630,6 +1642,21 @@ def _lt_input(shape: List[int], lb: float, ub: float) -> List[Dict[str, Any]]:
     ]
 
 
+def _lt_input_with_lin_poly(
+    shape: List[int],
+    lb: float,
+    ub: float,
+    A: torch.Tensor,
+    b: torch.Tensor,
+) -> List[Dict[str, Any]]:
+    return _lt_input(shape, lb, ub) + [
+        {
+            "kind": LayerKind.INPUT_SPEC.value,
+            "params": {"kind": InKind.LIN_POLY, "A": A, "b": b},
+        },
+    ]
+
+
 def _lt_const(value: torch.Tensor, shape: List[int]) -> Dict[str, Any]:
     flat = value.detach().clone().reshape(-1)
     s = [int(d) for d in shape]
@@ -1646,6 +1673,48 @@ def _lt_assert_le(c_vec: List[float], d: float) -> Dict[str, Any]:
             "kind": OutKind.LINEAR_LE,
             "c": [float(x) for x in c_vec],
             "d": float(d),
+        },
+    }
+
+
+def _lt_assert_top1(y_true: int) -> Dict[str, Any]:
+    return {
+        "kind": LayerKind.ASSERT.value,
+        "params": {"kind": OutKind.TOP1_ROBUST, "y_true": int(y_true)},
+    }
+
+
+def _lt_assert_margin(y_true: int, margin: float) -> Dict[str, Any]:
+    return {
+        "kind": LayerKind.ASSERT.value,
+        "params": {
+            "kind": OutKind.MARGIN_ROBUST,
+            "y_true": int(y_true),
+            "margin": float(margin),
+        },
+    }
+
+
+def _lt_assert_range(lb_vec: List[float], ub_vec: List[float]) -> Dict[str, Any]:
+    return {
+        "kind": LayerKind.ASSERT.value,
+        "params": {
+            "kind": OutKind.RANGE,
+            "lb": [float(x) for x in lb_vec],
+            "ub": [float(x) for x in ub_vec],
+        },
+    }
+
+
+def _lt_assert_unsafe_linear(
+    c_mat: List[List[float]], d_vec: List[float]
+) -> Dict[str, Any]:
+    return {
+        "kind": LayerKind.ASSERT.value,
+        "params": {
+            "kind": OutKind.UNSAFE_LINEAR,
+            "c": [[float(x) for x in row] for row in c_mat],
+            "d": [float(x) for x in d_vec],
         },
     }
 
@@ -1791,10 +1860,72 @@ def _lt_spec_rnn() -> Dict[str, Any]:
 
 
 def _lt_spec_layernorm() -> Dict[str, Any]:
+    # tf_layernorm requires gamma / beta as tensor params on the layer; the
+    # previous fixture only set shapes and would have raised KeyError at
+    # transfer-function time, which is why the example was never registered
+    # in LAYER_TESTING_SPECS. Provide identity affine (gamma=1, beta=0) so
+    # the TF runs to completion and exercises every branch of the interval
+    # layernorm bounds.
+    dtype = get_default_dtype()
+    gamma = torch.ones(8, dtype=dtype)
+    beta = torch.zeros(8, dtype=dtype)
     return {"layers": _lt_input([1, 8], -1.0, 1.0) + [
         {"kind": LayerKind.LAYERNORM.value,
-         "params": {"input_shape": [1, 8], "output_shape": [1, 8]}},
+         "params": {"input_shape": [1, 8], "output_shape": [1, 8],
+                    "gamma": gamma, "beta": beta, "eps": 1e-5}},
         _lt_assert_le([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 100.0),
+    ]}
+
+
+def _lt_spec_posenc() -> Dict[str, Any]:
+    # POSENC adds a fixed position vector to the input; exercises tf_posenc
+    # (interval) which is otherwise unreachable through random generation.
+    dtype = get_default_dtype()
+    pos_vec = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], dtype=dtype)
+    return {"layers": _lt_input([1, 6], -1.0, 1.0) + [
+        {"kind": LayerKind.POSENC.value,
+         "params": {"pos_vec": pos_vec, "input_shape": [1, 6],
+                    "output_shape": [1, 6]}},
+        _lt_assert_le([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], 100.0),
+    ]}
+
+
+def _lt_spec_mask_add() -> Dict[str, Any]:
+    # MASK_ADD adds an attention mask (broadcasted bias) to the input;
+    # exercises tf_mask_add which is otherwise unreachable.
+    dtype = get_default_dtype()
+    M = torch.tensor([0.0, -1e4, 0.0, -1e4], dtype=dtype)
+    return {"layers": _lt_input([1, 4], -1.0, 1.0) + [
+        {"kind": LayerKind.MASK_ADD.value,
+         "params": {"M": M, "input_shape": [1, 4], "output_shape": [1, 4]}},
+        _lt_assert_le([1.0, 0.0, 0.0, 0.0], 1.0),
+    ]}
+
+
+def _lt_spec_conv1d() -> Dict[str, Any]:
+    # Minimal CONV1D exercising tf_cnn.py 1-D conv branch (factory auto-fills
+    # weight via _gen_weight when "weight" is absent from params).
+    return {"layers": _lt_input([1, 2, 6], -1.0, 1.0) + [
+        {"kind": LayerKind.CONV1D.value, "params": {
+            "in_channels": 2, "out_channels": 3, "kernel_size": 3,
+            "stride": 1, "padding": 1, "dilation": 1, "groups": 1,
+            "input_shape": [1, 2, 6], "output_shape": [1, 3, 6],
+        }},
+        {"kind": LayerKind.FLATTEN.value, "params": {"start_dim": 1}},
+        _lt_assert_le([1.0] + [0.0] * 17, 100.0),
+    ]}
+
+
+def _lt_spec_conv3d() -> Dict[str, Any]:
+    # Minimal CONV3D exercising tf_cnn.py 3-D conv branch.
+    return {"layers": _lt_input([1, 1, 4, 4, 4], -1.0, 1.0) + [
+        {"kind": LayerKind.CONV3D.value, "params": {
+            "in_channels": 1, "out_channels": 2, "kernel_size": 3,
+            "stride": 1, "padding": 1, "dilation": 1, "groups": 1,
+            "input_shape": [1, 1, 4, 4, 4], "output_shape": [1, 2, 4, 4, 4],
+        }},
+        {"kind": LayerKind.FLATTEN.value, "params": {"start_dim": 1}},
+        _lt_assert_le([1.0] + [0.0] * 127, 100.0),
     ]}
 
 
@@ -1805,6 +1936,85 @@ def _lt_spec_gelu() -> Dict[str, Any]:
     ]}
 
 
+def _lt_spec_relu6() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 4], -2.0, 8.0) + [
+        {"kind": LayerKind.RELU6.value, "params": {}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 24.0),
+    ]}
+
+
+def _lt_spec_hardtanh() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 4], -3.0, 3.0) + [
+        {"kind": LayerKind.HARDTANH.value,
+         "params": {"min_val": -1.0, "max_val": 1.0}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
+    ]}
+
+
+def _lt_spec_hardsigmoid() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 4], -4.0, 4.0) + [
+        {"kind": LayerKind.HARDSIGMOID.value, "params": {}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
+    ]}
+
+
+def _lt_spec_hardswish() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 4], -2.5, 2.5) + [
+        {"kind": LayerKind.HARDSWISH.value, "params": {}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 10.0),
+    ]}
+
+
+def _lt_spec_mish() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 4], -2.0, 2.0) + [
+        {"kind": LayerKind.MISH.value, "params": {}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 8.0),
+    ]}
+
+
+def _lt_spec_softsign() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 4], -3.0, 3.0) + [
+        {"kind": LayerKind.SOFTSIGN.value, "params": {}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
+    ]}
+
+
+def _lt_spec_square() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 4], -2.0, 1.5) + [
+        {"kind": LayerKind.SQUARE.value, "params": {}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 16.0),
+    ]}
+
+
+def _lt_spec_pow() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 4], -1.0, 2.0) + [
+        {"kind": LayerKind.POWER.value, "params": {"p": 2.0}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 16.0),
+    ]}
+
+
+def _lt_spec_max_op() -> Dict[str, Any]:
+    dtype = get_default_dtype()
+    return {"layers": _lt_input([1, 3], 0.0, 1.0) + [
+        _lt_const(torch.tensor([0.5, 0.5, 0.5], dtype=dtype), [3]),
+        {"kind": LayerKind.MAX.value,
+         "params": {"input_shape": [1, 3], "output_shape": [1, 3]},
+         "preds": [1, 2]},
+        _lt_assert_le([1.0, 1.0, 1.0], 5.0),
+    ]}
+
+
+def _lt_spec_min_op() -> Dict[str, Any]:
+    dtype = get_default_dtype()
+    return {"layers": _lt_input([1, 3], 0.0, 1.0) + [
+        _lt_const(torch.tensor([0.5, 0.5, 0.5], dtype=dtype), [3]),
+        {"kind": LayerKind.MIN.value,
+         "params": {"input_shape": [1, 3], "output_shape": [1, 3]},
+         "preds": [1, 2]},
+        _lt_assert_le([1.0, 1.0, 1.0], 5.0),
+    ]}
+
+
 def _lt_spec_softmax() -> Dict[str, Any]:
     return {"layers": _lt_input([1, 4], -1.0, 1.0) + [
         {"kind": LayerKind.SOFTMAX.value, "params": {"axis": -1}},
@@ -1812,22 +2022,178 @@ def _lt_spec_softmax() -> Dict[str, Any]:
     ]}
 
 
+def _lt_spec_bab_deep() -> Dict[str, Any]:
+    # MLP with RELU activations + tight LINEAR_LE constraint engineered so
+    # interval certification at the seed box cannot prove the property
+    # (verify_once → UNKNOWN), forcing verify_bab to actually split
+    # subproblems and exercise branching/bounding strategies that are dead
+    # code on trivially-CERTIFIED examples. The d=0.01 threshold is below
+    # the conservative interval upper bound but above what BaB can refine
+    # to via box-splitting.
+    return {"layers": _lt_input([1, 4], -1.0, 1.0) + [
+        {"kind": LayerKind.DENSE.value, "params": {
+            "in_features": 4, "out_features": 8, "use_bias": True,
+        }},
+        {"kind": LayerKind.RELU.value, "params": {}},
+        {"kind": LayerKind.DENSE.value, "params": {
+            "in_features": 8, "out_features": 4, "use_bias": True,
+        }},
+        {"kind": LayerKind.RELU.value, "params": {}},
+        {"kind": LayerKind.DENSE.value, "params": {
+            "in_features": 4, "out_features": 2, "use_bias": True,
+        }},
+        _lt_assert_le([1.0, 1.0], 0.01),
+    ]}
+
+
+def _lt_spec_conv_transpose_2d() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 2, 4, 4], -1.0, 1.0) + [
+        {"kind": LayerKind.CONVTRANSPOSE2D.value, "params": {
+            "in_channels": 2, "out_channels": 1, "kernel_size": 4,
+            "stride": 2, "padding": 1, "dilation": 1, "groups": 1,
+            "transposed": True, "output_padding": 0,
+            "input_shape": [1, 2, 4, 4], "output_shape": [1, 1, 8, 8],
+        }},
+        {"kind": LayerKind.FLATTEN.value, "params": {"start_dim": 1}},
+        _lt_assert_le([1.0] + [0.0] * 63, 100.0),
+    ]}
+
+
+def _lt_spec_lin_poly() -> Dict[str, Any]:
+    # BOX seed [0, 1]^3 plus a single hyperplane x[0] + x[1] <= 1; covers
+    # InKind.LIN_POLY in seed_from_input_specs / add_all_input_specs and the
+    # multi-INPUT_SPEC topology that single-spec examples cannot reach.
+    dtype = get_default_dtype()
+    A = torch.tensor([[1.0, 1.0, 0.0]], dtype=dtype)
+    b = torch.tensor([1.0], dtype=dtype)
+    return {"layers": _lt_input_with_lin_poly([1, 3], 0.0, 1.0, A, b) + [
+        {
+            "kind": LayerKind.DENSE.value,
+            "params": {
+                "in_features": 3, "out_features": 2, "use_bias": True,
+            },
+        },
+        _lt_assert_le([1.0, 0.0], 100.0),
+    ]}
+
+
+def _lt_spec_margin_robust() -> Dict[str, Any]:
+    # Tiny MLP with MARGIN_ROBUST ASSERT; covers OutKind.MARGIN_ROBUST in
+    # add_negated_assert_to_solver and the encoded_linear MARGIN_ROBUST path.
+    return {"layers": _lt_input([1, 4], -1.0, 1.0) + [
+        {
+            "kind": LayerKind.DENSE.value,
+            "params": {
+                "in_features": 4, "out_features": 3, "use_bias": True,
+            },
+        },
+        _lt_assert_margin(y_true=0, margin=0.0),
+    ]}
+
+
+def _lt_spec_top1_robust() -> Dict[str, Any]:
+    # Tiny MLP with TOP1_ROBUST ASSERT; covers OutKind.TOP1_ROBUST in
+    # add_negated_assert_to_solver (existing random nets favor this kind, but
+    # a deterministic example pins coverage independent of seed).
+    return {"layers": _lt_input([1, 4], -1.0, 1.0) + [
+        {
+            "kind": LayerKind.DENSE.value,
+            "params": {
+                "in_features": 4, "out_features": 3, "use_bias": True,
+            },
+        },
+        _lt_assert_top1(y_true=0),
+    ]}
+
+
+def _lt_spec_range() -> Dict[str, Any]:
+    # Tiny MLP with RANGE ASSERT; covers OutKind.RANGE in
+    # add_negated_assert_to_solver and the v_max fallback in the RANGE branch.
+    return {"layers": _lt_input([1, 4], -1.0, 1.0) + [
+        {
+            "kind": LayerKind.DENSE.value,
+            "params": {
+                "in_features": 4, "out_features": 2, "use_bias": True,
+            },
+        },
+        _lt_assert_range(lb_vec=[-10.0, -10.0], ub_vec=[10.0, 10.0]),
+    ]}
+
+
+def _lt_spec_unsafe_linear() -> Dict[str, Any]:
+    # Tiny MLP with UNSAFE_LINEAR ASSERT (multi-row linear inequality);
+    # covers OutKind.UNSAFE_LINEAR in add_negated_assert_to_solver and the
+    # B=1 tensor-vs-scalar branch in the verifier's _b1_vec helper.
+    return {"layers": _lt_input([1, 4], -1.0, 1.0) + [
+        {
+            "kind": LayerKind.DENSE.value,
+            "params": {
+                "in_features": 4, "out_features": 3, "use_bias": True,
+            },
+        },
+        _lt_assert_unsafe_linear(
+            c_mat=[[1.0, 0.0, 0.0], [0.0, 1.0, -1.0]],
+            d_vec=[10.0, 10.0],
+        ),
+    ]}
+
+
 LAYER_TESTING_SPECS: Dict[str, Any] = {
-    f"{LAYER_TESTING_NAME_PREFIX}constant":     _lt_spec_constant,
-    f"{LAYER_TESTING_NAME_PREFIX}sign":         _lt_spec_sign,
-    f"{LAYER_TESTING_NAME_PREFIX}reduce_sum":   _lt_spec_reduce_sum,
-    f"{LAYER_TESTING_NAME_PREFIX}compare":      _lt_spec_compare,
-    f"{LAYER_TESTING_NAME_PREFIX}where":        _lt_spec_where,
-    f"{LAYER_TESTING_NAME_PREFIX}matmul":       _lt_spec_matmul,
-    f"{LAYER_TESTING_NAME_PREFIX}arg_extremum": _lt_spec_arg_extremum,
-    f"{LAYER_TESTING_NAME_PREFIX}upsample":     _lt_spec_upsample,
-    f"{LAYER_TESTING_NAME_PREFIX}expand":       _lt_spec_expand,
-    f"{LAYER_TESTING_NAME_PREFIX}scatter_nd":   _lt_spec_scatter_nd,
-    f"{LAYER_TESTING_NAME_PREFIX}lstm":         _lt_spec_lstm,
-    f"{LAYER_TESTING_NAME_PREFIX}gru":          _lt_spec_gru,
-    f"{LAYER_TESTING_NAME_PREFIX}rnn":          _lt_spec_rnn,
-    f"{LAYER_TESTING_NAME_PREFIX}gelu":         _lt_spec_gelu,
-    f"{LAYER_TESTING_NAME_PREFIX}softmax":      _lt_spec_softmax,
+    f"{LAYER_TESTING_NAME_PREFIX}constant":      _lt_spec_constant,
+    f"{LAYER_TESTING_NAME_PREFIX}sign":          _lt_spec_sign,
+    f"{LAYER_TESTING_NAME_PREFIX}reduce_sum":    _lt_spec_reduce_sum,
+    f"{LAYER_TESTING_NAME_PREFIX}compare":       _lt_spec_compare,
+    f"{LAYER_TESTING_NAME_PREFIX}where":         _lt_spec_where,
+    f"{LAYER_TESTING_NAME_PREFIX}matmul":        _lt_spec_matmul,
+    f"{LAYER_TESTING_NAME_PREFIX}arg_extremum":  _lt_spec_arg_extremum,
+    f"{LAYER_TESTING_NAME_PREFIX}upsample":      _lt_spec_upsample,
+    f"{LAYER_TESTING_NAME_PREFIX}expand":        _lt_spec_expand,
+    f"{LAYER_TESTING_NAME_PREFIX}scatter_nd":    _lt_spec_scatter_nd,
+    f"{LAYER_TESTING_NAME_PREFIX}lstm":          _lt_spec_lstm,
+    f"{LAYER_TESTING_NAME_PREFIX}gru":           _lt_spec_gru,
+    f"{LAYER_TESTING_NAME_PREFIX}rnn":           _lt_spec_rnn,
+    f"{LAYER_TESTING_NAME_PREFIX}gelu":          _lt_spec_gelu,
+    f"{LAYER_TESTING_NAME_PREFIX}softmax":       _lt_spec_softmax,
+    # Transformer / normalization coverage: each example targets one TF
+    # function in act/back_end/interval_tf/tf_transformer.py that is
+    # otherwise unreachable through the random MLP/CNN/RNN generators.
+    f"{LAYER_TESTING_NAME_PREFIX}layernorm":     _lt_spec_layernorm,
+    f"{LAYER_TESTING_NAME_PREFIX}posenc":        _lt_spec_posenc,
+    f"{LAYER_TESTING_NAME_PREFIX}mask_add":      _lt_spec_mask_add,
+    # Convolution coverage: 1-D / 3-D / transposed branches in tf_cnn.py
+    # that the random CNN generator (CONV2D only) never exercises.
+    f"{LAYER_TESTING_NAME_PREFIX}conv1d":              _lt_spec_conv1d,
+    f"{LAYER_TESTING_NAME_PREFIX}conv3d":              _lt_spec_conv3d,
+    f"{LAYER_TESTING_NAME_PREFIX}conv_transpose_2d":   _lt_spec_conv_transpose_2d,
+    # Activation coverage: kinds in interval_tf/tf_mlp.py that the random
+    # MLP generator does not pick. Several have non-monotonic dips (MISH,
+    # HARDSWISH, GELU) whose interval TFs were fixed to dispatch on the
+    # dip x-coordinate instead of using endpoint evaluation only.
+    f"{LAYER_TESTING_NAME_PREFIX}relu6":          _lt_spec_relu6,
+    f"{LAYER_TESTING_NAME_PREFIX}hardtanh":       _lt_spec_hardtanh,
+    f"{LAYER_TESTING_NAME_PREFIX}hardsigmoid":    _lt_spec_hardsigmoid,
+    f"{LAYER_TESTING_NAME_PREFIX}hardswish":      _lt_spec_hardswish,
+    f"{LAYER_TESTING_NAME_PREFIX}mish":           _lt_spec_mish,
+    f"{LAYER_TESTING_NAME_PREFIX}softsign":       _lt_spec_softsign,
+    f"{LAYER_TESTING_NAME_PREFIX}square":         _lt_spec_square,
+    f"{LAYER_TESTING_NAME_PREFIX}pow":            _lt_spec_pow,
+    # Multi-input MAX / MIN need preds=[i,j] so the factory builds
+    # y_vars_list from predecessors and tf_max/tf_min get a List[Bounds].
+    f"{LAYER_TESTING_NAME_PREFIX}max_op":         _lt_spec_max_op,
+    f"{LAYER_TESTING_NAME_PREFIX}min_op":         _lt_spec_min_op,
+    # Deep net designed so verify_once cannot certify via interval bounds
+    # alone, forcing verify_bab to split subproblems and exercise the
+    # branching / bounding / CE-validation paths that trivial nets never
+    # reach.
+    f"{LAYER_TESTING_NAME_PREFIX}bab_deep":       _lt_spec_bab_deep,
+    # InKind / OutKind coverage examples: deterministic 1-net-per-kind so
+    # CI's --generate + --validate-verifier + --verify --bab exercise every
+    # branch in the verifier's seed / ASSERT-encoding / MILP-negation paths.
+    f"{LAYER_TESTING_NAME_PREFIX}lin_poly":      _lt_spec_lin_poly,
+    f"{LAYER_TESTING_NAME_PREFIX}margin_robust": _lt_spec_margin_robust,
+    f"{LAYER_TESTING_NAME_PREFIX}top1_robust":   _lt_spec_top1_robust,
+    f"{LAYER_TESTING_NAME_PREFIX}range":         _lt_spec_range,
+    f"{LAYER_TESTING_NAME_PREFIX}unsafe_linear": _lt_spec_unsafe_linear,
 }
 
 

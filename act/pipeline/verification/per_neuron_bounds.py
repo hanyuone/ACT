@@ -116,10 +116,10 @@ def compute_abstract_bounds(
 ) -> Tuple[Dict[int, Bounds], List[str]]:
     """Compute abstract bounds for all layers in the ACT net.
 
-    For B>1 inputs under ``hybridz`` / ``dual`` (which are single-instance
-    by construction), runs the analysis once per sample and stacks the
-    per-layer bounds along a new batch axis. ``interval`` is batch-native
-    (post batch1) and runs a single batched pass.
+    ``interval`` and ``hybridz`` are both batch-native and run a single
+    batched analyze pass directly on ``[B, *shape]`` bounds. ``dual`` is
+    still single-instance, so for B>1 it runs the analysis once per
+    sample and stacks the per-layer bounds along a new batch axis.
     """
     from act.back_end.core import Fact
 
@@ -131,7 +131,7 @@ def compute_abstract_bounds(
     seed_lb = entry_fact.bounds.lb
     seed_ub = entry_fact.bounds.ub
     is_batched_input = seed_lb.dim() >= 2 and seed_lb.shape[0] > 1
-    needs_per_sample = is_batched_input and tf_mode in ("hybridz", "dual")
+    needs_per_sample = is_batched_input and tf_mode == "dual"
 
     if needs_per_sample:
         B = seed_lb.shape[0]

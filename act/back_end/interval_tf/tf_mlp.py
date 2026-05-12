@@ -331,13 +331,15 @@ def tf_silu(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_max(L: Layer, By_list: List[Bounds]) -> Fact:
-    lb=torch.maximum.reduce([b.lb for b in By_list]); ub=torch.maximum.reduce([b.ub for b in By_list])
+    lb = torch.stack([b.lb for b in By_list], dim=0).amax(dim=0)
+    ub = torch.stack([b.ub for b in By_list], dim=0).amax(dim=0)
     B=Bounds(lb,ub); all_y=sum((L.params["y_vars_list"][i] for i in range(len(By_list))), [])
     C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+all_y), {"tag":f"max:{L.id}","k":len(By_list),"mode":"convex"}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_min(L: Layer, By_list: List[Bounds]) -> Fact:
-    lb=torch.minimum.reduce([b.lb for b in By_list]); ub=torch.minimum.reduce([b.ub for b in By_list])
+    lb = torch.stack([b.lb for b in By_list], dim=0).amin(dim=0)
+    ub = torch.stack([b.ub for b in By_list], dim=0).amin(dim=0)
     B=Bounds(lb,ub); all_y=sum((L.params["y_vars_list"][i] for i in range(len(By_list))), [])
     C=ConSet(); C.replace(Con("INEQ", tuple(L.out_vars+all_y), {"tag":f"min:{L.id}","k":len(By_list),"mode":"convex"}))
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
@@ -390,21 +392,37 @@ def tf_hardsigmoid(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id, L.out_vars, B); return Fact(B, C)
 
 def tf_hardswish(L: Layer, Bin: Bounds) -> Fact:
-    """HardSwish: x * hardsigmoid(x)"""
-    l, u = Bin.lb, Bin.ub
-    # HardSwish bounds are complex, use conservative approximation
-    lb = torch.where(l >= 3, l, torch.where(l <= -3, torch.zeros_like(l), torch.minimum(l, torch.zeros_like(l))))
-    ub = torch.where(u >= 3, u, torch.where(u <= -3, torch.zeros_like(u), torch.maximum(u, torch.zeros_like(u))))
+    """HardSwish: x * clamp(x+3, 0, 6) / 6.
+
+    Has a single global minimum at x = -1.5 with f = -0.375 (the dip
+    inside [-3, 0]); endpoint-only evaluation is unsound when the input
+    range crosses x = -1.5.
+    """
+    HS_MIN_X = -1.5
+    HS_MIN_Y = -0.375
+    f = lambda x: x * torch.clamp(x + 3, min=0.0, max=6.0) / 6.0
+    f_lb, f_ub = f(Bin.lb), f(Bin.ub)
+    contains_min = (Bin.lb <= HS_MIN_X) & (Bin.ub >= HS_MIN_X)
+    lb = torch.where(contains_min, torch.full_like(f_lb, HS_MIN_Y), torch.minimum(f_lb, f_ub))
+    ub = torch.maximum(f_lb, f_ub)
     B = Bounds(lb, ub); C = ConSet()
     C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {"tag": f"hardswish:{L.id}"}))
     C.add_box(L.id, L.out_vars, B); return Fact(B, C)
 
 def tf_mish(L: Layer, Bin: Bounds) -> Fact:
-    """Mish: x * tanh(softplus(x))"""
-    l, u = Bin.lb, Bin.ub
-    # Conservative bounds for Mish activation
-    lb = torch.where(l >= 0, 0.0 * l, l)  # Negative values bounded by input
-    ub = torch.where(u <= 0, 0.0 * u, u)  # Positive values bounded by input
+    """Mish: x * tanh(softplus(x)).
+
+    Has a single global minimum at x ≈ -1.1924 with f ≈ -0.30884.
+    Monotone-decreasing for x < min_x (towards 0 as x → -∞) and
+    monotone-increasing for x > min_x.
+    """
+    MISH_MIN_X = -1.1924
+    MISH_MIN_Y = -0.30884
+    f = lambda x: x * torch.tanh(torch.nn.functional.softplus(x))
+    f_lb, f_ub = f(Bin.lb), f(Bin.ub)
+    contains_min = (Bin.lb <= MISH_MIN_X) & (Bin.ub >= MISH_MIN_X)
+    lb = torch.where(contains_min, torch.full_like(f_lb, MISH_MIN_Y), torch.minimum(f_lb, f_ub))
+    ub = torch.maximum(f_lb, f_ub)
     B = Bounds(lb, ub); C = ConSet()
     C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {"tag": f"mish:{L.id}"}))
     C.add_box(L.id, L.out_vars, B); return Fact(B, C)

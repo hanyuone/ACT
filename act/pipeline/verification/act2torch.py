@@ -352,6 +352,114 @@ class ActGraphModule(nn.Module):
             indices_per_dim = tuple(idx_long[..., d] for d in range(idx_long.shape[-1]))
             out.index_put_(indices_per_dim, upd, accumulate=False)
             return out
+        if kind == LayerKind.MASK_ADD.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: MASK_ADD layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            M = layer.params["M"].to(
+                device=inputs[0].device, dtype=inputs[0].dtype
+            )
+            return inputs[0] + M
+        if kind == LayerKind.POSENC.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: POSENC layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            P = layer.params["pos_vec"].to(
+                device=inputs[0].device, dtype=inputs[0].dtype
+            )
+            return inputs[0] + P
+        if kind == LayerKind.LAYERNORM.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: LAYERNORM layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            import torch.nn.functional as F
+            gamma = layer.params["gamma"].to(
+                device=inputs[0].device, dtype=inputs[0].dtype
+            )
+            beta = layer.params["beta"].to(
+                device=inputs[0].device, dtype=inputs[0].dtype
+            )
+            eps = float(layer.params.get("eps", 1e-5))
+            return F.layer_norm(
+                inputs[0], gamma.shape, weight=gamma, bias=beta, eps=eps
+            )
+        if kind == LayerKind.SQUARE.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: SQUARE layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            return inputs[0] * inputs[0]
+        if kind == LayerKind.POWER.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: POWER layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            p = float(layer.params["p"])
+            return torch.pow(torch.clamp(inputs[0], min=0.0), p)
+        if kind in (LayerKind.MAX.value, LayerKind.MIN.value):
+            if len(inputs) < 2:
+                raise RuntimeError(
+                    f"ActGraphModule: {kind} layer {layer.id} expects at least 2 inputs, "
+                    f"got {len(inputs)}."
+                )
+            stacked = torch.stack(list(inputs), dim=0)
+            reduce_fn = stacked.amax if kind == LayerKind.MAX.value else stacked.amin
+            return reduce_fn(dim=0)
+        if kind == LayerKind.RELU6.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: RELU6 layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            return torch.clamp(inputs[0], min=0.0, max=6.0)
+        if kind == LayerKind.HARDTANH.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: HARDTANH layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            min_val = float(layer.params.get("min_val", -1.0))
+            max_val = float(layer.params.get("max_val", 1.0))
+            return torch.clamp(inputs[0], min=min_val, max=max_val)
+        if kind == LayerKind.HARDSIGMOID.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: HARDSIGMOID layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            alpha = float(layer.params.get("alpha", 1.0 / 6.0))
+            beta = float(layer.params.get("beta", 0.5))
+            return torch.clamp(alpha * inputs[0] + beta, min=0.0, max=1.0)
+        if kind == LayerKind.HARDSWISH.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: HARDSWISH layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            return inputs[0] * torch.clamp(inputs[0] + 3.0, min=0.0, max=6.0) / 6.0
+        if kind == LayerKind.MISH.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: MISH layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            import torch.nn.functional as F
+            return inputs[0] * torch.tanh(F.softplus(inputs[0]))
+        if kind == LayerKind.SOFTSIGN.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: SOFTSIGN layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            return inputs[0] / (1.0 + torch.abs(inputs[0]))
         raise NotImplementedError(
             f"ActGraphModule: functional layer kind '{kind}' (id={layer.id}) not supported."
         )
@@ -521,24 +629,39 @@ class ACTToTorch:
             **optional_kwargs,
         )
 
-        if len(input_spec_acts) > 1:
+        # Multiple INPUT_SPEC layers are allowed (the verifier handles each
+        # spec independently via add_all_input_specs). The PyTorch model
+        # only needs ONE spec for concrete input-satisfaction checks in
+        # find_concrete_counterexample; pick the BOX/LINF_BALL seed using
+        # the same priority as seed_from_input_specs. LIN_POLY refinements
+        # are kept on the ACT Net for the symbolic verifier path; at the
+        # concrete inference level they are not enforced (any sampled x
+        # outside the polytope simply fails to be a true counterexample to
+        # the joint spec, which is benign for soundness).
+        seed_spec_act = next(
+            (L for L in input_spec_acts
+             if L.params.get("kind") in ("BOX", "LINF_BALL")),
+            None,
+        )
+        if seed_spec_act is None:
             raise ValueError(
-                f"ACTToTorch currently supports exactly one INPUT_SPEC layer for restoration; "
-                f"found {len(input_spec_acts)} ids={[layer.id for layer in input_spec_acts]}."
+                f"ACTToTorch: at least one BOX or LINF_BALL INPUT_SPEC required "
+                f"for PyTorch model reconstruction; got kinds="
+                f"{[L.params.get('kind') for L in input_spec_acts]}."
             )
 
-        input_spec_params = input_spec_acts[0].params
+        input_spec_params = seed_spec_act.params
         input_kind_str = input_spec_params.get("kind")
         if not isinstance(input_kind_str, str):
             raise ValueError(
-                f"ACTToTorch: INPUT_SPEC layer {input_spec_acts[0].id} has invalid kind "
+                f"ACTToTorch: INPUT_SPEC layer {seed_spec_act.id} has invalid kind "
                 f"param {input_kind_str!r}."
             )
         try:
             input_spec_kind = getattr(InKind, input_kind_str)
         except AttributeError as exc:
             raise ValueError(
-                f"ACTToTorch: INPUT_SPEC layer {input_spec_acts[0].id} has unknown kind "
+                f"ACTToTorch: INPUT_SPEC layer {seed_spec_act.id} has unknown kind "
                 f"{input_kind_str!r}."
             ) from exc
         input_spec_dict = {"kind": input_spec_kind}
@@ -678,32 +801,33 @@ class ACTToTorch:
             raise ValueError(
                 f"ACTToTorch: ASSERT layer {assert_act.id} has unknown kind {output_kind_str!r}."
             ) from exc
-        # OutputSpec dataclass + OutputSpecLayer.forward expect single-sample
-        # high-level fields (c: [n_out], d: scalar, y_true: [1] or scalar,
-        # margin: scalar, lb/ub: [n_out]). The on-disk ASSERT params are the
-        # batched encoded form produced by OutputSpec.encode_linear
-        # (c: [B, n_out], d: [B], y_true: [B], margin: [B], lb/ub: [B, n_out]).
-        # All sample slots carry the same value, so extracting index 0 reduces
-        # without losing information.
-        def _unbatch_first(t: torch.Tensor) -> torch.Tensor:
-            if t.dim() >= 1 and t.shape[0] >= 1:
-                return t[0]
-            return t
-
+        # Batch-native handoff: pass the on-disk batched ASSERT params straight
+        # through to OutputSpec / OutputSpecLayer. The leading B axis is the
+        # same B that the model forward consumes, so no per-sample stripping is
+        # needed. On-disk shapes (from OutputSpec.encode_linear):
+        #   LINEAR_LE     c: [B, n_out]      d: [B]
+        #   UNSAFE_LINEAR c: [B, N, n_out]   d: [B, N]
+        #   TOP1_ROBUST   y_true: [B]
+        #   MARGIN_ROBUST y_true: [B]        margin: [B]
+        #   RANGE         lb: [B, n_out]     ub: [B, n_out]
+        # OutputSpecLayer.forward dispatches on dim() to handle both these
+        # batched shapes and the single-sample shapes still emitted by the
+        # VNNLIB and TorchVision front-end loaders.
         output_spec_dict = {"kind": output_spec_kind}
         if "y_true" in output_params:
-            yt = _to_target_tensor(output_params["y_true"])
-            output_spec_dict["y_true"] = _unbatch_first(yt).reshape(1)
+            output_spec_dict["y_true"] = _to_target_tensor(
+                output_params["y_true"]
+            )
         if "margin" in output_params:
-            mt = _to_target_float_tensor(output_params["margin"])
-            output_spec_dict["margin"] = _unbatch_first(mt).reshape(1)
+            output_spec_dict["margin"] = _to_target_float_tensor(
+                output_params["margin"]
+            )
         if "d" in output_params:
-            dt = _to_target_float_tensor(output_params["d"])
-            output_spec_dict["d"] = _unbatch_first(dt).reshape(1)
+            output_spec_dict["d"] = _to_target_float_tensor(output_params["d"])
         for param_key in ["c", "lb", "ub"]:
             if param_key in output_params:
-                output_spec_dict[param_key] = _unbatch_first(
-                    _to_target_float_tensor(output_params[param_key])
+                output_spec_dict[param_key] = _to_target_float_tensor(
+                    output_params[param_key]
                 )
         output_spec_mod = OutputSpecLayer(OutputSpec(**output_spec_dict))
 
@@ -810,7 +934,11 @@ class ACTToTorch:
         # Build kwargs from params_optional (names match PyTorch directly)
         # Only include kwargs that PyTorch module accepts
         kwargs = {}
-        # Check if bias exists in params to set bias kwarg for Linear/Conv
+        # Check if bias exists in params to set bias kwarg for Linear/Conv.
+        # CONVTRANSPOSE2D must be in the bias=False list: leaving its bias
+        # at the nn.ConvTranspose2d default (True) materialises a randomly
+        # initialised phantom bias that the abstract analysis has no record
+        # of, breaking the per-neuron soundness invariant.
         if "bias" in act_layer.params:
             kwargs["bias"] = True
         elif kind in (
@@ -818,6 +946,7 @@ class ACTToTorch:
             LayerKind.CONV1D.value,
             LayerKind.CONV2D.value,
             LayerKind.CONV3D.value,
+            LayerKind.CONVTRANSPOSE2D.value,
         ):
             kwargs["bias"] = False
         # Pass through common kwargs from params

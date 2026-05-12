@@ -128,7 +128,7 @@
 #       --solvers gurobi --tf-modes interval --input-samples 10 \
 #       --device cpu --dtype float64
 #
-#   # Direct execution (legacy):
+#   # Direct script execution:
 #   python act/pipeline/verification/validate_verifier.py
 #   python act/pipeline/verification/validate_verifier.py --mode bounds --input-samples 5
 #
@@ -219,7 +219,7 @@ class VerificationValidator:
         ``target_B is None`` returns the net unchanged (use native B).
         """
         if target_B is None or target_B <= 0:
-            return net
+            return self._migrate_net_to_device(copy.deepcopy(net))
 
         new_net = copy.deepcopy(net)
         for L in new_net.layers:
@@ -246,7 +246,23 @@ class VerificationValidator:
                         params[key] = new_shp
             elif L.kind == "ASSERT":
                 self._batchify_assert_layer(L, target_B)
-        return new_net
+        return self._migrate_net_to_device(new_net)
+
+    def _migrate_net_to_device(self, net: Net) -> Net:
+        """Move every tensor in ``net.layers[*].params`` to ``self.device`` and
+        cast floating-point tensors to ``self.dtype``. Non-tensor params and
+        integer / bool tensors are passed through untouched. Required so
+        downstream ``analyze`` doesn't see mixed CPU/CUDA matmul operands.
+        """
+        for L in net.layers:
+            params = L.params or {}
+            for k, v in list(params.items()):
+                if torch.is_tensor(v):
+                    params[k] = v.to(
+                        device=self.device,
+                        dtype=self.dtype if v.is_floating_point() else v.dtype,
+                    )
+        return net
 
     def _batchify_assert_layer(self, L: Layer, target_B: int) -> None:
         """Re-encode an ASSERT layer to ``target_B`` lanes via the canonical
@@ -356,11 +372,7 @@ class VerificationValidator:
             return t
         return t[:1].expand(target_B, *t.shape[1:]).contiguous()
 
-    _KNOWN_RUNTIME_BROKEN: Dict[Tuple[str, str], str] = {
-        ("hybridz", "LSTM"): "hybridz_tf LSTM cell mishandles batched bounds",
-        ("hybridz", "GRU"): "hybridz_tf GRU cell mishandles batched bounds",
-        ("hybridz", "RNN"): "hybridz_tf RNN cell mishandles batched bounds",
-    }
+    _KNOWN_RUNTIME_BROKEN: Dict[Tuple[str, str], str] = {}
 
     def _network_supported_by_mode(
         self, net: Net, tf_mode: str

@@ -88,12 +88,10 @@ class OutputSpec:
         if self.margin is not None and not isinstance(self.margin, torch.Tensor):
             self.margin = torch.tensor([float(self.margin)])
         
-        # Convert d (scalar → 1-D tensor)
-        if self.d is not None and not isinstance(self.d, torch.Tensor):
-            self.d = torch.tensor([float(self.d)])
-        
-        # Convert c, lb, ub (list or scalar → tensor)
-        for field in ['c', 'lb', 'ub']:
+        # Convert c, d, lb, ub (list/tuple → tensor; scalar → 1-D tensor).
+        # ``d`` is scalar for LINEAR_LE but a vector for UNSAFE_LINEAR, so it
+        # joins the list-aware conversion path below.
+        for field in ['c', 'd', 'lb', 'ub']:
             val = getattr(self, field, None)
             if val is not None and not isinstance(val, torch.Tensor):
                 if isinstance(val, (list, tuple)):

@@ -169,10 +169,10 @@ def _b1_scalar(val: Any, name: str) -> float:
     """Extract a Python scalar from a BaB-path ASSERT param.
 
     BaB MILP encoding is single-instance by contract: every high-level
-    field is either a Python scalar (legacy form) or a ``torch.Tensor[B=1]``
-    (post-``OutputSpec.encode_linear``). Tensors with ``B > 1`` are
-    rejected because the existential encoding for TOP1 / MARGIN
-    intrinsically requires a single ``y_true`` / ``margin``.
+    field is either a Python scalar or a ``torch.Tensor[B=1]`` produced by
+    ``OutputSpec.encode_linear``. Tensors with ``B > 1`` are rejected
+    because the existential encoding for TOP1 / MARGIN intrinsically
+    requires a single ``y_true`` / ``margin``.
     """
     if isinstance(val, torch.Tensor):
         if val.numel() != 1:
@@ -199,8 +199,8 @@ def _b1_int(val: Any, name: str) -> int:
 def _b1_vec(val: Any, name: str, expected_len: int) -> torch.Tensor:
     """Extract a ``[expected_len]`` 1-D tensor from a BaB-path ASSERT param.
 
-    Accepts either ``Tensor[expected_len]`` (legacy) or ``Tensor[B=1, expected_len]``
-    (post-encode_linear) — rejects ``B > 1``.
+    Accepts a 1-D ``Tensor[expected_len]`` or a 2-D ``Tensor[B=1, expected_len]``
+    (as produced by ``encode_linear``); rejects ``B > 1``.
     """
     t = val if isinstance(val, torch.Tensor) else torch.as_tensor(val)
     if t.dim() == 2:
@@ -510,11 +510,14 @@ def verify_once(
     dtype = output_lb.dtype
 
     # 4. Read pre-encoded ASSERT params (produced by OutputSpec.encode_linear
-    # at FE construction time). No runtime kind-dispatch / encoding happens
-    # in verify_once — the encoding lives in act/front_end/specs.py.
+    # at FE construction time). Dispatch on ``kind`` because UNSAFE_LINEAR
+    # has EXISTS-row safety semantics while the four other kinds (LINEAR_LE,
+    # TOP1_ROBUST, MARGIN_ROBUST, RANGE) share an ALL-rows form.
     C = assert_layer.params["C"].to(device=device, dtype=dtype)
     thresholds = assert_layer.params["thresholds"].to(device=device, dtype=dtype)
     M = int(assert_layer.params["M"])
+    kind = assert_layer.params.get("kind")
+    is_unsafe_linear = kind == OutKind.UNSAFE_LINEAR
     assert C.dim() == 2 and C.shape == (B * M, n_out), (
         f"verify_once: ASSERT params['C'].shape={tuple(C.shape)} "
         f"expected ({B * M}, {n_out})"
@@ -528,8 +531,19 @@ def verify_once(
     C_neg = C.clamp(max=0)
     lb_exp = output_lb.repeat_interleave(M, dim=0)
     ub_exp = output_ub.repeat_interleave(M, dim=0)
-    margin_max = (C_pos * ub_exp + C_neg * lb_exp).sum(dim=-1)
-    certified = (margin_max.view(B, M) < thresholds).all(dim=-1)
+
+    if is_unsafe_linear:
+        # UNSAFE polytope = {y : C y <= d}. Property is SAFE iff for all y in
+        # the box, EXISTS row i with c_i @ y > d_i (i.e. y leaves the polytope
+        # on row i). Sound under-approximation: EXISTS row i such that
+        # min_{y in box} (c_i @ y) > d_i. min(c_i @ y) = c_i_pos @ lb + c_i_neg @ ub.
+        margin_min = (C_pos * lb_exp + C_neg * ub_exp).sum(dim=-1)
+        certified = (margin_min.view(B, M) > thresholds).any(dim=-1)
+    else:
+        # LINEAR_LE / TOP1_ROBUST / MARGIN_ROBUST / RANGE: certified iff for
+        # all y in the box, ALL rows max_y (c_i @ y) < d_i.
+        margin_max = (C_pos * ub_exp + C_neg * lb_exp).sum(dim=-1)
+        certified = (margin_max.view(B, M) < thresholds).all(dim=-1)
 
     # 5. Concrete falsification (optional).
     falsified = torch.zeros(B, dtype=torch.bool, device=device)
@@ -545,11 +559,18 @@ def verify_once(
         y_concrete = y_concrete.to(device=device, dtype=dtype)
         C_view = C.view(B, M, n_out)
         concrete_violation = torch.einsum("bmn,bn->bm", C_view, y_concrete)
-        # Cert uses strict <; falsification uses >=. A sample is FALSIFIED
-        # iff ANY of its M lanes' concrete margin meets-or-exceeds threshold.
-        falsified = (~certified) & (
-            (concrete_violation >= thresholds).any(dim=-1)
-        )
+        if is_unsafe_linear:
+            # Concrete y is in the UNSAFE polytope iff ALL rows c_i @ y <= d_i;
+            # that is the violation condition for UNSAFE_LINEAR.
+            falsified = (~certified) & (
+                (concrete_violation <= thresholds).all(dim=-1)
+            )
+        else:
+            # ALL-rows kinds: FALSIFIED iff ANY lane's concrete margin
+            # meets-or-exceeds threshold.
+            falsified = (~certified) & (
+                (concrete_violation >= thresholds).any(dim=-1)
+            )
         if falsified.any():
             x_center_cpu = x_center.detach().cpu()
             for i in range(B):

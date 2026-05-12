@@ -47,14 +47,12 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # CE validation (single-instance contract)
 #
-# BaB operates on single-instance subproblems by construction: each BaB node
-# encodes one MILP for one (input box, ASSERT) pair, with existential
+# BaB operates on single-instance subproblems by construction: each BaB
+# node encodes one MILP for one (input box, ASSERT) pair, with existential
 # encoding of y_true / margin. The `_bab_*` helpers below enforce B=1 at
-# the API boundary so that batched callers from `verify_once` cannot
-# accidentally pipe [B, ...] tensors into BaB. This is NOT a violation of
-# the "native batching, B=1 if sequential" mandate (PR #64 review):
-# batched verify_once is still natively batched; BaB simply isn't a
-# batched algorithm by construction.
+# the API boundary so that batched callers cannot accidentally pipe
+# [B, ...] tensors into BaB. ``verify_once`` itself stays batched; only
+# the BaB MILP encoding is single-instance.
 # ---------------------------------------------------------------------------
 
 
@@ -327,7 +325,7 @@ def test_config_yaml_roundtrip():
     finally:
         os.unlink(tmp)
 
-    # Verify time_budget_s was removed from BaBConfig
+    # BaBConfig must not expose a time_budget_s attribute.
     assert not hasattr(c1, "time_budget_s")
 
 

@@ -283,22 +283,31 @@ def _seq_view(Bin: Bounds, cfg: dict):
 
 
 def _stack_and_flatten(lb_steps, ub_steps, cfg):
-    """Stack per-step (B, H) bounds into the layer's declared output_shape,
-    then flatten to a 1D Bounds vector aligned with out_vars.
+    """Stack per-step ``(B, H)`` bounds into the layer's declared
+    ``output_shape``. The leading axes are preserved (``(B, T, H)`` for
+    batch-first; ``(T, B, H)`` otherwise) so downstream layers — FLATTEN,
+    DENSE, etc. — see the same rank-3 sequence tensor that interval-mode
+    RNN produces.
     """
     out_lb = torch.stack(lb_steps, dim=1)  # (B, T, H)
     out_ub = torch.stack(ub_steps, dim=1)
     if not cfg["batch_first"]:
         out_lb = out_lb.permute(1, 0, 2).contiguous()
         out_ub = out_ub.permute(1, 0, 2).contiguous()
-    return out_lb.reshape(-1), out_ub.reshape(-1)
+    return out_lb, out_ub
 
 
 def _make_fact(L: Layer, cfg: dict, out_lb, out_ub, op_name: str) -> Fact:
-    if out_lb.numel() != len(L.out_vars):
+    # out_vars indexes one symbolic copy per layer; under validate_verifier
+    # batchification the concrete bound tensor carries ``B`` independent
+    # instances stacked on the leading axis, so the produced numel must be
+    # an integer multiple of ``len(out_vars)`` (equal when B=1).
+    per_instance = len(L.out_vars)
+    actual = out_lb.numel()
+    if per_instance > 0 and actual % per_instance != 0:
         raise RuntimeError(
-            f"hybridz tf_{op_name}: produced {out_lb.numel()} outputs, expected "
-            f"len(out_vars)={len(L.out_vars)} (output_shape={cfg['output_shape']})."
+            f"hybridz tf_{op_name}: produced {actual} outputs, not a multiple "
+            f"of len(out_vars)={per_instance} (output_shape={cfg['output_shape']})."
         )
     B_out = Bounds(out_lb, out_ub)
     meta = {

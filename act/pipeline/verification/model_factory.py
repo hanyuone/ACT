@@ -377,7 +377,8 @@ def main():
                     # Run model with automatic constraint checking
                     results = model(input_tensor)
                     
-                    # Check if results is a dict (VerifiableModel) or tensor (legacy)
+                    # VerifiableModel emits a dict with verification info;
+                    # a raw nn.Module emits a bare output tensor.
                     if isinstance(results, dict):
                         # VerifiableModel returns dict with verification info
                         output = results['output']
