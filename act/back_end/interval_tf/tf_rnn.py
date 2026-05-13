@@ -22,44 +22,36 @@ def tf_lstm(L: Layer, Bin: Bounds) -> Fact:
     Handles LSTM cell computation with interval bounds propagation.
     """
     # Extract LSTM parameters
-    weight_ih = L.params["weight_ih_l0"]  # input-to-hidden weights
-    weight_hh = L.params["weight_hh_l0"]  # hidden-to-hidden weights
-    bias_ih = L.params.get("bias_ih_l0", None)
-    bias_hh = L.params.get("bias_hh_l0", None)
+    weight_ih = _get_tensor_param(L, "weight_ih_l0")  # input-to-hidden weights
+    weight_hh = _get_tensor_param(L, "weight_hh_l0")  # hidden-to-hidden weights
+    bias_ih = _get_optional_tensor_param(L, "bias_ih_l0")
+    bias_hh = _get_optional_tensor_param(L, "bias_hh_l0")
     
     # LSTM dimensions
-    input_size = L.params["input_size"]
-    hidden_size = L.params["hidden_size"]
-    num_layers = L.params.get("num_layers", 1)
-    batch_first = L.params.get("batch_first", False)
-    bidirectional = L.params.get("bidirectional", False)
+    input_size = L.get_int("input_size")
+    hidden_size = L.get_int("hidden_size")
+    num_layers = L.get_int("num_layers", 1)
+    batch_first = bool(L.get_scalar("batch_first", False))
+    bidirectional = bool(L.get_scalar("bidirectional", False))
     
     # Shape information
-    input_shape = L.params["input_shape"]  # [batch, seq_len, input_size] or [seq_len, batch, input_size]
-    output_shape = L.params["output_shape"]
+    input_shape = _get_shape_param(L, "input_shape")  # [batch, seq_len, input_size] or [seq_len, batch, input_size]
+    output_shape = _get_shape_param(L, "output_shape")
     
-    if batch_first:
-        batch_size, seq_len, _ = input_shape
-    else:
-        seq_len, batch_size, _ = input_shape
-    
-    # Bin arrives flat (analyze() stores Bounds as 1D over in_vars); reshape
-    # to the declared (batch, seq, feat) layout so per-step [:, t, :] /
-    # [t, :, :] indexing below works.
-    Bin = Bounds(Bin.lb.reshape(input_shape), Bin.ub.reshape(input_shape))
-    
-    
+    seq_bounds = _reshape_sequence_bounds(Bin, input_shape, batch_first)
+    batch_size, seq_len, _ = seq_bounds.lb.shape
+
     # For verification, we approximate LSTM with its linearized form
     # This is a conservative approximation using the worst-case bounds
-    
+
     # Initialize hidden and cell states bounds (typically zeros)
     h_bounds = Bounds(
-        torch.zeros(batch_size, hidden_size),
-        torch.zeros(batch_size, hidden_size)
+        Bin.lb.new_zeros(batch_size, hidden_size),
+        Bin.lb.new_zeros(batch_size, hidden_size),
     )
     c_bounds = Bounds(
-        torch.zeros(batch_size, hidden_size),
-        torch.zeros(batch_size, hidden_size)
+        Bin.lb.new_zeros(batch_size, hidden_size),
+        Bin.lb.new_zeros(batch_size, hidden_size),
     )
     
     # Process each time step
@@ -67,16 +59,7 @@ def tf_lstm(L: Layer, Bin: Bounds) -> Fact:
     
     for t in range(seq_len):
         # Extract input at time step t
-        if batch_first:
-            x_t_bounds = Bounds(
-                Bin.lb[:, t, :],  # [batch_size, input_size]
-                Bin.ub[:, t, :]
-            )
-        else:
-            x_t_bounds = Bounds(
-                Bin.lb[t, :, :],  # [batch_size, input_size]
-                Bin.ub[t, :, :]
-            )
+        x_t_bounds = Bounds(seq_bounds.lb[:, t, :], seq_bounds.ub[:, t, :])
         
         # LSTM cell computation with bounds
         h_bounds, c_bounds = _lstm_cell_bounds(
@@ -86,15 +69,7 @@ def tf_lstm(L: Layer, Bin: Bounds) -> Fact:
         
         output_bounds_list.append(h_bounds)
     
-    # Combine output bounds across time steps
-    if batch_first:
-        # Stack along sequence dimension: [batch_size, seq_len, hidden_size]
-        output_lb = torch.stack([b.lb for b in output_bounds_list], dim=1)
-        output_ub = torch.stack([b.ub for b in output_bounds_list], dim=1)
-    else:
-        # Stack along time dimension: [seq_len, batch_size, hidden_size]
-        output_lb = torch.stack([b.lb for b in output_bounds_list], dim=0)
-        output_ub = torch.stack([b.ub for b in output_bounds_list], dim=0)
+    output_lb, output_ub = _stack_step_bounds(output_bounds_list)
     
     if bidirectional:
         raise NotImplementedError(
@@ -102,7 +77,7 @@ def tf_lstm(L: Layer, Bin: Bounds) -> Fact:
             "sweep over weight_*_l0_reverse not implemented)."
         )
     
-    B_output = Bounds(output_lb.view(-1), output_ub.view(-1))
+    B_output = Bounds(output_lb, output_ub)
     
     # Create constraints
     C = ConSet()
@@ -128,53 +103,38 @@ def tf_gru(L: Layer, Bin: Bounds) -> Fact:
     Handles GRU cell computation with interval bounds propagation.
     """
     # Extract GRU parameters
-    weight_ih = L.params["weight_ih_l0"]
-    weight_hh = L.params["weight_hh_l0"]
-    bias_ih = L.params.get("bias_ih_l0", None)
-    bias_hh = L.params.get("bias_hh_l0", None)
+    weight_ih = _get_tensor_param(L, "weight_ih_l0")
+    weight_hh = _get_tensor_param(L, "weight_hh_l0")
+    bias_ih = _get_optional_tensor_param(L, "bias_ih_l0")
+    bias_hh = _get_optional_tensor_param(L, "bias_hh_l0")
     
     # GRU dimensions
-    input_size = L.params["input_size"]
-    hidden_size = L.params["hidden_size"]
-    num_layers = L.params.get("num_layers", 1)
-    batch_first = L.params.get("batch_first", False)
-    bidirectional = L.params.get("bidirectional", False)
+    input_size = L.get_int("input_size")
+    hidden_size = L.get_int("hidden_size")
+    num_layers = L.get_int("num_layers", 1)
+    batch_first = bool(L.get_scalar("batch_first", False))
+    bidirectional = bool(L.get_scalar("bidirectional", False))
     
     # Input shape information
-    input_shape = L.params["input_shape"]
-    output_shape = L.params["output_shape"]
+    input_shape = _get_shape_param(L, "input_shape")
+    output_shape = _get_shape_param(L, "output_shape")
     
-    if batch_first:
-        batch_size, seq_len, _ = input_shape
-    else:
-        seq_len, batch_size, _ = input_shape
-    
-    # Bin arrives flat (analyze() stores Bounds as 1D over in_vars); reshape
-    # to the declared (batch, seq, feat) layout so per-step [:, t, :] / [t, :, :] indexing below works.
-    Bin = Bounds(Bin.lb.reshape(input_shape), Bin.ub.reshape(input_shape))
-    
+    seq_bounds = _reshape_sequence_bounds(Bin, input_shape, batch_first)
+    batch_size, seq_len, _ = seq_bounds.lb.shape
+
     # Initialize hidden state bounds
     h_bounds = Bounds(
-        torch.zeros(batch_size, hidden_size),
-        torch.zeros(batch_size, hidden_size)
+        Bin.lb.new_zeros(batch_size, hidden_size),
+        Bin.lb.new_zeros(batch_size, hidden_size),
     )
-    
+
     # Process each time step
     output_bounds_list = []
-    
+
     for t in range(seq_len):
         # Extract input at time step t
-        if batch_first:
-            x_t_bounds = Bounds(
-                Bin.lb[:, t, :],
-                Bin.ub[:, t, :]
-            )
-        else:
-            x_t_bounds = Bounds(
-                Bin.lb[t, :, :],
-                Bin.ub[t, :, :]
-            )
-        
+        x_t_bounds = Bounds(seq_bounds.lb[:, t, :], seq_bounds.ub[:, t, :])
+
         # GRU cell computation with bounds
         h_bounds = _gru_cell_bounds(
             x_t_bounds, h_bounds,
@@ -183,13 +143,7 @@ def tf_gru(L: Layer, Bin: Bounds) -> Fact:
         
         output_bounds_list.append(h_bounds)
     
-    # Combine output bounds
-    if batch_first:
-        output_lb = torch.stack([b.lb for b in output_bounds_list], dim=1)
-        output_ub = torch.stack([b.ub for b in output_bounds_list], dim=1)
-    else:
-        output_lb = torch.stack([b.lb for b in output_bounds_list], dim=0)
-        output_ub = torch.stack([b.ub for b in output_bounds_list], dim=0)
+    output_lb, output_ub = _stack_step_bounds(output_bounds_list)
     
     if bidirectional:
         # Same soundness issue as tf_lstm — see that function for details.
@@ -198,7 +152,7 @@ def tf_gru(L: Layer, Bin: Bounds) -> Fact:
             "sweep over weight_*_l0_reverse not implemented)."
         )
     
-    B_output = Bounds(output_lb.view(-1), output_ub.view(-1))
+    B_output = Bounds(output_lb, output_ub)
     
     # Create constraints
     C = ConSet()
@@ -224,35 +178,29 @@ def tf_rnn(L: Layer, Bin: Bounds) -> Fact:
     Handles simple RNN cell computation with interval bounds propagation.
     """
     # Extract RNN parameters
-    weight_ih = L.params["weight_ih_l0"]
-    weight_hh = L.params["weight_hh_l0"]
-    bias_ih = L.params.get("bias_ih_l0", None)
-    bias_hh = L.params.get("bias_hh_l0", None)
+    weight_ih = _get_tensor_param(L, "weight_ih_l0")
+    weight_hh = _get_tensor_param(L, "weight_hh_l0")
+    bias_ih = _get_optional_tensor_param(L, "bias_ih_l0")
+    bias_hh = _get_optional_tensor_param(L, "bias_hh_l0")
     
     # RNN dimensions
-    input_size = L.params["input_size"]
-    hidden_size = L.params["hidden_size"]
-    nonlinearity = L.params.get("nonlinearity", "tanh")  # 'tanh' or 'relu'
-    batch_first = L.params.get("batch_first", False)
-    bidirectional = L.params.get("bidirectional", False)
+    input_size = L.get_int("input_size")
+    hidden_size = L.get_int("hidden_size")
+    nonlinearity = str(L.get_scalar("nonlinearity", "tanh"))  # 'tanh' or 'relu'
+    batch_first = bool(L.get_scalar("batch_first", False))
+    bidirectional = bool(L.get_scalar("bidirectional", False))
     
     # Input shape information
-    input_shape = L.params["input_shape"]
-    output_shape = L.params["output_shape"]
+    input_shape = _get_shape_param(L, "input_shape")
+    output_shape = _get_shape_param(L, "output_shape")
     
-    if batch_first:
-        batch_size, seq_len, _ = input_shape
-    else:
-        seq_len, batch_size, _ = input_shape
-    
-    # Bin arrives flat (analyze() stores Bounds as 1D over in_vars); reshape
-    # to the declared (batch, seq, feat) layout so per-step [:, t, :] / [t, :, :] indexing below works.
-    Bin = Bounds(Bin.lb.reshape(input_shape), Bin.ub.reshape(input_shape))
-    
+    seq_bounds = _reshape_sequence_bounds(Bin, input_shape, batch_first)
+    batch_size, seq_len, _ = seq_bounds.lb.shape
+
     # Initialize hidden state bounds
     h_bounds = Bounds(
-        torch.zeros(batch_size, hidden_size),
-        torch.zeros(batch_size, hidden_size)
+        Bin.lb.new_zeros(batch_size, hidden_size),
+        Bin.lb.new_zeros(batch_size, hidden_size),
     )
     
     # Process each time step
@@ -260,16 +208,7 @@ def tf_rnn(L: Layer, Bin: Bounds) -> Fact:
     
     for t in range(seq_len):
         # Extract input at time step t
-        if batch_first:
-            x_t_bounds = Bounds(
-                Bin.lb[:, t, :],
-                Bin.ub[:, t, :]
-            )
-        else:
-            x_t_bounds = Bounds(
-                Bin.lb[t, :, :],
-                Bin.ub[t, :, :]
-            )
+        x_t_bounds = Bounds(seq_bounds.lb[:, t, :], seq_bounds.ub[:, t, :])
         
         # RNN cell computation: h_t = tanh(W_ih * x_t + W_hh * h_{t-1} + b)
         # Linear transformation
@@ -292,13 +231,7 @@ def tf_rnn(L: Layer, Bin: Bounds) -> Fact:
         
         output_bounds_list.append(h_bounds)
     
-    # Combine output bounds
-    if batch_first:
-        output_lb = torch.stack([b.lb for b in output_bounds_list], dim=1)
-        output_ub = torch.stack([b.ub for b in output_bounds_list], dim=1)
-    else:
-        output_lb = torch.stack([b.lb for b in output_bounds_list], dim=0)
-        output_ub = torch.stack([b.ub for b in output_bounds_list], dim=0)
+    output_lb, output_ub = _stack_step_bounds(output_bounds_list)
     
     if bidirectional:
         # Same soundness issue as tf_lstm — see that function for details.
@@ -307,7 +240,7 @@ def tf_rnn(L: Layer, Bin: Bounds) -> Fact:
             "sweep over weight_*_l0_reverse not implemented)."
         )
     
-    B_output = Bounds(output_lb.view(-1), output_ub.view(-1))
+    B_output = Bounds(output_lb, output_ub)
     
     # Create constraints
     C = ConSet()
@@ -333,14 +266,14 @@ def tf_embedding(L: Layer, Bin: Bounds) -> Fact:
     Handles embedding lookup with interval bounds.
     """
     # Extract embedding parameters
-    weight = L.params["weight"]  # [num_embeddings, embedding_dim]
-    num_embeddings = L.params["num_embeddings"]
-    embedding_dim = L.params["embedding_dim"]
+    weight = _get_tensor_param(L, "weight")  # [num_embeddings, embedding_dim]
+    num_embeddings = L.get_int("num_embeddings")
+    embedding_dim = L.get_int("embedding_dim")
     padding_idx = L.params.get("padding_idx", None)
     
     # Input shape information (indices)
-    input_shape = L.params["input_shape"]
-    output_shape = L.params["output_shape"]
+    input_shape = _get_shape_param(L, "input_shape")
+    output_shape = _get_shape_param(L, "output_shape")
     
     # For embedding, the bounds depend on the range of possible embeddings
     # Since we don't know which embeddings will be selected, we use worst-case bounds
@@ -348,7 +281,9 @@ def tf_embedding(L: Layer, Bin: Bounds) -> Fact:
     weight_max = torch.max(weight, dim=0)[0]  # [embedding_dim]
     
     # Broadcast to output shape
-    output_size = torch.prod(torch.tensor(output_shape)).item()
+    output_size = 1
+    for dim in output_shape:
+        output_size *= dim
     embedding_elements = output_size // embedding_dim
     
     output_lb = weight_min.repeat(embedding_elements)
@@ -372,6 +307,37 @@ def tf_embedding(L: Layer, Bin: Bounds) -> Fact:
 
 
 # Helper functions for RNN computations
+
+def _get_tensor_param(L: Layer, key: str) -> torch.Tensor:
+    value = L.get_tensor(key)
+    if value is None:
+        raise TypeError(f"Expected tensor param '{key}' on layer {L.id}")
+    return value
+
+
+def _get_optional_tensor_param(L: Layer, key: str):
+    return L.get_tensor(key)
+
+
+def _get_shape_param(L: Layer, key: str) -> tuple[int, ...]:
+    return tuple(int(dim) for dim in L.get_tuple(key))
+
+def _reshape_sequence_bounds(Bin: Bounds, input_shape, batch_first: bool) -> Bounds:
+    """Reshape sequence inputs and normalize to [B, T, F] for the time loop."""
+    seq_lb = Bin.lb.reshape(input_shape)
+    seq_ub = Bin.ub.reshape(input_shape)
+    if not batch_first:
+        seq_lb = seq_lb.permute(1, 0, 2).contiguous()
+        seq_ub = seq_ub.permute(1, 0, 2).contiguous()
+    return Bounds(seq_lb, seq_ub)
+
+
+def _stack_step_bounds(output_bounds_list):
+    """Stack per-step hidden-state bounds with batch preserved as dim 0."""
+    return (
+        torch.stack([b.lb for b in output_bounds_list], dim=1),
+        torch.stack([b.ub for b in output_bounds_list], dim=1),
+    )
 
 def _lstm_cell_bounds(x_bounds, h_bounds, c_bounds, weight_ih, weight_hh, bias_ih, bias_hh):
     """Compute LSTM cell bounds for one time step."""
@@ -481,7 +447,7 @@ def _apply_linear_bounds(input_bounds, weight, bias=None):
     W_pos = torch.clamp(weight, min=0)
     W_neg = torch.clamp(weight, max=0)
     if bias is None:
-        bias = torch.zeros(weight.shape[0], dtype=weight.dtype, device=weight.device)
+        bias = weight.new_zeros(weight.shape[0])
     # input_bounds.lb shape (..., in_features); weight shape (out, in).
     out_lb = input_bounds.lb @ W_pos.T + input_bounds.ub @ W_neg.T + bias
     out_ub = input_bounds.ub @ W_pos.T + input_bounds.lb @ W_neg.T + bias

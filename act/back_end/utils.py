@@ -39,45 +39,22 @@ def update_cache(L, B: Bounds, masks: Optional[Dict[str, torch.Tensor]]):
     L.cache["masks"] = None if masks is None else {k: v.clone() for k,v in masks.items()}
 
 def affine_bounds(W_pos, W_neg, b, Bin: Bounds) -> Bounds:
-    """Compute bounds for affine transformation using interval arithmetic.
-    
-    Uses pre-computed W_pos/W_neg split for efficiency:
-    - W_pos = clamp(W, min=0): positive weights
-    - W_neg = clamp(W, max=0): negative weights
-    
-    Interval arithmetic:
-    - Lower bound: W_pos @ lb + W_neg @ ub + b
-    - Upper bound: W_pos @ ub + W_neg @ lb + b
-    
+    """Batched affine-transform bounds via interval arithmetic.
+
+    Maps [B, n_in] input bounds to [B, n_out] output bounds for any B>=1.
+
     Args:
-        W_pos: Positive part of weight matrix [out_features, in_features]
-        W_neg: Negative part of weight matrix [out_features, in_features]
-        b: Bias vector [out_features]
-        Bin: Input bounds with shape [batch, in_features] or [in_features]
-    
+        W_pos: clamp(W, min=0), shape [out_features, in_features]
+        W_neg: clamp(W, max=0), shape [out_features, in_features]
+        b: bias vector, shape [out_features]
+        Bin: input bounds, lb/ub shape [B, in_features]
+
     Returns:
-        Output bounds with shape [out_features]
+        Bounds with lb/ub shape [B, out_features].
     """
-    # Validate and squeeze batch dimension if present
-    if Bin.lb.ndim == 2:
-        batch_size = Bin.lb.shape[0]
-        assert batch_size == 1, (
-            f"affine_bounds expects batch_size=1 for symbolic verification, "
-            f"got batch_size={batch_size}. Bounds shape: {Bin.lb.shape}"
-        )
-        lb_vec = Bin.lb.squeeze(0)  # [1, in_features] → [in_features]
-        ub_vec = Bin.ub.squeeze(0)
-    elif Bin.lb.ndim == 1:
-        lb_vec = Bin.lb
-        ub_vec = Bin.ub
-    else:
-        raise ValueError(
-            f"affine_bounds expects 1D or 2D bounds, got {Bin.lb.ndim}D with shape {Bin.lb.shape}"
-        )
-    
-    # Compute bounds using interval arithmetic
-    lb = W_pos @ lb_vec + W_neg @ ub_vec + b
-    ub = W_pos @ ub_vec + W_neg @ lb_vec + b
+    assert Bin.lb.dim() == 2, f"affine_bounds expects 2D [B, n_in] bounds, got shape {tuple(Bin.lb.shape)}"
+    lb = Bin.lb @ W_pos.T + Bin.ub @ W_neg.T + b
+    ub = Bin.ub @ W_pos.T + Bin.lb @ W_neg.T + b
     return Bounds(lb, ub)
 
 def pwl_meta(l: torch.Tensor, u: torch.Tensor, K: int) -> Dict[str, Any]:
@@ -113,9 +90,6 @@ def validate_constraints(globalC, after: Dict, net) -> bool:
     Returns:
         True if all checks pass, False otherwise
     """
-    from act.back_end.core import Bounds
-    from act.util.options import PerformanceOptions
-    
     if not PerformanceOptions.validate_constraints:
         return True  # Skip validation when disabled
     

@@ -121,10 +121,12 @@ families:
   mlp:
 
     # --- Input ---
-    # Shape includes batch dim (always 1).
-    # [1, 6] = flat 6-D input;  [1, 3, 8] = 3-channel 1-D signal (auto-flattened).
+    # Shape's leading dim is the batch size B. Sequential analysis is the
+    # B=1 case of the same batched code path.
+    # [1, 6] = batch of 1 6-D input;  [4, 16] = batch of 4 16-D inputs;
+    # [1, 3, 8] = 3-channel 1-D signal (auto-flattened).
     input_shape:
-      choice: [[1, 6], [1, 16], [1, 3, 8]]
+      choice: [[1, 6], [1, 16], [1, 3, 8], [4, 6], [4, 16]]
 
     # Number of output classes (= width of the final Dense layer).
     num_classes:
@@ -194,10 +196,11 @@ families:
   cnn2d:
 
     # --- Input ---
-    # [batch, channels, height, width].
-    # [1,1,8,8] = single-channel 8x8;  [1,3,16,16] = RGB 16x16.
+    # [batch, channels, height, width]. Leading dim is the batch B.
+    # [1,1,8,8] = single-channel 8x8;  [4,1,8,8] = batch of 4;
+    # [1,3,16,16] = RGB 16x16;         [4,3,16,16] = batch of 4 RGB.
     input_shape:
-      choice: [[1, 1, 8, 8], [1, 3, 16, 16]]
+      choice: [[1, 1, 8, 8], [1, 3, 16, 16], [4, 1, 8, 8], [4, 3, 16, 16]]
 
     num_classes:
       choice: [10]
@@ -264,8 +267,11 @@ families:
     pool_stride: { const: 2 }
 
     # --- Activation ---
+    # Restricted to kinds that have both a dual_tf forward handler AND
+    # a PyTorch builder in ActGraphModule (required by validate-verifier
+    # bounds checks against concrete model output).
     activation:
-      choice: [relu, tanh, sigmoid, lrelu, relu6, silu, abs]
+      choice: [relu, tanh, sigmoid, lrelu]
 
     lrelu_alpha:
       choice: [0.01, 0.1, 0.2]
@@ -401,3 +407,17 @@ output_spec:
   # RANGE: per-output lower and upper bounds are sampled within this range.
   range_bounds:
     choice: [[-1.0, 1.0]]
+
+
+# ============================================================================
+# 6. VALIDATE-VERIFIER DEFAULTS
+# ============================================================================
+# Defaults consumed by `python -m act.pipeline --validate-verifier ...`
+# when the corresponding CLI flag is NOT explicitly passed. Any CLI flag
+# that IS passed overrides the value here.
+
+validate:
+  # Batch sizes to validate at. ``null`` = use each network's native B
+  # from its INPUT shape; positive int = batchify INPUT_SPEC/ASSERT to
+  # that B (sequential analysis is the B=1 case of the same path).
+  batch_sizes: [null, 1, 4]

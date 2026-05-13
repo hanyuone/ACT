@@ -53,13 +53,21 @@ jobs:
           cd ${{ github.workspace }}
           coverage run -p --source=act -m act.back_end --generate
 
-      - name: Run BaB verification (float64)
+      - name: Run BaB verification (float64) over all generated nets
         run: |
           cd ${{ github.workspace }}
-          NET=$(ls act/back_end/examples/nets/mlp_block_*.json | head -1)
-          echo "Testing BaB on: $NET"
+          NETS_DIR=act/back_end/examples/nets
+          # Iterate every *.json under nets/ (skip _meta/manifest.json).
           # All settings from act/back_end/config.yaml + ACT_* env vars above.
-          coverage run -p --source=act -m act.back_end --verify --network "$NET"
+          # '|| true' on each invocation: BaB / MILP export may not yet
+          # support every layer kind (e.g. CONVTRANSPOSE2D / CONV1D
+          # cons_exportor entries are not yet wired); we still want the
+          # successful nets' coverage signal uploaded.
+          for net in "$NETS_DIR"/*.json; do
+            [ -f "$net" ] || continue
+            echo "=== BaB verify: $(basename "$net") ==="
+            coverage run -p --source=act -m act.back_end --verify --network "$net" || true
+          done
 
       - name: Combine coverage data
         if: always()

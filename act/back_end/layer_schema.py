@@ -232,14 +232,14 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
         ],
     },
     LayerKind.ASSERT.value: {
-        "params_required": ["kind"],
+        "params_required": ["kind", "C", "thresholds", "M"],
         "params_optional": [
-            "c",  # Tensor: coefficient vector for LINEAR_LE (c^T y <= d)
-            "lb",  # Tensor: lower bounds for RANGE
-            "ub",  # Tensor: upper bounds for RANGE
-            "d",  # Scalar: threshold for LINEAR_LE (c^T y <= d)
-            "y_true",  # Scalar int: true class index for TOP1_ROBUST / MARGIN_ROBUST
-            "margin",  # Scalar float: margin threshold for MARGIN_ROBUST
+            "c",
+            "lb",
+            "ub",
+            "d",
+            "y_true",
+            "margin",
         ],
     },
     # =====================
@@ -311,9 +311,18 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
         ],
     },
     LayerKind.CONVTRANSPOSE2D.value: {
-        "params_required": ["weight", "stride", "padding", "dilation", "groups"],
+        # Required = positional args for nn.ConvTranspose2d(in_channels,
+        # out_channels, kernel_size, ...). stride / padding / dilation /
+        # groups go through optional → kwargs in _build_from_schema; making
+        # them required here would collide with the kwargs whitelist and
+        # raise 'got multiple values for argument'.
+        "params_required": ["weight", "in_channels", "out_channels", "kernel_size"],
         "params_optional": [
             "bias",
+            "stride",
+            "padding",
+            "dilation",
+            "groups",
             "transposed",
             "output_padding",
             "padding_mode",
@@ -756,6 +765,9 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
             "seq_len",
             "embedding_dim",
             "theta",
+            "pos_vec",
+            "input_shape",
+            "output_shape",
         ],
     },
     LayerKind.SLICE.value: {
@@ -773,6 +785,22 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     LayerKind.PAD.value: {
         "params_required": ["pad"],
         "params_optional": ["mode", "value", "input_shape", "output_shape"],
+    },
+    LayerKind.LAYERNORM.value: {
+        "params_required": ["gamma", "beta"],
+        "params_optional": ["eps", "input_shape", "output_shape"],
+    },
+    LayerKind.MASK_ADD.value: {
+        "params_required": ["M"],
+        "params_optional": ["input_shape", "output_shape"],
+    },
+    LayerKind.SQUARE.value: {
+        "params_required": [],
+        "params_optional": ["input_shape", "output_shape"],
+    },
+    LayerKind.POWER.value: {
+        "params_required": ["p"],
+        "params_optional": ["input_shape", "output_shape"],
     },
 }
 

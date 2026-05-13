@@ -187,12 +187,24 @@ def validate_wrapper_graph(layers: List["Layer"]) -> None:
                 f"Preprocessing should be handled by data loader (e.g., torchvision.transforms)."
             )
 
-    # No INPUT/INPUT_SPEC after first spec (except final ASSERT at end)
+    # All INPUT_SPEC layers must form a contiguous prefix block right after
+    # INPUT. Once a non-INPUT_SPEC, non-wrapper layer appears, no more
+    # INPUT_SPECs or INPUTs are allowed.
+    seen_model_layer = False
     for i, k in enumerate(kinds[first_spec_idx+1:-1], start=first_spec_idx+1):
-        if k in (LayerKind.INPUT.value, LayerKind.INPUT_SPEC.value):
+        if k == LayerKind.INPUT.value:
             raise ValueError(
                 f"Unexpected {k} after the first INPUT_SPEC at index {i}."
             )
+        if k == LayerKind.INPUT_SPEC.value:
+            if seen_model_layer:
+                raise ValueError(
+                    f"INPUT_SPEC at index {i} appears after model layers; "
+                    "all INPUT_SPEC layers must form a contiguous block "
+                    "immediately after INPUT."
+                )
+        else:
+            seen_model_layer = True
 
 
 def is_supported_op(op: str) -> bool:

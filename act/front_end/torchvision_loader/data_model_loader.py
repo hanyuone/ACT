@@ -111,7 +111,8 @@ def download_dataset_model_pair(
         if is_classification and inference_result is not None:
             print(f"  • Inference Test: {'✓ PASSED' if inference_result else '✗ FAILED'}")
         
-        # Check testability - now works for both standard and custom models
+        # Testability covers standard torchvision.models and any custom
+        # models registered in model_definitions.get_model().
         if not is_testable:
             error_msg = (
                 f"❌ VALIDATION FAILED: Model '{model_name}' cannot be loaded.\n"
@@ -423,9 +424,10 @@ def _format_size(size_bytes: int) -> str:
 def list_downloaded_pairs(root_dir: Optional[str] = None) -> List[dict]:
     """
     List all downloaded dataset-model pairs with size information.
-    
-    Reads from info.json which now stores a list of models per dataset.
-    
+
+    Reads ``info.json`` per dataset; each file stores a list of models
+    sharing that dataset.
+
     Args:
         root_dir: Root directory for downloads (default: from path_config.get_torchvision_data_root())
         
@@ -459,12 +461,11 @@ def list_downloaded_pairs(root_dir: Optional[str] = None) -> List[dict]:
             size_bytes = _get_directory_size(dataset_dir)
             size_formatted = _format_size(size_bytes)
             
-            # Handle both old format (single 'model') and new format (list 'models')
+            # info.json may store either a list under 'models' or a single
+            # 'model' string; normalise both into models_list.
             if 'models' in metadata:
-                # New format: list of models
                 models_list = metadata['models']
             else:
-                # Old format: single model (backward compatibility)
                 model = metadata.get('model')
                 models_list = [model] if model else []
             

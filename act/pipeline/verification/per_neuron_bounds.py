@@ -114,14 +114,78 @@ def compute_abstract_bounds(
     *,
     tf_mode: str = "interval",
 ) -> Tuple[Dict[int, Bounds], List[str]]:
+    """Compute abstract bounds for all layers in the ACT net.
+
+    ``interval`` and ``hybridz`` are both batch-native and run a single
+    batched analyze pass directly on ``[B, *shape]`` bounds. ``dual`` is
+    still single-instance, so for B>1 it runs the analysis once per
+    sample and stacks the per-layer bounds along a new batch axis.
     """
-    Compute abstract bounds for all layers in the ACT net.
-    """
+    from act.back_end.core import Fact
+
     errors: List[str] = []
     bounds_by_layer: Dict[int, Bounds] = {}
-
     set_transfer_function_mode(tf_mode)
     entry_id = find_entry_layer_id(act_net)
+
+    seed_lb = entry_fact.bounds.lb
+    seed_ub = entry_fact.bounds.ub
+    is_batched_input = seed_lb.dim() >= 2 and seed_lb.shape[0] > 1
+    needs_per_sample = is_batched_input and tf_mode == "dual"
+
+    if needs_per_sample:
+        B = seed_lb.shape[0]
+        per_sample_after: List[Dict[int, Any]] = []
+        for b_idx in range(B):
+            # Preserve the leading B=1 axis (batch-native TFs require >=2D).
+            single_fact = Fact(
+                bounds=Bounds(
+                    lb=seed_lb[b_idx:b_idx + 1],
+                    ub=seed_ub[b_idx:b_idx + 1],
+                ),
+                cons=entry_fact.cons,
+            )
+            _before, after_b, _globalC = analyze(
+                act_net, entry_id, single_fact
+            )
+            per_sample_after.append(after_b)
+
+        for layer in getattr(act_net, "layers", []):
+            lid = layer.id
+            if not all(lid in a for a in per_sample_after):
+                errors.append(
+                    f"Missing bounds for layer_id={lid} (kind={layer.kind}) "
+                    f"in at least one sample under per-sample {tf_mode} analysis"
+                )
+                continue
+            lbs = [a[lid].bounds.lb for a in per_sample_after]
+            ubs = [a[lid].bounds.ub for a in per_sample_after]
+            # Per-sample TF backends differ: batched ones (interval) leave the
+            # B=1 axis intact (shape (1, *)); single-instance ones (dual)
+            # return 1-D (numel,). Normalize to at-least-2D then cat on dim 0
+            # so the result is always (B, *).
+            lbs = [t.unsqueeze(0) if t.dim() < 2 else t for t in lbs]
+            ubs = [t.unsqueeze(0) if t.dim() < 2 else t for t in ubs]
+            try:
+                stacked_lb = torch.cat(lbs, dim=0)
+                stacked_ub = torch.cat(ubs, dim=0)
+            except RuntimeError as e:
+                errors.append(
+                    f"Failed to stack per-sample bounds at layer_id={lid}: {e}"
+                )
+                continue
+            if stacked_lb.shape != stacked_ub.shape:
+                errors.append(
+                    f"Bounds shape mismatch at layer_id={lid}: "
+                    f"lb={tuple(stacked_lb.shape)} ub={tuple(stacked_ub.shape)}"
+                )
+                continue
+            if not torch.isfinite(stacked_lb).all() or not torch.isfinite(stacked_ub).all():
+                errors.append(f"Non-finite bounds at layer_id={lid}")
+                continue
+            bounds_by_layer[lid] = Bounds(lb=stacked_lb, ub=stacked_ub)
+        return bounds_by_layer, errors
+
     _before, after, _globalC = analyze(act_net, entry_id, entry_fact)
 
     for layer in getattr(act_net, "layers", []):
@@ -207,21 +271,23 @@ def collect_concrete_activations(
         raw_shape: Tuple[int, ...],
         expected_shape: Tuple[int, ...] | None,
     ) -> Tuple[Tuple[int, ...], bool, str]:
-        """
-        Strictly tolerate ONLY batch=1 differences.
-        """
+        """Match per-sample shape: raw and expected may carry any leading
+        batch dim (B=1 or B>1). Comparison strips the leading dim from both
+        sides if their per-sample ranks line up."""
         if expected_shape is None:
             return raw_shape, False, "expected_shape_missing"
         if not raw_shape:
             return raw_shape, False, "raw_shape_empty"
-        if raw_shape[0] != 1:
-            return raw_shape, False, "raw_first_dim_not_1"
-        if len(raw_shape) != len(expected_shape) + 1:
-            return raw_shape, False, "rank_not_expected_plus_one"
-        candidate = tuple(raw_shape[1:])
-        if candidate != expected_shape:
+        if len(raw_shape) == len(expected_shape) + 1:
+            candidate = tuple(raw_shape[1:])
+            if candidate == expected_shape:
+                return candidate, True, "dropped_batch"
             return raw_shape, False, "drop_would_not_match_expected"
-        return candidate, True, "dropped_batch1"
+        if len(raw_shape) == len(expected_shape):
+            if tuple(raw_shape[1:]) == tuple(expected_shape[1:]):
+                return raw_shape, True, "per_sample_matched"
+            return raw_shape, False, "per_sample_shape_mismatch"
+        return raw_shape, False, "rank_mismatch"
 
     mapping: Dict[int, torch.Tensor] = {}
 
@@ -251,16 +317,17 @@ def collect_concrete_activations(
                 raw_shape,
                 expected_shape,
             )
-            ev_numel = _numel(no_batch_shape)
-            exp_numel = _numel(expected_shape)
-            if ev_numel != exp_numel:
-                errors.append(
-                    f"Shape mismatch at layer_id={layer.id}: "
-                    f"event_raw={raw_shape} event_no_batch={no_batch_shape} "
-                    f"expected={expected_shape} "
-                    f"dropped_batch={dropped} drop_reason={drop_reason} "
-                    f"event_numel={ev_numel} expected_numel={exp_numel}"
-                )
+            if not dropped:
+                ev_numel = _numel(raw_shape)
+                exp_numel = _numel(expected_shape)
+                if ev_numel != exp_numel:
+                    errors.append(
+                        f"Shape mismatch at layer_id={layer.id}: "
+                        f"event_raw={raw_shape} event_no_batch={no_batch_shape} "
+                        f"expected={expected_shape} "
+                        f"dropped_batch={dropped} drop_reason={drop_reason} "
+                        f"event_numel={ev_numel} expected_numel={exp_numel}"
+                    )
         mapping[layer.id] = tensor
 
     info = {

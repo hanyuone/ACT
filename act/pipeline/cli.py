@@ -640,6 +640,31 @@ def cmd_verify(target: str, args):
         sys.exit(1)
 
 
+def _resolve_batch_sizes(cli_value):
+    """CLI flag > YAML ``validate.batch_sizes`` > built-in default ``[None]``.
+
+    The ``[None]`` fallback means "validate each network at its native
+    batch size from JSON only" (no batchification).
+    """
+    if cli_value:
+        return cli_value
+    try:
+        import yaml
+        from act.util.path_config import get_project_root
+        cfg_path = (
+            Path(get_project_root())
+            / "act/back_end/examples/config_gen_act_net.yaml"
+        )
+        if cfg_path.exists():
+            cfg = yaml.safe_load(cfg_path.read_text()) or {}
+            yaml_val = (cfg.get("validate") or {}).get("batch_sizes")
+            if yaml_val:
+                return yaml_val
+    except Exception:
+        pass
+    return [None]
+
+
 def cmd_validate_verifier(args):
     """Run verifier validation with specified mode.
 
@@ -665,14 +690,15 @@ def cmd_validate_verifier(args):
     # Parse networks if specified
     networks = args.networks.split(",") if args.networks else None
 
-    # Run validation based on mode
     try:
         per_neuron_config = args.per_neuron_config
+        batch_sizes = _resolve_batch_sizes(getattr(args, "batch_sizes", None))
         if args.mode == "counterexample":
             summary = validator.validate_counterexamples(
-                networks=networks, solvers=args.solvers
+                networks=networks,
+                solvers=args.solvers,
+                batch_sizes=batch_sizes,
             )
-            # Exit 1 if failures or errors, unless --ignore-errors is set
             exit_code = (
                 0
                 if args.ignore_errors
@@ -686,8 +712,8 @@ def cmd_validate_verifier(args):
                 tf_modes=args.tf_modes,
                 num_samples=args.samples,
                 per_neuron_config=per_neuron_config,
+                batch_sizes=batch_sizes,
             )
-            # Exit 1 if failures or errors, unless --ignore-errors is set
             exit_code = (
                 0
                 if args.ignore_errors
@@ -695,15 +721,15 @@ def cmd_validate_verifier(args):
                     1 if (summary["failed"] > 0 or summary.get("errors", 0) > 0) else 0
                 )
             )
-        else:  # comprehensive
+        else:
             combined = validator.validate_comprehensive(
                 networks=networks,
                 solvers=args.solvers,
                 tf_modes=args.tf_modes,
                 num_samples=args.samples,
                 per_neuron_config=per_neuron_config,
+                batch_sizes=batch_sizes,
             )
-            # Exit 1 if any failures or errors, unless --ignore-errors is set
             exit_code = (
                 0
                 if args.ignore_errors
@@ -947,6 +973,19 @@ Examples:
         default=PerNeuronConfigAction.PRESETS[PerNeuronConfigAction.DEFAULT_NAME],
         metavar="PRESET|ATOL,RTOL,TOPK",
         help="Per-neuron bounds preset (default|strict|loose) or triplet 'ATOL,RTOL,TOPK'.",
+    )
+    validation_group.add_argument(
+        "--batch-sizes",
+        type=lambda s: [
+            (None if (b.strip() == "" or b.strip().lower() == "none") else int(b))
+            for b in s.split(",")
+        ],
+        default=None,
+        metavar="B1,B2,...",
+        help="Batch sizes to validate at, e.g. '1,4'. Use 'none' for the "
+        "network's native batch (from JSON). When omitted, falls back to "
+        "the ``validate.batch_sizes`` list in config_gen_act_net.yaml, "
+        "then to ``[None]`` (native only).",
     )
     validation_group.add_argument(
         "--ignore-errors",

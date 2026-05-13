@@ -12,9 +12,8 @@
 
 import torch
 import torch.nn.functional as F
-from typing import List, Tuple
+from typing import Tuple
 from act.back_end.core import Bounds, Con, ConSet, Fact, Layer
-from act.back_end.utils import affine_bounds, pwl_meta, bound_var_interval, scale_interval
 
 
 def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
@@ -25,11 +24,15 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     """
     # Extract convolution parameters
     weight = L.params["weight"]  # [out_channels, in_channels, kernel_h, kernel_w]
+    assert isinstance(weight, torch.Tensor)
     bias = L.params.get("bias", None)
+    if bias is not None:
+        assert isinstance(bias, torch.Tensor)
     stride = L.params.get("stride", 1)
     padding = L.params.get("padding", 0)
     dilation = L.params.get("dilation", 1)
     groups = L.params.get("groups", 1)
+    assert isinstance(groups, int)
     
     # Normalize stride/padding/dilation to tuples
     if isinstance(stride, int):
@@ -44,7 +47,8 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     in_channels = in_channels_per_group * groups
     
     # Get ACTUAL input size from bounds (not metadata - metadata may be wrong!)
-    actual_input_size = Bin.lb.numel()
+    B_in = Bin.lb.shape[0]
+    actual_input_size = Bin.lb[0].numel()
     
     # Infer spatial dimensions from actual input size
     spatial_size = actual_input_size // in_channels
@@ -60,16 +64,16 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
                 if in_h * in_w * in_channels == actual_input_size:
                     break
     
-    input_shape = (1, in_channels, in_h, in_w)
+    input_shape = (B_in, in_channels, in_h, in_w)
     
     # Compute output dimensions using standard conv formula
     out_h = (in_h + 2 * padding[0] - dilation[0] * (kernel_h - 1) - 1) // stride[0] + 1
     out_w = (in_w + 2 * padding[1] - dilation[1] * (kernel_w - 1) - 1) // stride[1] + 1
-    output_shape = (1, out_channels, out_h, out_w)
+    output_shape = (B_in, out_channels, out_h, out_w)
     
     # Compute bounds via torch
-    lb_4d = Bin.lb.view(1, in_channels, in_h, in_w)
-    ub_4d = Bin.ub.view(1, in_channels, in_h, in_w)
+    lb_4d = Bin.lb.view(B_in, in_channels, in_h, in_w)
+    ub_4d = Bin.ub.view(B_in, in_channels, in_h, in_w)
     
     W_pos = weight.clamp(min=0)
     W_neg = weight.clamp(max=0)
@@ -81,15 +85,15 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     if bias is not None:
         lb_out = lb_out + bias.view(1, -1, 1, 1)
         ub_out = ub_out + bias.view(1, -1, 1, 1)
-    
-    B_output = Bounds(lb=lb_out.flatten(), ub=ub_out.flatten())
-    
-    actual_output_size = B_output.lb.numel()
+
+    B_output = Bounds(lb=lb_out.reshape(B_in, -1), ub=ub_out.reshape(B_in, -1))
+
+    actual_output_size = B_output.lb.shape[1]
     spatial_size_per_channel = actual_output_size // out_channels
     if bias is not None:
         b_equiv = bias.repeat_interleave(spatial_size_per_channel)
     else:
-        b_equiv = torch.zeros(actual_output_size)
+        b_equiv = Bin.lb.new_zeros(actual_output_size)
     
     # Store conv params for constraint (no Toeplitz materialization)
     C = ConSet()
@@ -109,37 +113,6 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     
     C.add_box(L.id, L.out_vars, B_output)
     return Fact(B_output, C)
-    padding = L.params.get("padding", 0)
-    dilation = L.params.get("dilation", 1)
-
-    input_shape = L.params["input_shape"]   # [batch, channels, width]
-    output_shape = L.params["output_shape"] # [batch, channels, out_w]
-
-    b, c, w = input_shape
-    _, _, out_w = output_shape
-
-    lb_in = Bin.lb.view(b, c, w)
-    ub_in = Bin.ub.view(b, c, w)
-
-    lb_out = F.max_pool1d(lb_in, kernel_size, stride, padding, dilation)
-    ub_out = F.max_pool1d(ub_in, kernel_size, stride, padding, dilation)
-    assert lb_out.shape == (b, c, out_w), f"maxpool1d output shape mismatch: got {tuple(lb_out.shape)}, expected {(b, c, out_w)}"
-    assert lb_out.numel() == len(L.out_vars), f"maxpool1d out_vars length {len(L.out_vars)} != output elements {lb_out.numel()}"
-
-    B = Bounds(lb_out.view(-1), ub_out.view(-1))
-    assert torch.all(B.lb <= B.ub), "maxpool1d produced invalid bounds (lb > ub)"
-    C = ConSet()
-    C.replace(Con("INEQ", tuple(L.out_vars + L.in_vars), {
-        "tag": f"maxpool1d:{L.id}",
-        "kernel_size": kernel_size,
-        "stride": stride,
-        "padding": padding,
-        "dilation": dilation,
-        "input_shape": input_shape,
-        "output_shape": output_shape,
-    }))
-    C.add_box(L.id, L.out_vars, B)
-    return Fact(B, C)
 
 
 def tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
@@ -157,16 +130,19 @@ def tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     # Shape information
     input_shape = L.params["input_shape"]  # [batch, channels, height, width]
     output_shape = L.params["output_shape"]  # [batch, channels, out_h, out_w]
-    
-    batch_size, channels, in_h, in_w = input_shape
+    input_shape = tuple(int(dim) for dim in input_shape)
+    output_shape = tuple(int(dim) for dim in output_shape)
+
+    B_in = Bin.lb.shape[0]
+    _, channels, in_h, in_w = input_shape
     _, _, out_h, out_w = output_shape
     
     # For max pooling, we need to consider all possible inputs in each pool window
     # The output bounds are the max of upper bounds and max of lower bounds in each window
     
     # Reshape bounds for pooling operation
-    input_lb = Bin.lb.view(batch_size, channels, in_h, in_w)
-    input_ub = Bin.ub.view(batch_size, channels, in_h, in_w)
+    input_lb = Bin.lb.view(B_in, channels, in_h, in_w)
+    input_ub = Bin.ub.view(B_in, channels, in_h, in_w)
     
     # Apply max pooling to bounds
     # For lower bound: take max of lower bounds in each window
@@ -175,7 +151,13 @@ def tf_maxpool2d(L: Layer, Bin: Bounds) -> Fact:
     output_ub = F.max_pool2d(input_ub, kernel_size, stride, padding, dilation)
     
     # Flatten output bounds
-    B_output = Bounds(output_lb.view(-1), output_ub.view(-1))
+    assert tuple(output_lb.shape) == (B_in, channels, out_h, out_w), (
+        f"maxpool2d output shape mismatch: got {tuple(output_lb.shape)}, expected {(B_in, channels, out_h, out_w)}"
+    )
+    assert output_lb[0].numel() == len(L.out_vars), (
+        f"maxpool2d out_vars length {len(L.out_vars)} != output elements {output_lb[0].numel()}"
+    )
+    B_output = Bounds(output_lb.reshape(B_in, -1), output_ub.reshape(B_in, -1))
     
     # Create constraints for max pooling
     C = ConSet()
@@ -285,29 +267,35 @@ def tf_pad(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B, C)
 
 def tf_flatten(L: Layer, Bin: Bounds) -> Fact:
-    lb = Bin.lb
-    ub = Bin.ub
+    B_in = Bin.lb.shape[0]
 
     if "input_shape" in L.params:
-        input_shape = tuple(L.params["input_shape"])
+        raw_input_shape = L.params["input_shape"]
+        input_shape = tuple(int(dim) for dim in raw_input_shape)
     else:
-        input_shape = (int(lb.numel()),)
+        input_shape = (B_in, int(Bin.lb[0].numel()))
 
     if "output_shape" in L.params:
-        output_shape = tuple(L.params["output_shape"])
+        raw_output_shape = L.params["output_shape"]
+        output_shape = tuple(int(dim) for dim in raw_output_shape)
     else:
-        output_shape = (int(lb.numel()),)
+        output_shape = (B_in, int(Bin.lb[0].numel()))
 
     axis      = L.params.get("axis", None)        # ONNX Flatten(axis=...)
     start_dim = L.params.get("start_dim", None)   # torch.flatten(start_dim, end_dim)
     end_dim   = L.params.get("end_dim", None)
 
-    lb_flat = lb.view(-1)
-    ub_flat = ub.view(-1)
-    assert lb_flat.numel() == len(L.out_vars), f"flatten out_vars length {len(L.out_vars)} != output elements {lb_flat.numel()}"
+    lb_flat = Bin.lb.view(B_in, -1)
+    ub_flat = Bin.ub.view(B_in, -1)
+    assert lb_flat.shape[1] == len(L.out_vars), (
+        f"flatten out_vars length {len(L.out_vars)} != output elements {lb_flat.shape[1]}"
+    )
     if "output_shape" in L.params:
-        expected = int(torch.tensor(output_shape).prod().item())
-        assert lb_flat.numel() == expected, f"flatten output numel {lb_flat.numel()} != expected {expected}"
+        expected = 1
+        dims = output_shape[1:] if len(output_shape) > 1 else output_shape
+        for dim in dims:
+            expected *= int(dim)
+        assert lb_flat.shape[1] == expected, f"flatten output numel {lb_flat.shape[1]} != expected {expected}"
     B_out = Bounds(lb_flat, ub_flat)
     # Note: bounds validity is checked in analyze.py with detailed debug info
 
@@ -343,27 +331,28 @@ def tf_avgpool2d(L: Layer, Bin: Bounds) -> Fact:
     # Input/output shape information
     input_shape = L.params["input_shape"]
     output_shape = L.params["output_shape"]
-    
-    batch_size, channels, in_h, in_w = input_shape
+    input_shape = tuple(int(dim) for dim in input_shape)
+    output_shape = tuple(int(dim) for dim in output_shape)
+
+    B_in = Bin.lb.shape[0]
+    _, channels, in_h, in_w = input_shape
     _, _, out_h, out_w = output_shape
-    
-    # Create equivalent linear transformation for average pooling
-    input_flat_size = channels * in_h * in_w
-    output_flat_size = channels * out_h * out_w
-    
+
+    input_lb = Bin.lb.view(B_in, channels, in_h, in_w)
+    input_ub = Bin.ub.view(B_in, channels, in_h, in_w)
+    output_lb = F.avg_pool2d(input_lb, kernel_size, stride, padding)
+    output_ub = F.avg_pool2d(input_ub, kernel_size, stride, padding)
+    assert tuple(output_lb.shape) == (B_in, channels, out_h, out_w), (
+        f"avgpool2d output shape mismatch: got {tuple(output_lb.shape)}, expected {(B_in, channels, out_h, out_w)}"
+    )
+    assert output_lb[0].numel() == len(L.out_vars), (
+        f"avgpool2d out_vars length {len(L.out_vars)} != output elements {output_lb[0].numel()}"
+    )
+    B_output = Bounds(output_lb.reshape(B_in, -1), output_ub.reshape(B_in, -1))
+
     W_equiv = _avgpool2d_to_linear_matrix(
         input_shape, output_shape, kernel_size, stride, padding
     )
-    
-    # No bias for average pooling
-    b_equiv = torch.zeros(output_flat_size, dtype=Bin.lb.dtype, device=Bin.lb.device)
-    
-    # Apply linear transformation
-    W_pos = torch.clamp(W_equiv, min=0)
-    W_neg = torch.clamp(W_equiv, max=0)
-    
-    input_bounds_flat = Bounds(Bin.lb.view(-1), Bin.ub.view(-1))
-    B_output = affine_bounds(W_pos, W_neg, b_equiv, input_bounds_flat)
     
     # Create constraints
     C = ConSet()
@@ -389,53 +378,46 @@ def _avgpool2d_to_linear_matrix(
     padding: int
 ) -> torch.Tensor:
     """Convert AvgPool2d to equivalent linear transformation matrix."""
-    batch_size, channels, in_h, in_w = input_shape
+    _, channels, in_h, in_w = input_shape
     _, _, out_h, out_w = output_shape
-    
+
     input_flat_size = channels * in_h * in_w
     output_flat_size = channels * out_h * out_w
-    
+
     W_equiv = torch.zeros(output_flat_size, input_flat_size)
-    
+
     if isinstance(kernel_size, int):
         kernel_size = (kernel_size, kernel_size)
     if isinstance(stride, int):
         stride = (stride, stride)
     if isinstance(padding, int):
         padding = (padding, padding)
-    
+
     kernel_h, kernel_w = kernel_size
-    
-    for c in range(channels):
-        for out_y in range(out_h):
-            for out_x in range(out_w):
-                out_idx = c * (out_h * out_w) + out_y * out_w + out_x
-                
-                # Count valid kernel positions
-                valid_count = 0
-                
-                for k_y in range(kernel_h):
-                    for k_x in range(kernel_w):
-                        in_y = out_y * stride[0] - padding[0] + k_y
-                        in_x = out_x * stride[1] - padding[1] + k_x
-                        
-                        if 0 <= in_y < in_h and 0 <= in_x < in_w:
-                            in_idx = c * (in_h * in_w) + in_y * in_w + in_x
-                            valid_count += 1
-                
-                # Set weights for average (1/count for each valid position)
-                if valid_count > 0:
-                    weight_val = 1.0 / valid_count
-                    
-                    for k_y in range(kernel_h):
-                        for k_x in range(kernel_w):
-                            in_y = out_y * stride[0] - padding[0] + k_y
-                            in_x = out_x * stride[1] - padding[1] + k_x
-                            
-                            if 0 <= in_y < in_h and 0 <= in_x < in_w:
-                                in_idx = c * (in_h * in_w) + in_y * in_w + in_x
-                                W_equiv[out_idx, in_idx] = weight_val
-    
+
+    c, out_y, out_x, k_y, k_x = torch.meshgrid(
+        torch.arange(channels),
+        torch.arange(out_h),
+        torch.arange(out_w),
+        torch.arange(kernel_h),
+        torch.arange(kernel_w),
+        indexing="ij",
+    )
+
+    in_y = out_y * stride[0] - padding[0] + k_y
+    in_x = out_x * stride[1] - padding[1] + k_x
+    valid = (in_y >= 0) & (in_y < in_h) & (in_x >= 0) & (in_x < in_w)
+
+    valid_count = valid.sum(dim=(-2, -1), keepdim=True)
+    weight_vals = torch.zeros_like(valid_count, dtype=W_equiv.dtype)
+    nonzero = valid_count > 0
+    weight_vals[nonzero] = valid_count[nonzero].to(W_equiv.dtype).reciprocal()
+
+    out_idx = (c * (out_h * out_w) + out_y * out_w + out_x)[valid]
+    in_idx = (c * (in_h * in_w) + in_y * in_w + in_x)[valid]
+    scatter_vals = weight_vals.expand_as(valid)[valid]
+    W_equiv.index_put_((out_idx, in_idx), scatter_vals, accumulate=True)
+
     return W_equiv
 
 
@@ -445,33 +427,52 @@ def tf_conv1d(L: Layer, Bin: Bounds) -> Fact:
     """Transfer function for Conv1d layer."""
     # Extract convolution parameters
     weight = L.params["weight"]  # [out_channels, in_channels, kernel_w]
+    assert isinstance(weight, torch.Tensor)
     bias = L.params.get("bias", None)
+    if bias is not None:
+        assert isinstance(bias, torch.Tensor)
     stride = L.params.get("stride", 1)
     padding = L.params.get("padding", 0)
     dilation = L.params.get("dilation", 1)
     groups = L.params.get("groups", 1)
-    
+    assert isinstance(groups, int)
+
     # Input/output shape information
     input_shape = L.params["input_shape"]   # [batch, channels, width]
     output_shape = L.params["output_shape"] # [batch, out_channels, out_w]
-    
-    # Convert to equivalent linear transformation matrix
+    input_shape = tuple(int(dim) for dim in input_shape)
+    output_shape = tuple(int(dim) for dim in output_shape)
+
+    B_in = Bin.lb.shape[0]
+    _, channels, in_w = input_shape
+    _, out_channels, out_w = output_shape
+    lb_in = Bin.lb.view(B_in, channels, in_w)
+    ub_in = Bin.ub.view(B_in, channels, in_w)
+
+    W_pos = weight.clamp(min=0)
+    W_neg = weight.clamp(max=0)
+    conv_kw = dict(stride=stride, padding=padding, dilation=dilation, groups=groups)
+    lb_out = F.conv1d(lb_in, W_pos, None, **conv_kw) + F.conv1d(ub_in, W_neg, None, **conv_kw)
+    ub_out = F.conv1d(ub_in, W_pos, None, **conv_kw) + F.conv1d(lb_in, W_neg, None, **conv_kw)
+    if bias is not None:
+        lb_out = lb_out + bias.view(1, -1, 1)
+        ub_out = ub_out + bias.view(1, -1, 1)
+    assert tuple(lb_out.shape) == (B_in, out_channels, out_w), (
+        f"conv1d output shape mismatch: got {tuple(lb_out.shape)}, expected {(B_in, out_channels, out_w)}"
+    )
+    assert lb_out[0].numel() == len(L.out_vars), (
+        f"conv1d out_vars length {len(L.out_vars)} != output elements {lb_out[0].numel()}"
+    )
+    B_output = Bounds(lb_out.reshape(B_in, -1), ub_out.reshape(B_in, -1))
+
     W_equiv = _conv1d_to_linear_matrix(
         weight, input_shape, output_shape, stride, padding, dilation, groups
     )
-    
-    # Apply affine transformation with bias
+
     if bias is not None:
-        b_equiv = bias.repeat(output_shape[-1])  # Repeat for spatial dimensions
+        b_equiv = bias.repeat(out_w)
     else:
-        b_equiv = torch.zeros(W_equiv.shape[0])
-    
-    # Compute bounds using affine transformation
-    W_pos = torch.clamp(W_equiv, min=0)
-    W_neg = torch.clamp(W_equiv, max=0)
-    
-    # Apply linear transformation
-    B_output = affine_bounds(W_pos, W_neg, b_equiv, Bin)
+        b_equiv = Bin.lb.new_zeros(out_channels * out_w)
     
     # Create constraints
     C = ConSet()
@@ -494,33 +495,52 @@ def tf_conv3d(L: Layer, Bin: Bounds) -> Fact:
     """Transfer function for Conv3d layer."""
     # Extract convolution parameters
     weight = L.params["weight"]  # [out_channels, in_channels, kernel_d, kernel_h, kernel_w]
+    assert isinstance(weight, torch.Tensor)
     bias = L.params.get("bias", None)
+    if bias is not None:
+        assert isinstance(bias, torch.Tensor)
     stride = L.params.get("stride", 1)
     padding = L.params.get("padding", 0)
     dilation = L.params.get("dilation", 1)
     groups = L.params.get("groups", 1)
-    
+    assert isinstance(groups, int)
+
     # Input/output shape information
     input_shape = L.params["input_shape"]   # [batch, channels, depth, height, width]
     output_shape = L.params["output_shape"] # [batch, out_channels, out_d, out_h, out_w]
-    
-    # Convert to equivalent linear transformation matrix
+    input_shape = tuple(int(dim) for dim in input_shape)
+    output_shape = tuple(int(dim) for dim in output_shape)
+
+    B_in = Bin.lb.shape[0]
+    _, channels, in_d, in_h, in_w = input_shape
+    _, out_channels, out_d, out_h, out_w = output_shape
+    lb_in = Bin.lb.view(B_in, channels, in_d, in_h, in_w)
+    ub_in = Bin.ub.view(B_in, channels, in_d, in_h, in_w)
+
+    W_pos = weight.clamp(min=0)
+    W_neg = weight.clamp(max=0)
+    conv_kw = dict(stride=stride, padding=padding, dilation=dilation, groups=groups)
+    lb_out = F.conv3d(lb_in, W_pos, None, **conv_kw) + F.conv3d(ub_in, W_neg, None, **conv_kw)
+    ub_out = F.conv3d(ub_in, W_pos, None, **conv_kw) + F.conv3d(lb_in, W_neg, None, **conv_kw)
+    if bias is not None:
+        lb_out = lb_out + bias.view(1, -1, 1, 1, 1)
+        ub_out = ub_out + bias.view(1, -1, 1, 1, 1)
+    assert tuple(lb_out.shape) == (B_in, out_channels, out_d, out_h, out_w), (
+        f"conv3d output shape mismatch: got {tuple(lb_out.shape)}, expected {(B_in, out_channels, out_d, out_h, out_w)}"
+    )
+    assert lb_out[0].numel() == len(L.out_vars), (
+        f"conv3d out_vars length {len(L.out_vars)} != output elements {lb_out[0].numel()}"
+    )
+    B_output = Bounds(lb_out.reshape(B_in, -1), ub_out.reshape(B_in, -1))
+
     W_equiv = _conv3d_to_linear_matrix(
         weight, input_shape, output_shape, stride, padding, dilation, groups
     )
-    
-    # Apply affine transformation with bias
+
     if bias is not None:
-        out_d, out_h, out_w = output_shape[-3:]
         b_equiv = bias.repeat(out_d * out_h * out_w)
     else:
-        b_equiv = torch.zeros(W_equiv.shape[0])
-    
-    # Compute bounds using affine transformation
-    W_pos = torch.clamp(W_equiv, min=0)
-    W_neg = torch.clamp(W_equiv, max=0)
-    
-    B_output = affine_bounds(W_pos, W_neg, b_equiv, Bin)
+        b_equiv = Bin.lb.new_zeros(out_channels * out_d * out_h * out_w)
     
     # Create constraints
     C = ConSet()
@@ -543,34 +563,53 @@ def tf_convtranspose2d(L: Layer, Bin: Bounds) -> Fact:
     """Transfer function for ConvTranspose2d layer."""
     # Extract parameters
     weight = L.params["weight"]  # [in_channels, out_channels, kernel_h, kernel_w]
+    assert isinstance(weight, torch.Tensor)
     bias = L.params.get("bias", None)
+    if bias is not None:
+        assert isinstance(bias, torch.Tensor)
     stride = L.params.get("stride", 1)
     padding = L.params.get("padding", 0)
     output_padding = L.params.get("output_padding", 0)
     dilation = L.params.get("dilation", 1)
     groups = L.params.get("groups", 1)
-    
+    assert isinstance(groups, int)
+
     # Input/output shape information
     input_shape = L.params["input_shape"]
     output_shape = L.params["output_shape"]
-    
-    # Convert to equivalent linear transformation matrix
+    input_shape = tuple(int(dim) for dim in input_shape)
+    output_shape = tuple(int(dim) for dim in output_shape)
+
+    B_in = Bin.lb.shape[0]
+    _, in_channels, in_h, in_w = input_shape
+    _, out_channels, out_h, out_w = output_shape
+    lb_in = Bin.lb.view(B_in, in_channels, in_h, in_w)
+    ub_in = Bin.ub.view(B_in, in_channels, in_h, in_w)
+
+    W_pos = weight.clamp(min=0)
+    W_neg = weight.clamp(max=0)
+    conv_kw = dict(stride=stride, padding=padding, output_padding=output_padding, dilation=dilation, groups=groups)
+    lb_out = F.conv_transpose2d(lb_in, W_pos, None, **conv_kw) + F.conv_transpose2d(ub_in, W_neg, None, **conv_kw)
+    ub_out = F.conv_transpose2d(ub_in, W_pos, None, **conv_kw) + F.conv_transpose2d(lb_in, W_neg, None, **conv_kw)
+    if bias is not None:
+        lb_out = lb_out + bias.view(1, -1, 1, 1)
+        ub_out = ub_out + bias.view(1, -1, 1, 1)
+    assert tuple(lb_out.shape) == (B_in, out_channels, out_h, out_w), (
+        f"convtranspose2d output shape mismatch: got {tuple(lb_out.shape)}, expected {(B_in, out_channels, out_h, out_w)}"
+    )
+    assert lb_out[0].numel() == len(L.out_vars), (
+        f"convtranspose2d out_vars length {len(L.out_vars)} != output elements {lb_out[0].numel()}"
+    )
+    B_output = Bounds(lb_out.reshape(B_in, -1), ub_out.reshape(B_in, -1))
+
     W_equiv = _convtranspose2d_to_linear_matrix(
         weight, input_shape, output_shape, stride, padding, output_padding, dilation, groups
     )
-    
-    # Apply affine transformation with bias
+
     if bias is not None:
-        out_h, out_w = output_shape[-2:]
         b_equiv = bias.repeat(out_h * out_w)
     else:
-        b_equiv = torch.zeros(W_equiv.shape[0])
-    
-    # Compute bounds
-    W_pos = torch.clamp(W_equiv, min=0)
-    W_neg = torch.clamp(W_equiv, max=0)
-    
-    B_output = affine_bounds(W_pos, W_neg, b_equiv, Bin)
+        b_equiv = Bin.lb.new_zeros(out_channels * out_h * out_w)
     
     # Create constraints
     C = ConSet()
@@ -590,9 +629,12 @@ def tf_convtranspose2d(L: Layer, Bin: Bounds) -> Fact:
     return Fact(B_output, C)
 
 def tf_upsample(L: Layer, Bin: Bounds) -> Fact:
-    in_shape = tuple(L.params["input_shape"])
-    x_lb = Bin.lb.view(*in_shape)
-    x_ub = Bin.ub.view(*in_shape)
+    # input_shape comes through as a list after JSON deserialization;
+    # coerce to tuple of ints for downstream torch ops.
+    in_shape = tuple(int(dim) for dim in L.params["input_shape"])
+    B_in = Bin.lb.shape[0]
+    x_lb = Bin.lb.view(B_in, *in_shape[1:])
+    x_ub = Bin.ub.view(B_in, *in_shape[1:])
 
     size = L.params.get("size", None)
     scale_factor = L.params.get("scale_factor", None)
@@ -617,11 +659,12 @@ def tf_upsample(L: Layer, Bin: Bounds) -> Fact:
     )
 
     if "output_shape" in L.params:
-        expected_shape = tuple(L.params["output_shape"])
+        out_shape = tuple(int(dim) for dim in L.params["output_shape"])
+        expected_shape = (B_in, *out_shape[1:])
         assert tuple(y_lb.shape) == expected_shape, f"upsample output shape mismatch: got {tuple(y_lb.shape)}, expected {expected_shape}"
-    assert y_lb.numel() == len(L.out_vars), f"upsample out_vars length {len(L.out_vars)} != output elements {y_lb.numel()}"
+    assert y_lb[0].numel() == len(L.out_vars), f"upsample out_vars length {len(L.out_vars)} != output elements {y_lb[0].numel()}"
 
-    B = Bounds(y_lb.reshape(-1), y_ub.reshape(-1))
+    B = Bounds(y_lb.reshape(B_in, -1), y_ub.reshape(B_in, -1))
     assert torch.all(B.lb <= B.ub), "upsample produced invalid bounds (lb > ub)"
     C = ConSet()
     C.replace(Con("EQ", tuple(L.out_vars + L.in_vars), {
@@ -648,31 +691,37 @@ def _conv1d_to_linear_matrix(
     groups: int = 1
 ) -> torch.Tensor:
     """Convert Conv1d to equivalent linear transformation matrix."""
-    batch_size, in_channels, in_w = input_shape
+    _, in_channels, in_w = input_shape
     _, out_channels, out_w = output_shape
-    
+
     input_flat_size = in_channels * in_w
     output_flat_size = out_channels * out_w
-    
-    W_equiv = torch.zeros(output_flat_size, input_flat_size)
-    
+
+    W_equiv = weight.new_zeros(output_flat_size, input_flat_size)
+
     kernel_w = weight.shape[2]
-    
-    for out_c in range(out_channels):
-        for out_x in range(out_w):
-            for in_c in range(in_channels // groups):
-                for k_x in range(kernel_w):
-                    in_x = out_x * stride - padding + k_x * dilation
-                    
-                    if 0 <= in_x < in_w:
-                        group_idx = (out_c // (out_channels // groups))
-                        actual_in_c = group_idx * (in_channels // groups) + in_c
-                        
-                        out_idx = out_c * out_w + out_x
-                        in_idx = actual_in_c * in_w + in_x
-                        
-                        W_equiv[out_idx, in_idx] += weight[out_c, in_c, k_x]
-    
+    in_channels_per_group = in_channels // groups
+    out_channels_per_group = out_channels // groups
+
+    dev = weight.device
+    out_c, out_x, in_c, k_x = torch.meshgrid(
+        torch.arange(out_channels, device=dev),
+        torch.arange(out_w, device=dev),
+        torch.arange(in_channels_per_group, device=dev),
+        torch.arange(kernel_w, device=dev),
+        indexing="ij",
+    )
+
+    group_idx = out_c // out_channels_per_group
+    actual_in_c = group_idx * in_channels_per_group + in_c
+    in_x = out_x * stride - padding + k_x * dilation
+    valid = (in_x >= 0) & (in_x < in_w)
+
+    out_idx = (out_c * out_w + out_x)[valid]
+    in_idx = (actual_in_c * in_w + in_x)[valid]
+    scatter_vals = weight[out_c, in_c, k_x][valid]
+    W_equiv.index_put_((out_idx, in_idx), scatter_vals, accumulate=True)
+
     return W_equiv
 
 
@@ -686,16 +735,16 @@ def _conv3d_to_linear_matrix(
     groups: int = 1
 ) -> torch.Tensor:
     """Convert Conv3d to equivalent linear transformation matrix."""
-    batch_size, in_channels, in_d, in_h, in_w = input_shape
+    _, in_channels, in_d, in_h, in_w = input_shape
     _, out_channels, out_d, out_h, out_w = output_shape
-    
+
     input_flat_size = in_channels * in_d * in_h * in_w
     output_flat_size = out_channels * out_d * out_h * out_w
-    
-    W_equiv = torch.zeros(output_flat_size, input_flat_size)
-    
+
+    W_equiv = weight.new_zeros(output_flat_size, input_flat_size)
+
     kernel_d, kernel_h, kernel_w = weight.shape[2], weight.shape[3], weight.shape[4]
-    
+
     # Handle stride/padding as tuples or ints
     if isinstance(stride, int):
         stride = (stride, stride, stride)
@@ -703,32 +752,51 @@ def _conv3d_to_linear_matrix(
         padding = (padding, padding, padding)
     if isinstance(dilation, int):
         dilation = (dilation, dilation, dilation)
-    
-    for out_c in range(out_channels):
-        for out_d_idx in range(out_d):
-            for out_h_idx in range(out_h):
-                for out_w_idx in range(out_w):
-                    for in_c in range(in_channels // groups):
-                        for k_d in range(kernel_d):
-                            for k_h in range(kernel_h):
-                                for k_w in range(kernel_w):
-                                    in_d_idx = out_d_idx * stride[0] - padding[0] + k_d * dilation[0]
-                                    in_h_idx = out_h_idx * stride[1] - padding[1] + k_h * dilation[1]
-                                    in_w_idx = out_w_idx * stride[2] - padding[2] + k_w * dilation[2]
-                                    
-                                    if (0 <= in_d_idx < in_d and 0 <= in_h_idx < in_h and 0 <= in_w_idx < in_w):
-                                        group_idx = (out_c // (out_channels // groups))
-                                        actual_in_c = group_idx * (in_channels // groups) + in_c
-                                        
-                                        out_idx = (out_c * out_d * out_h * out_w + 
-                                                 out_d_idx * out_h * out_w +
-                                                 out_h_idx * out_w + out_w_idx)
-                                        in_idx = (actual_in_c * in_d * in_h * in_w +
-                                                in_d_idx * in_h * in_w +
-                                                in_h_idx * in_w + in_w_idx)
-                                        
-                                        W_equiv[out_idx, in_idx] += weight[out_c, in_c, k_d, k_h, k_w]
-    
+
+    in_channels_per_group = in_channels // groups
+    out_channels_per_group = out_channels // groups
+
+    out_c, out_d_idx, out_h_idx, out_w_idx, in_c, k_d, k_h, k_w = torch.meshgrid(
+        torch.arange(out_channels, device=weight.device),
+        torch.arange(out_d, device=weight.device),
+        torch.arange(out_h, device=weight.device),
+        torch.arange(out_w, device=weight.device),
+        torch.arange(in_channels_per_group, device=weight.device),
+        torch.arange(kernel_d, device=weight.device),
+        torch.arange(kernel_h, device=weight.device),
+        torch.arange(kernel_w, device=weight.device),
+        indexing="ij",
+    )
+
+    group_idx = out_c // out_channels_per_group
+    actual_in_c = group_idx * in_channels_per_group + in_c
+    in_d_idx = out_d_idx * stride[0] - padding[0] + k_d * dilation[0]
+    in_h_idx = out_h_idx * stride[1] - padding[1] + k_h * dilation[1]
+    in_w_idx = out_w_idx * stride[2] - padding[2] + k_w * dilation[2]
+    valid = (
+        (in_d_idx >= 0)
+        & (in_d_idx < in_d)
+        & (in_h_idx >= 0)
+        & (in_h_idx < in_h)
+        & (in_w_idx >= 0)
+        & (in_w_idx < in_w)
+    )
+
+    out_idx = (
+        out_c * out_d * out_h * out_w
+        + out_d_idx * out_h * out_w
+        + out_h_idx * out_w
+        + out_w_idx
+    )[valid]
+    in_idx = (
+        actual_in_c * in_d * in_h * in_w
+        + in_d_idx * in_h * in_w
+        + in_h_idx * in_w
+        + in_w_idx
+    )[valid]
+    scatter_vals = weight[out_c, in_c, k_d, k_h, k_w][valid]
+    W_equiv.index_put_((out_idx, in_idx), scatter_vals, accumulate=True)
+
     return W_equiv
 
 
@@ -743,16 +811,16 @@ def _convtranspose2d_to_linear_matrix(
     groups: int = 1
 ) -> torch.Tensor:
     """Convert ConvTranspose2d to equivalent linear transformation matrix."""
-    batch_size, in_channels, in_h, in_w = input_shape
+    _, in_channels, in_h, in_w = input_shape
     _, out_channels, out_h, out_w = output_shape
-    
+
     input_flat_size = in_channels * in_h * in_w
     output_flat_size = out_channels * out_h * out_w
-    
-    W_equiv = torch.zeros(output_flat_size, input_flat_size)
-    
+
+    W_equiv = weight.new_zeros(output_flat_size, input_flat_size)
+
     kernel_h, kernel_w = weight.shape[2], weight.shape[3]
-    
+
     # Handle stride/padding as tuples or ints
     if isinstance(stride, int):
         stride = (stride, stride)
@@ -762,24 +830,29 @@ def _convtranspose2d_to_linear_matrix(
         output_padding = (output_padding, output_padding)
     if isinstance(dilation, int):
         dilation = (dilation, dilation)
-    
-    # Transpose convolution: each input position contributes to multiple output positions
-    for in_c in range(in_channels):
-        for in_y in range(in_h):
-            for in_x in range(in_w):
-                for out_c in range(out_channels // groups):
-                    for k_y in range(kernel_h):
-                        for k_w in range(kernel_w):
-                            out_y = in_y * stride[0] - padding[0] + k_y * dilation[0]
-                            out_x = in_x * stride[1] - padding[1] + k_w * dilation[1]
-                            
-                            if (0 <= out_y < out_h and 0 <= out_x < out_w):
-                                group_idx = (in_c // (in_channels // groups))
-                                actual_out_c = group_idx * (out_channels // groups) + out_c
-                                
-                                in_idx = in_c * in_h * in_w + in_y * in_w + in_x
-                                out_idx = actual_out_c * out_h * out_w + out_y * out_w + out_x
-                                
-                                W_equiv[out_idx, in_idx] += weight[in_c, out_c, k_y, k_w]
-    
+
+    in_channels_per_group = in_channels // groups
+    out_channels_per_group = out_channels // groups
+
+    in_c, in_y, in_x, out_c, k_y, k_w = torch.meshgrid(
+        torch.arange(in_channels, device=weight.device),
+        torch.arange(in_h, device=weight.device),
+        torch.arange(in_w, device=weight.device),
+        torch.arange(out_channels_per_group, device=weight.device),
+        torch.arange(kernel_h, device=weight.device),
+        torch.arange(kernel_w, device=weight.device),
+        indexing="ij",
+    )
+
+    group_idx = in_c // in_channels_per_group
+    actual_out_c = group_idx * out_channels_per_group + out_c
+    out_y = in_y * stride[0] - padding[0] + k_y * dilation[0]
+    out_x = in_x * stride[1] - padding[1] + k_w * dilation[1]
+    valid = (out_y >= 0) & (out_y < out_h) & (out_x >= 0) & (out_x < out_w)
+
+    in_idx = (in_c * in_h * in_w + in_y * in_w + in_x)[valid]
+    out_idx = (actual_out_c * out_h * out_w + out_y * out_w + out_x)[valid]
+    scatter_vals = weight[in_c, out_c, k_y, k_w][valid]
+    W_equiv.index_put_((out_idx, in_idx), scatter_vals, accumulate=True)
+
     return W_equiv

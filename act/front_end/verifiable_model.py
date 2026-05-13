@@ -160,8 +160,8 @@ class VerifiableModel(nn.Module):
         else:
             x = result
         
-        # Convert tensor satisfied to bool for dict output (backward compatible)
-        # Spec layers now always return tensor, convert here
+        # Spec layers always return tensors; collapse them to a single
+        # bool for the dict-shaped output expected by callers.
         if isinstance(input_satisfied, torch.Tensor):
             input_satisfied = bool(input_satisfied.all().item())
         if isinstance(output_satisfied, torch.Tensor):
@@ -232,7 +232,7 @@ class InputLayer(nn.Module):
         if shape[0] < 1:
             raise ValueError(f"Batch size must be >= 1, got {shape[0]}")
         
-        # Core attributes (dtype now required)
+        # Core attributes (dtype is required by callers downstream).
         self.shape = tuple(shape)
         self._batched = shape[0] > 1  # Track if batched for to_act_layers
         self.dtype = dtype  # REQUIRED
@@ -460,7 +460,7 @@ class InputSpecLayer(nn.Module):
     def _validate_schema(self):
         """Validate parameters against INPUT_SPEC layer schema"""
         schema = REGISTRY[LayerKind.INPUT_SPEC.value]
-        params = {"kind": self.kind}  # kind is now in params
+        params = {"kind": self.kind}
         for name in ("lb", "ub", "center", "A", "b"):
             val = getattr(self, name, None)
             if val is not None:
@@ -476,22 +476,34 @@ class InputSpecLayer(nn.Module):
             if key not in schema["params_required"] + schema["params_optional"]:
                 raise ValueError(f"InputSpecLayer has unknown param: {key}")
 
-    def to_act_layers(self, layer_id_start: int, in_vars: List[int]) -> Tuple[List, List[int]]:
-        """Convert to ACT Layer(s) - INPUT_SPEC doesn't create new vars"""
-        params = {"kind": self.kind}  # kind is now in params
+    def to_act_layers(
+        self,
+        layer_id_start: int,
+        in_vars: List[int],
+        B: int = 1,
+    ) -> Tuple[List, List[int]]:
+        """Convert to ACT Layer(s) - INPUT_SPEC doesn't create new vars.
+
+        ``B`` is accepted for signature parity with ``OutputSpecLayer`` so
+        callers can pass the batch dim uniformly; currently unused because
+        ``InputSpec`` tensors are already batched at construction time
+        (lb/ub/center carry the leading B dim from the wrapped tensors).
+        """
+        del B
+        params = {"kind": self.kind}
         for name in ("lb", "ub", "center", "A", "b"):
             val = getattr(self, name, None)
             if val is not None:
                 params[name] = val
         if self.eps is not None:
             params["eps"] = self.eps
-        
+
         layer = create_layer(
             id=layer_id_start,
             kind=LayerKind.INPUT_SPEC.value,
             params=params,
             in_vars=in_vars,
-            out_vars=in_vars  # INPUT_SPEC doesn't change variables
+            out_vars=in_vars,
         )
         return [layer], in_vars
 
@@ -608,46 +620,54 @@ class OutputSpecLayer(nn.Module):
         self._validate_schema()
 
     def _validate_schema(self):
-        """Validate parameters against ASSERT layer schema"""
-        schema = REGISTRY[LayerKind.ASSERT.value]
-        params = {"kind": self.kind}
-        for name in ("c", "lb", "ub"):
-            val = getattr(self, name, None)
-            if val is not None:
-                params[name] = val
-        if self.y_true is not None:
-            params["y_true"] = self.y_true
-        if self.margin is not None:
-            params["margin"] = self.margin
-        if self.d is not None:
-            params["d"] = self.d
-        
-        # Check schema compliance
-        for key in schema["params_required"]:
-            if key not in params:
-                raise ValueError(f"OutputSpecLayer missing required param: {key}")
+        """Pre-flight kind validation; full ASSERT-layer schema (including
+        pre-encoded ``C`` / ``thresholds`` / ``M``) is enforced at
+        ``to_act_layers`` time via ``create_layer``.
+        """
+        supported = (
+            OutKind.LINEAR_LE, OutKind.UNSAFE_LINEAR,
+            OutKind.TOP1_ROBUST, OutKind.MARGIN_ROBUST, OutKind.RANGE,
+        )
+        if self.kind not in supported:
+            raise ValueError(
+                f"OutputSpecLayer: unsupported kind {self.kind!r}; "
+                f"expected one of {supported}"
+            )
 
-    def to_act_layers(self, layer_id_start: int, in_vars: List[int]) -> Tuple[List, List[int]]:
-        """Convert to ACT Layer(s) - ASSERT doesn't create new vars"""
-        # Build unified params dict
-        params = {"kind": self.kind}
-        for name in ("c", "lb", "ub"):
-            val = getattr(self, name, None)
-            if val is not None:
-                params[name] = val
-        if self.y_true is not None:
-            params["y_true"] = self.y_true
-        if self.margin is not None:
-            params["margin"] = self.margin
-        if self.d is not None:
-            params["d"] = self.d
-        
+    def to_act_layers(
+        self,
+        layer_id_start: int,
+        in_vars: List[int],
+        B: int = 1,
+    ) -> Tuple[List, List[int]]:
+        """Build the ACT ASSERT Layer for this output spec.
+
+        Encodes the spec via ``OutputSpec.encode_linear``, producing a
+        params dict with both high-level fields (for the BaB MILP path)
+        and pre-encoded ``C`` / ``thresholds`` / ``M`` (for ``verify_once``).
+
+        Args:
+            layer_id_start: numeric id to assign to the new ASSERT layer.
+            in_vars: variable ids carrying the network output values that
+                this assert constrains (``out_vars == in_vars`` for ASSERT).
+            B: batch size of the surrounding net; flows from the InputLayer's
+                ``shape[0]``. Defaults to 1 when the caller has no batch context.
+        """
+        from act.util.device_manager import (
+            get_default_device, get_default_dtype,
+        )
+        n_out = len(in_vars)
+        device = get_default_device()
+        dtype = get_default_dtype()
+        params = self.spec.encode_linear(
+            B=B, n_out=n_out, device=device, dtype=dtype,
+        )
         layer = create_layer(
             id=layer_id_start,
             kind=LayerKind.ASSERT.value,
             params=params,
             in_vars=in_vars,
-            out_vars=in_vars  # ASSERT doesn't change variables
+            out_vars=in_vars,
         )
         return [layer], in_vars
 
@@ -693,7 +713,7 @@ class OutputSpecLayer(nn.Module):
             max_other = other_scores.max(dim=1)[0]  # (batch,)
             
             actual_margin = true_scores - max_other  # (batch,)
-            margin_threshold = self.margin  # Always tensor now (even for n=1)
+            margin_threshold = self.margin  # always a tensor, including the n=1 case
             satisfied = actual_margin >= margin_threshold  # (batch,) bool
             
             # Unified explanation format (consistent across all batch sizes)
@@ -706,17 +726,16 @@ class OutputSpecLayer(nn.Module):
         elif self.kind == OutKind.LINEAR_LE:
             if self.c is None or self.d is None:
                 return (y, True, "⚠️ OUTPUT LINEAR_LE: Missing c/d")
-            
-            # Works for both single and batched (c applied to each sample)
+
             y_2d = y.reshape(batch_size, -1)  # (batch, n_vars)
-            lhs = (y_2d @ self.c)  # (batch,)
-            satisfied = lhs <= self.d  # (batch,) bool
-            
-            # Unified explanation format (consistent across all batch sizes)
+            # c is [n_out] (single-sample) or [B, n_out] (batch-native).
+            # Element-wise multiply + sum gives a per-lane lhs in both cases
+            # (broadcasts when c is 1-D); plain matmul would mismatch on the
+            # batch-native shape.
+            lhs = (y_2d * self.c).sum(dim=1)  # (batch,)
+            satisfied = lhs <= self.d.reshape(-1)  # (batch,) bool
             n_ok = satisfied.sum().item()
             explanation = f"✅ OUTPUT LINEAR_LE: {n_ok}/{batch_size} satisfied"
-            
-            # Always return tensor (unified output format)
             return (y, satisfied, explanation)
         
         elif self.kind == OutKind.RANGE:
@@ -742,10 +761,20 @@ class OutputSpecLayer(nn.Module):
             if self.c is None or self.d is None:
                 return (y, True, "⚠️ OUTPUT UNSAFE_LINEAR: Missing c/d")
             y_2d = y.reshape(batch_size, -1)
-            C = self.c if self.c.dim() >= 2 else self.c.unsqueeze(0)
-            d_vec = self.d.reshape(-1)
-            Cy = y_2d @ C.T
-            unsafe = (Cy <= d_vec).all(dim=1)
+            # c shape branches:
+            #   [n_out]          single-row legacy → promote to [1, n_out]
+            #   [N, n_out]       single-sample, N rows
+            #   [B, N, n_out]    batch-native, per-lane rows
+            # d shape pairs naturally: [1] / [N] / [B, N]. y is in {Cy <= d}
+            # iff ALL rows hold; safe iff NOT in the polytope.
+            if self.c.dim() == 3:
+                Cy = torch.einsum("bmn,bn->bm", self.c, y_2d)  # [B, N]
+                d_per_lane = self.d  # [B, N]
+            else:
+                C = self.c if self.c.dim() == 2 else self.c.unsqueeze(0)
+                Cy = y_2d @ C.T  # [B, N]
+                d_per_lane = self.d.reshape(-1)  # [N]
+            unsafe = (Cy <= d_per_lane).all(dim=1)
             satisfied = ~unsafe
             n_ok = satisfied.sum().item()
             explanation = f"✅ OUTPUT UNSAFE_LINEAR: {n_ok}/{batch_size} safe (UNSAFE={batch_size - n_ok})"

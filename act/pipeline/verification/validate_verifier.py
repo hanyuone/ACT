@@ -128,7 +128,7 @@
 #       --solvers gurobi --tf-modes interval --input-samples 10 \
 #       --device cpu --dtype float64
 #
-#   # Direct execution (legacy):
+#   # Direct script execution:
 #   python act/pipeline/verification/validate_verifier.py
 #   python act/pipeline/verification/validate_verifier.py --mode bounds --input-samples 5
 #
@@ -144,8 +144,9 @@ import copy
 import torch
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple, List, Sequence
 
+from act.back_end.core import Net, Layer
 from act.pipeline.verification.model_factory import ModelFactory
 from act.pipeline.verification.torch2act import TorchToACT
 from act.pipeline.verification.per_neuron_bounds import (
@@ -196,11 +197,218 @@ class VerificationValidator:
                 f.write(f"{'=' * 80}\n\n")
             logger.info(f"Debug logging to: {debug_file}")
 
+    def _batchify_net(self, net: Net, target_B: Optional[int]) -> Net:
+        """Return a deep copy of ``net`` with INPUT/INPUT_SPEC/ASSERT tensors
+        adjusted to ``target_B`` lanes along axis 0.
+
+        Scope:
+          Sub-problems sharing the SAME network and SAME spec kind only;
+          mixing kinds (e.g. LINEAR_LE with TOP1_ROBUST) in one batch is
+          not supported. Within a kind, lanes MAY carry different per-lane
+          constraints.
+
+        Per-kind ASSERT handling:
+          - TOP1_ROBUST / MARGIN_ROBUST: cycle ``y_true`` across classes
+            so each lane verifies a different "true class" assumption.
+          - LINEAR_LE / RANGE / UNSAFE_LINEAR: replicate sample 0's
+            constraint (these kinds have no natural per-lane axis).
+
+        INPUT / INPUT_SPEC: leading-axis tensors are replicated; spec-side
+        is the intended axis of per-lane variation.
+
+        ``target_B is None`` returns the net unchanged (use native B).
+        """
+        if target_B is None or target_B <= 0:
+            return self._migrate_net_to_device(copy.deepcopy(net))
+
+        new_net = copy.deepcopy(net)
+        for L in new_net.layers:
+            if L.kind in ("INPUT", "INPUT_SPEC"):
+                params = L.params or {}
+                for key in ("lb", "ub", "center", "eps"):
+                    t = params.get(key)
+                    if torch.is_tensor(t) and t.dim() > 0 and t.shape[0] != target_B:
+                        params[key] = (
+                            t[:1].expand(target_B, *t.shape[1:]).contiguous()
+                        )
+                if L.kind == "INPUT" and "shape" in params:
+                    shp = list(params["shape"])
+                    if shp and shp[0] != target_B:
+                        shp[0] = target_B
+                        params["shape"] = shp
+            elif L.kind in ("LSTM", "GRU", "RNN", "EMBEDDING"):
+                params = L.params or {}
+                for key in ("input_shape", "output_shape"):
+                    shp = params.get(key)
+                    if isinstance(shp, (list, tuple)) and shp and shp[0] != target_B:
+                        new_shp = list(shp)
+                        new_shp[0] = target_B
+                        params[key] = new_shp
+            elif L.kind == "ASSERT":
+                self._batchify_assert_layer(L, target_B)
+        return self._migrate_net_to_device(new_net)
+
+    def _migrate_net_to_device(self, net: Net) -> Net:
+        """Move every tensor in ``net.layers[*].params`` to ``self.device`` and
+        cast floating-point tensors to ``self.dtype``. Non-tensor params and
+        integer / bool tensors are passed through untouched. Required so
+        downstream ``analyze`` doesn't see mixed CPU/CUDA matmul operands.
+        """
+        for L in net.layers:
+            params = L.params or {}
+            for k, v in list(params.items()):
+                if torch.is_tensor(v):
+                    params[k] = v.to(
+                        device=self.device,
+                        dtype=self.dtype if v.is_floating_point() else v.dtype,
+                    )
+        return net
+
+    def _batchify_assert_layer(self, L: Layer, target_B: int) -> None:
+        """Re-encode an ASSERT layer to ``target_B`` lanes via the canonical
+        ``OutputSpec.encode_linear`` pipeline (single source of truth).
+
+        Mutates ``L.params`` in place. No-op if already at ``target_B``.
+        """
+        from act.front_end.specs import OutputSpec
+
+        params = L.params or {}
+        kind = str(params.get("kind", ""))
+
+        m_raw = params.get("M")
+        M = int(m_raw) if isinstance(m_raw, (int, float)) else 0
+        C_cur = params.get("C")
+        if (
+            torch.is_tensor(C_cur)
+            and C_cur.dim() == 2
+            and M > 0
+            and C_cur.shape[0] // M == target_B
+        ):
+            return
+
+        n_out = (
+            int(C_cur.shape[1])
+            if torch.is_tensor(C_cur) and C_cur.dim() == 2
+            else len(L.in_vars)
+        )
+
+        high: Dict[str, Any] = {}
+
+        if kind in ("TOP1_ROBUST", "MARGIN_ROBUST"):
+            y_true = params.get("y_true")
+            if not torch.is_tensor(y_true):
+                return
+            K = n_out
+            y0 = y_true.flatten()[:1]
+            arange = torch.arange(
+                target_B, device=y_true.device, dtype=y_true.dtype
+            )
+            high["y_true"] = ((y0 + arange) % K).contiguous()
+            if kind == "MARGIN_ROBUST":
+                margin = params.get("margin")
+                if torch.is_tensor(margin):
+                    high["margin"] = (
+                        margin.flatten()[:1].expand(target_B).contiguous()
+                    )
+
+        elif kind == "LINEAR_LE":
+            c, d = params.get("c"), params.get("d")
+            if torch.is_tensor(c) and c.dim() == 2:
+                high["c"] = c[0].contiguous()
+            if torch.is_tensor(d) and d.dim() == 1:
+                high["d"] = d[0:1].contiguous()
+
+        elif kind == "RANGE":
+            lb, ub = params.get("lb"), params.get("ub")
+            if torch.is_tensor(lb) and lb.dim() == 2:
+                high["lb"] = lb[0].contiguous()
+            if torch.is_tensor(ub) and ub.dim() == 2:
+                high["ub"] = ub[0].contiguous()
+
+        elif kind == "UNSAFE_LINEAR":
+            c, d = params.get("c"), params.get("d")
+            if torch.is_tensor(c) and c.dim() == 3:
+                high["c"] = c[0].contiguous()
+            if torch.is_tensor(d) and d.dim() == 2:
+                high["d"] = d[0].contiguous()
+
+        else:
+            return
+
+        ref = (
+            C_cur if torch.is_tensor(C_cur)
+            else next(
+                (v for v in high.values() if torch.is_tensor(v)), None
+            )
+        )
+        try:
+            spec = OutputSpec(kind=kind, **high)
+            new_params = spec.encode_linear(
+                B=target_B,
+                n_out=n_out,
+                device=ref.device if ref is not None else torch.device(self.device),
+                dtype=(
+                    ref.dtype
+                    if ref is not None and ref.dtype.is_floating_point
+                    else self.dtype
+                ),
+            )
+        except Exception as e:
+            logger.warning(
+                f"_batchify_assert_layer({kind}) at B={target_B}: "
+                f"re-encode failed: {e}"
+            )
+            return
+
+        L.params.clear()
+        L.params.update(new_params)
+
+    @staticmethod
+    def _batchify_tensor(t: torch.Tensor, target_B: Optional[int]) -> torch.Tensor:
+        """Expand a leading-axis tensor to ``target_B`` (no-op if matches/None)."""
+        if target_B is None or target_B <= 0:
+            return t
+        if t.dim() == 0 or t.shape[0] == target_B:
+            return t
+        return t[:1].expand(target_B, *t.shape[1:]).contiguous()
+
+    _KNOWN_RUNTIME_BROKEN: Dict[Tuple[str, str], str] = {}
+
+    def _network_supported_by_mode(
+        self, net: Net, tf_mode: str
+    ) -> Tuple[bool, List[str]]:
+        """Return ``(is_supported, sorted_blocking_kinds)`` for the
+        (network, tf_mode) pair.
+
+        Two sources of "skip":
+          1. Backend's static ``supports_layer`` returns False for some kind
+             (e.g. ``DualTF`` has no LSTM/GRU/RNN/transformer ops at all).
+          2. The (tf_mode, kind) pair is in ``_KNOWN_RUNTIME_BROKEN`` — the
+             backend claims support but has a documented runtime bug.
+
+        Real (undocumented) runtime errors are NOT swallowed; they bubble
+        up as ERROR so we notice and fix them.
+        """
+        from act.back_end.transfer_functions import (
+            set_transfer_function_mode,
+            get_transfer_function,
+        )
+        set_transfer_function_mode(tf_mode)
+        tf = get_transfer_function()
+        blocking = set()
+        for L in net.layers:
+            if not tf.supports_layer(L.kind):
+                blocking.add(L.kind)
+            elif (tf_mode, L.kind) in self._KNOWN_RUNTIME_BROKEN:
+                blocking.add(L.kind)
+        return len(blocking) == 0, sorted(blocking)
+
     def find_concrete_counterexample(
         self,
         name: str,
         model: torch.nn.Module,
         max_random: int = 64,
+        act_net: Optional[Net] = None,
     ) -> Optional[Tuple[torch.Tensor, Dict[str, Any]]]:
         """
         Try to find a concrete counterexample via concrete execution.
@@ -233,8 +441,8 @@ class VerificationValidator:
                 specs = gather_input_spec_layers(act_net)
                 if specs:
                     seed = seed_from_input_specs(specs)
-                    lb = seed.lb.to(device=self.device, dtype=self.dtype).flatten()
-                    ub = seed.ub.to(device=self.device, dtype=self.dtype).flatten()
+                    lb = seed.lb.to(self.device, self.dtype).flatten()
+                    ub = seed.ub.to(self.device, self.dtype).flatten()
                     if (
                         lb.shape == ub.shape
                         and lb.numel() > 0
@@ -255,7 +463,7 @@ class VerificationValidator:
                 if (input_shape and shape_prod == x_flat.numel())
                 else x_flat.reshape(1, -1)
             )
-            x = x.to(device=self.device, dtype=self.dtype)
+            x = x.to(self.device, self.dtype)
             with torch.no_grad():
                 res = model(x)
             if (
@@ -282,7 +490,7 @@ class VerificationValidator:
                             if (input_shape and shape_prod == x_edge.numel())
                             else x_edge.reshape(1, -1)
                         )
-                        x = x.to(device=self.device, dtype=self.dtype)
+                        x = x.to(self.device, self.dtype)
                         with torch.no_grad():
                             res = model(x)
                         if (
@@ -312,7 +520,7 @@ class VerificationValidator:
                     if (input_shape and shape_prod == x_flat.numel())
                     else x_flat.reshape(1, -1)
                 )
-                x = x.to(device=self.device, dtype=self.dtype)
+                x = x.to(self.device, self.dtype)
                 with torch.no_grad():
                     res = model(x)
                 if (
@@ -339,6 +547,7 @@ class VerificationValidator:
         self,
         networks: Optional[List[str]] = None,
         solvers: List[str] = ["gurobi", "torchlp"],
+        batch_sizes: Optional[Sequence[Optional[int]]] = None,
     ) -> Dict[str, Any]:
         """
         Level 1: Validate verifier soundness using concrete counterexamples.
@@ -346,12 +555,19 @@ class VerificationValidator:
         Args:
             networks: List of network names (None = all networks)
             solvers: List of solver names to test
+            batch_sizes: List of batch sizes to validate at. Each element may be:
+                - None: use the network's native batch size from JSON (default)
+                - int >= 1: batchify the network's INPUT_SPEC to this size
+                If ``batch_sizes`` is None or empty, defaults to ``[None]``
+                (preserves current behavior).
 
         Returns:
             Summary dictionary with validation results
         """
         if networks is None:
             networks = self.factory.list_networks()
+        if not batch_sizes:
+            batch_sizes = [None]
 
         solvers = list(solvers)
         if "gurobi" in solvers and not is_gurobi_available():
@@ -363,54 +579,69 @@ class VerificationValidator:
         logger.info(f"\n{'=' * 80}")
         logger.info(f"LEVEL 1: COUNTEREXAMPLE/SOUNDNESS VALIDATION")
         logger.info(f"{'=' * 80}")
-        logger.info(f"Testing {len(networks)} networks with {len(solvers)} solvers")
+        logger.info(
+            f"Testing {len(networks)} networks x {len(solvers)} solvers "
+            f"x {len(batch_sizes)} batch_sizes={batch_sizes}"
+        )
         logger.info(f"Device: {self.device}, Dtype: {self.dtype}")
         logger.info(f"{'=' * 80}\n")
 
         for network in networks:
             for solver in solvers:
-                try:
-                    self._validate_counterexample_single(network, solver)
-                except Exception as e:
-                    logger.error(f"Validation failed for {network}/{solver}: {e}")
-                    import traceback
+                for batch_size in batch_sizes:
+                    try:
+                        self._validate_counterexample_single(
+                            network, solver, batch_size=batch_size
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Validation failed for {network}/{solver}/B={batch_size}: {e}"
+                        )
+                        import traceback
 
-                    traceback.print_exc()
-                    # Add error result if not already added
-                    error_result = {
-                        "network": network,
-                        "solver": solver,
-                        "validation_type": "counterexample",
-                        "status": "ERROR",
-                        "error": f"Outer exception: {str(e)}",
-                        "concrete_counterexample": False,
-                    }
-                    self.validation_results.append(error_result)
+                        traceback.print_exc()
+                        error_result = {
+                            "network": network,
+                            "solver": solver,
+                            "batch_size": batch_size,
+                            "validation_type": "counterexample",
+                            "status": "ERROR",
+                            "error": f"Outer exception: {str(e)}",
+                            "concrete_counterexample": False,
+                        }
+                        self.validation_results.append(error_result)
 
         return self._compute_summary(validation_type="counterexample")
 
-    def _validate_counterexample_single(self, name: str, solver: str) -> Dict[str, Any]:
+    def _validate_counterexample_single(
+        self,
+        name: str,
+        solver: str,
+        batch_size: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """
         Validate verifier correctness for a single network (Level 1).
 
         Args:
             name: Network name (stem of .json file in nets/)
             solver: 'gurobi' or 'torchlp'
+            batch_size: Target batch size. None preserves the network's native B.
 
         Returns:
             Validation result dictionary with status and details
         """
         logger.info(f"\n{'=' * 80}")
-        logger.info(f"Validating: {name} (solver: {solver})")
+        logger.info(f"Validating: {name} (solver: {solver}, B={batch_size})")
         logger.info(f"{'=' * 80}")
 
-        # Step 1: Load ACT Net from factory
         act_net = self.factory.get_act_net(name)
+        act_net = self._batchify_net(act_net, batch_size)
 
-        # Step 2: Create PyTorch model for concrete execution
         model = self.factory.create_model(name, load_weights=True)
-        model = model.to(device=self.device, dtype=self.dtype)
-        counterexample = self.find_concrete_counterexample(name, model)
+        model = model.to(self.device, self.dtype)
+        counterexample = self.find_concrete_counterexample(
+            name, model, act_net=act_net
+        )
 
         # Step 3: Run formal verifier on ACT Net
         logger.info(f"\n  🔍 Running formal verifier ({solver})...")
@@ -423,7 +654,8 @@ class VerificationValidator:
             else:
                 raise ValueError(f"Unknown solver: {solver}")
 
-            verify_result = verify_once(act_net, solver=solver_instance)
+            verify_result_list = verify_once(act_net)
+            verify_result = verify_result_list[0]
             verifier_status = verify_result.status
             logger.info(f"     Verifier result: {verifier_status}")
 
@@ -449,7 +681,7 @@ class VerificationValidator:
                         f"     CE reshape failed, using vector: {reshape_err}"
                     )
                     ce_tensor = ce_raw.unsqueeze(0)
-                ce_tensor = ce_tensor.to(device=self.device, dtype=self.dtype)
+                ce_tensor = ce_tensor.to(self.device, self.dtype)
                 ce_results = model(ce_tensor)
                 if isinstance(ce_results, dict):
                     logger.info(
@@ -465,6 +697,7 @@ class VerificationValidator:
             error_result = {
                 "network": name,
                 "solver": solver,
+                "batch_size": batch_size,
                 "validation_type": "counterexample",
                 "status": "ERROR",
                 "error": str(e),
@@ -473,13 +706,13 @@ class VerificationValidator:
             self.validation_results.append(error_result)
             return error_result
 
-        # Step 4: Cross-validate results
         validation = self._cross_validate_counterexample(
             network_name=name,
             solver_name=solver,
             concrete_counterexample=counterexample,
             verifier_status=verifier_status,
         )
+        validation["batch_size"] = batch_size
 
         self.validation_results.append(validation)
         return validation
@@ -568,6 +801,7 @@ class VerificationValidator:
         tf_modes: List[str] = ["interval"],
         num_samples: int = 10,
         per_neuron_config: Optional[PerNeuronCheckConfig] = None,
+        batch_sizes: Optional[Sequence[Optional[int]]] = None,
     ) -> Dict[str, Any]:
         """
         Level 2: Validate abstract bounds overapproximate concrete values.
@@ -576,47 +810,58 @@ class VerificationValidator:
             networks: List of network names (None = all networks)
             tf_modes: Transfer function modes to test ('interval', 'hybridz')
             num_samples: Number of concrete inputs to sample per network
+            batch_sizes: List of batch sizes to validate at. ``None`` element
+                means use the network's native batch size from JSON. If the
+                whole list is None/empty, defaults to ``[None]``.
 
         Returns:
             Summary dictionary with validation results
         """
         if networks is None:
             networks = self.factory.list_networks()
+        if not batch_sizes:
+            batch_sizes = [None]
 
         logger.info(f"\n{'=' * 80}")
         logger.info(f"LEVEL 2: BOUNDS/NUMERICAL VALIDATION")
         logger.info(f"{'=' * 80}")
-        logger.info(f"Testing {len(networks)} networks with {len(tf_modes)} TF modes")
+        logger.info(
+            f"Testing {len(networks)} networks x {len(tf_modes)} TF modes "
+            f"x {len(batch_sizes)} batch_sizes={batch_sizes}"
+        )
         logger.info(f"Samples per network: {num_samples}")
         logger.info(f"Device: {self.device}, Dtype: {self.dtype}")
         logger.info(f"{'=' * 80}\n")
 
         for network in networks:
             for tf_mode in tf_modes:
-                try:
-                    self._validate_bounds_single(
-                        network,
-                        tf_mode,
-                        num_samples,
-                        per_neuron_config=per_neuron_config,
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Bounds validation failed for {network}/{tf_mode}: {e}"
-                    )
-                    import traceback
+                for batch_size in batch_sizes:
+                    try:
+                        self._validate_bounds_single(
+                            network,
+                            tf_mode,
+                            num_samples,
+                            per_neuron_config=per_neuron_config,
+                            batch_size=batch_size,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Bounds validation failed for "
+                            f"{network}/{tf_mode}/B={batch_size}: {e}"
+                        )
+                        import traceback
 
-                    traceback.print_exc()
-                    # Add error result if not already added
-                    error_result = {
-                        "network": network,
-                        "tf_mode": tf_mode,
-                        "validation_type": "bounds",
-                        "status": "ERROR",
-                        "error": f"Outer exception: {str(e)}",
-                        "samples_processed": 0,
-                    }
-                    self.validation_results.append(error_result)
+                        traceback.print_exc()
+                        error_result = {
+                            "network": network,
+                            "tf_mode": tf_mode,
+                            "batch_size": batch_size,
+                            "validation_type": "bounds",
+                            "status": "ERROR",
+                            "error": f"Outer exception: {str(e)}",
+                            "samples_processed": 0,
+                        }
+                        self.validation_results.append(error_result)
 
         return self._compute_summary(validation_type="bounds")
 
@@ -626,6 +871,7 @@ class VerificationValidator:
         tf_mode: str,
         num_samples: int,
         per_neuron_config: Optional[PerNeuronCheckConfig] = None,
+        batch_size: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Validate bounds for a single network (Level 2).
@@ -634,18 +880,38 @@ class VerificationValidator:
             name: Network name
             tf_mode: Transfer function mode ('interval' or 'hybridz')
             num_samples: Number of concrete inputs to sample
+            batch_size: Target batch size. None preserves the network's native B.
 
         Returns:
             Validation result dictionary
         """
         logger.info(f"\n{'=' * 80}")
-        logger.info(f"Validating bounds: {name} (tf_mode: {tf_mode})")
+        logger.info(f"Validating bounds: {name} (tf_mode: {tf_mode}, B={batch_size})")
         logger.info(f"{'=' * 80}")
 
-        # Step 1: Load ACT Net and PyTorch model
         act_net = self.factory.get_act_net(name)
+        act_net = self._batchify_net(act_net, batch_size)
+
+        ok, missing = self._network_supported_by_mode(act_net, tf_mode)
+        if not ok:
+            skip_result = {
+                "network": name,
+                "tf_mode": tf_mode,
+                "batch_size": batch_size,
+                "validation_type": "bounds",
+                "validation_status": "SKIPPED",
+                "explanation": (
+                    f"⏭️  SKIPPED: tf_mode={tf_mode!r} has no handler for "
+                    f"layer kind(s): {', '.join(missing)}"
+                ),
+                "unsupported_kinds": missing,
+            }
+            logger.info(f"\n  {skip_result['explanation']}")
+            self.validation_results.append(skip_result)
+            return skip_result
+
         model = self.factory.create_model(name, load_weights=True)
-        model = model.to(device=self.device, dtype=self.dtype)
+        model = model.to(self.device, self.dtype)
 
         # Step 2: Set transfer function mode globally
         from act.back_end.transfer_functions import set_transfer_function_mode
@@ -666,49 +932,44 @@ class VerificationValidator:
 
                 params = layer.params or {}
 
-                # 1) Prefer BOX
+                # 1) Prefer BOX. Preserve the original [B, *input_shape] from
+                # the JSON; the verifier's analyze() requires the leading
+                # batch dimension end-to-end.
                 if "lb" in params and "ub" in params:
                     return Bounds(
-                        lb=params["lb"]
-                        .flatten()
-                        .to(device=self.device, dtype=self.dtype),
-                        ub=params["ub"]
-                        .flatten()
-                        .to(device=self.device, dtype=self.dtype),
+                        lb=params["lb"].to(self.device, self.dtype),
+                        ub=params["ub"].to(self.device, self.dtype),
                     )
 
-                # 2) LINF_BALL: center + eps
+                # 2) LINF_BALL: center + eps (shape preserved)
                 if "center" in params and "eps" in params:
-                    center = (
-                        params["center"]
-                        .flatten()
-                        .to(device=self.device, dtype=self.dtype)
-                    )
+                    center = params["center"].to(self.device, self.dtype)
                     eps = params["eps"]
                     if not torch.is_tensor(eps):
-                        eps = torch.tensor(eps, device=self.device, dtype=self.dtype)
+                        eps = center.new_tensor(eps)
                     else:
-                        eps = eps.to(device=self.device, dtype=self.dtype)
+                        eps = eps.to(self.device, self.dtype)
                     return Bounds(lb=center - eps, ub=center + eps)
             return None
 
         spec_bounds = _get_input_bounds_from_act(act_net)
 
         for sample_idx in range(num_samples):
-            # Generate random input within spec
             input_tensor = self.factory.generate_test_input(name, "random")
-            input_tensor = input_tensor.to(device=self.device, dtype=self.dtype)
+            input_tensor = self._batchify_tensor(input_tensor, batch_size)
+            input_tensor = input_tensor.to(self.device, self.dtype)
 
             # Step 4: Prepare entry fact from input tensor
             from act.back_end.core import Fact, Bounds
 
             entry_id = find_entry_layer_id(act_net)
-            if spec_bounds is not None:
-                input_bounds = spec_bounds
-            else:
-                input_bounds = Bounds(
-                    lb=input_tensor.flatten(), ub=input_tensor.flatten()
+            if spec_bounds is None:
+                raise ValueError(
+                    f"validate_bounds_single({name}): no INPUT_SPEC layer "
+                    f"with BOX or LINF_BALL bounds; cannot run abstract "
+                    f"analysis. Network must declare an input region."
                 )
+            input_bounds = spec_bounds
             entry_fact = Fact(bounds=input_bounds, cons=None)
 
             # Step 5: Run abstract analysis + strict per-neuron validation
@@ -780,6 +1041,7 @@ class VerificationValidator:
                 error_result = {
                     "network": name,
                     "tf_mode": tf_mode,
+                    "batch_size": batch_size,
                     "validation_type": "bounds",
                     "status": "ERROR",
                     "error": str(e),
@@ -788,11 +1050,11 @@ class VerificationValidator:
                 self.validation_results.append(error_result)
                 return error_result
 
-        # Step 6: Summarize results
         if len(violations) > 0:
             result = {
                 "network": name,
                 "tf_mode": tf_mode,
+                "batch_size": batch_size,
                 "validation_type": "bounds",
                 "validation_status": "FAILED",
                 "explanation": f"🚨 UNSOUND BOUNDS: {len(violations)} violations found across {num_samples} samples",
@@ -809,6 +1071,7 @@ class VerificationValidator:
             result = {
                 "network": name,
                 "tf_mode": tf_mode,
+                "batch_size": batch_size,
                 "validation_type": "bounds",
                 "validation_status": "PASSED",
                 "explanation": f"✅ SOUND BOUNDS: All {total_checks} checks passed across {num_samples} samples",
@@ -832,6 +1095,7 @@ class VerificationValidator:
         tf_modes: List[str] = ["interval"],
         num_samples: int = 10,
         per_neuron_config: Optional[PerNeuronCheckConfig] = None,
+        batch_sizes: Optional[Sequence[Optional[int]]] = None,
     ) -> Dict[str, Any]:
         """
         Run both Level 1 and Level 2 validations.
@@ -841,6 +1105,7 @@ class VerificationValidator:
             solvers: List of solver names for Level 1
             tf_modes: Transfer function modes for Level 2
             num_samples: Number of samples for Level 2
+            batch_sizes: List of batch sizes (see validate_bounds). None = native.
 
         Returns:
             Combined summary dictionary
@@ -854,15 +1119,16 @@ class VerificationValidator:
         logger.info(f"Device: {self.device}, Dtype: {self.dtype}")
         logger.info(f"{'=' * 80}\n")
 
-        # Run Level 1
-        summary_l1 = self.validate_counterexamples(networks=networks, solvers=solvers)
+        summary_l1 = self.validate_counterexamples(
+            networks=networks, solvers=solvers, batch_sizes=batch_sizes
+        )
 
-        # Run Level 2
         summary_l2 = self.validate_bounds(
             networks=networks,
             tf_modes=tf_modes,
             num_samples=num_samples,
             per_neuron_config=per_neuron_config,
+            batch_sizes=batch_sizes,
         )
 
         # Combine summaries - FAILED if any failures OR errors
@@ -909,6 +1175,7 @@ class VerificationValidator:
                 "failed": 0,
                 "acceptable": 0,
                 "inconclusive": 0,
+                "skipped": 0,
                 "errors": 0,
                 "results": [],
                 "error_message": "No validation results (all tests encountered errors)",
@@ -922,6 +1189,9 @@ class VerificationValidator:
         inconclusive = sum(
             1 for r in results if r.get("validation_status") == "INCONCLUSIVE"
         )
+        skipped = sum(
+            1 for r in results if r.get("validation_status") == "SKIPPED"
+        )
         errors = sum(1 for r in results if r.get("status") == "ERROR")
 
         summary = {
@@ -931,6 +1201,7 @@ class VerificationValidator:
             "failed": failed,
             "acceptable": acceptable,
             "inconclusive": inconclusive,
+            "skipped": skipped,
             "errors": errors,
             "results": results,
         }
@@ -980,6 +1251,8 @@ class VerificationValidator:
         if validation_type == "counterexample":
             print(f"⚠️  ACCEPTABLE:   {summary['acceptable']}")
             print(f"⚪ INCONCLUSIVE: {summary['inconclusive']}")
+        if summary.get("skipped", 0) > 0:
+            print(f"⏭️  SKIPPED:      {summary['skipped']}")
         print(f"❌ ERRORS:       {summary['errors']}")
         print(f"🚨 FAILED:       {summary['failed']}")
         print("=" * 80)
@@ -1062,6 +1335,17 @@ def main():
         help="Number of input samples for Level 2 bounds validation",
     )
     parser.add_argument(
+        "--batch-sizes",
+        type=lambda s: [
+            (None if (b.strip() == "" or b.strip().lower() == "none") else int(b))
+            for b in s.split(",")
+        ],
+        default=[None],
+        metavar="B1,B2,...",
+        help="Batch sizes to validate at, e.g. '1,4'. Use 'none' (or omit) "
+        "for native batch from each network's JSON. Default: native.",
+    )
+    parser.add_argument(
         "--ignore-errors",
         action="store_true",
         help="Always exit 0 (ignore failures and errors for CI)",
@@ -1069,33 +1353,33 @@ def main():
 
     args = parser.parse_args()
 
-    # Convert dtype string to torch dtype
     dtype = torch.float64 if args.dtype == "float64" else torch.float32
 
-    # Create validator
     validator = VerificationValidator(device=args.device, dtype=dtype)
 
-    # Run validation
     if args.mode == "counterexample":
         summary = validator.validate_counterexamples(
-            networks=args.networks, solvers=args.solvers
+            networks=args.networks,
+            solvers=args.solvers,
+            batch_sizes=args.batch_sizes,
         )
-        # Exit 1 if any failures OR errors detected
         exit_code = 1 if (summary["failed"] > 0 or summary["errors"] > 0) else 0
     elif args.mode == "bounds":
         summary = validator.validate_bounds(
-            networks=args.networks, tf_modes=args.tf_modes, num_samples=args.samples
+            networks=args.networks,
+            tf_modes=args.tf_modes,
+            num_samples=args.samples,
+            batch_sizes=args.batch_sizes,
         )
-        # Exit 1 if any failures OR errors detected
         exit_code = 1 if (summary["failed"] > 0 or summary["errors"] > 0) else 0
-    else:  # comprehensive
+    else:
         combined = validator.validate_comprehensive(
             networks=args.networks,
             solvers=args.solvers,
             tf_modes=args.tf_modes,
             num_samples=args.samples,
+            batch_sizes=args.batch_sizes,
         )
-        # Exit 1 for both FAILED (verification bugs) and ERROR (backend bugs)
         exit_code = 1 if combined["overall_status"] in ["FAILED", "ERROR"] else 0
 
     # Override exit code if --ignore-errors is set

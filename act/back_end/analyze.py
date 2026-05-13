@@ -49,11 +49,15 @@ def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple
     after:  Dict[int, Fact] = {}
     globalC = ConSet()
 
-    # init with +/- inf boxes (vector length per layer's out_vars)
+    # Default bounds must carry the leading batch dim. Consumer TFs assume
+    # bounds are [B, n] and reshape on that axis; a (n,) default would
+    # silently broadcast in some paths and fail loudly in others.
+    seed = entry_fact.bounds.lb
+    B = seed.shape[0] if seed.dim() >= 2 else 1
     for L in net.layers:
         n = len(L.out_vars)
-        hi = torch.full((n,), float("inf"), device=entry_fact.bounds.lb.device, dtype=entry_fact.bounds.lb.dtype)
-        lo = torch.full((n,), -float("inf"), device=entry_fact.bounds.lb.device, dtype=entry_fact.bounds.lb.dtype)
+        hi = seed.new_full((B, n), float("inf"))
+        lo = seed.new_full((B, n), -float("inf"))
         before[L.id] = Fact(bounds=Bounds(lo.clone(), hi.clone()), cons=ConSet())
         after[L.id]  = Fact(bounds=Bounds(lo.clone(), hi.clone()), cons=ConSet())
         L.cache.clear()
@@ -70,11 +74,13 @@ def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple
         if L.id == entry_id or net.preds.get(L.id):
             continue
         if L.kind == LayerKind.CONSTANT.value:
-            val = L.params["value"].flatten().to(
+            B_size = entry_fact.bounds.lb.shape[0]
+            val = L.params["value"].reshape(-1).to(
                 device=entry_fact.bounds.lb.device,
                 dtype=entry_fact.bounds.lb.dtype,
             )
-            before[L.id] = Fact(bounds=Bounds(val.clone(), val.clone()), cons=ConSet())
+            val_b = val.unsqueeze(0).expand(B_size, -1).contiguous()  # [B, numel]
+            before[L.id] = Fact(bounds=Bounds(val_b.clone(), val_b.clone()), cons=ConSet())
         # Other zero-indegree kinds (none today) would be seeded similarly.
         seeds.append(L.id)
 

@@ -522,7 +522,7 @@ For Common Operations (list, search, download, info):
         dest="test_with_inference",
         help="Run comprehensive tests with inference validation (classification only)"
     )
-    # Download/load commands (kept for backward compatibility and advanced options)
+    # Download/load commands (TorchVision-specific; for the cross-creator CLI use ``python -m act.front_end``).
     parser.add_argument(
         "--download",
         nargs=2,

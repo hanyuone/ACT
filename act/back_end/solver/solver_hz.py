@@ -155,7 +155,7 @@ def _hz_bounds_unconstrained(hz: HZono) -> Bounds:
         else torch.zeros((n, 1), dtype=dtype, device=device)
     )
     rad = absGc + absGb
-    return Bounds(lb=(hz.c - rad).flatten(), ub=(hz.c + rad).flatten())
+    return Bounds(lb=(hz.c - rad).reshape(1, -1), ub=(hz.c + rad).reshape(1, -1))
 
 
 def _hz_compute_bounds_gurobi(hz: HZono) -> Bounds:
@@ -202,8 +202,8 @@ def _hz_compute_bounds_scipy(hz: HZono) -> Bounds:
 
     dtype, device = hz.c.dtype, hz.c.device
     return Bounds(
-        lb=torch.from_numpy(LB).to(device=device, dtype=dtype).flatten(),
-        ub=torch.from_numpy(UB).to(device=device, dtype=dtype).flatten(),
+        lb=torch.from_numpy(LB).to(device=device, dtype=dtype).reshape(1, -1),
+        ub=torch.from_numpy(UB).to(device=device, dtype=dtype).reshape(1, -1),
     )
 
 

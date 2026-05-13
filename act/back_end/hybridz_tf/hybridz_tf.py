@@ -136,16 +136,15 @@ class HybridzTF(TransferFunction):
         n = lb.shape[0]
         if n > self._HZ_MAX_INPUT_DIM:
             return None
-        dtype, device = lb.dtype, lb.device
         c = ((lb + ub) / 2.0).view(-1, 1)
         rad = (ub - lb) / 2.0
         return HZono(
             c=c,
             Gc=torch.diag(rad),
-            Gb=torch.zeros((n, 0), dtype=dtype, device=device),
-            Ac=torch.zeros((0, n), dtype=dtype, device=device),
-            Ab=torch.zeros((0, 0), dtype=dtype, device=device),
-            b=torch.zeros((0, 1), dtype=dtype, device=device),
+            Gb=lb.new_zeros(n, 0),
+            Ac=lb.new_zeros(0, n),
+            Ab=lb.new_zeros(0, 0),
+            b=lb.new_zeros(0, 1),
         )
 
     def apply(

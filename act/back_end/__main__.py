@@ -8,7 +8,9 @@ Copyright (C) 2025 SVF-tools/ACT
 License: AGPLv3+
 """
 
+import sys
+
 from act.back_end.cli import main
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

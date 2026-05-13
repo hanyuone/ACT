@@ -73,33 +73,52 @@ def run_verification(args, backend_cfg):
             config=bab,
             time_budget_s=backend_cfg.timeout,
         )
-    else:
-        print(f"\nRunning single-shot verification...")
-        print(f"  Timeout: {backend_cfg.timeout}s\n")
 
-        result = verify_once(net=net, solver=solver, timelimit=backend_cfg.timeout)
+        print(f"\n{'=' * 80}")
+        print(f"VERIFICATION RESULT: {result.status}")
+        print(f"{'=' * 80}")
+
+        if "time" in result.metadata:
+            print(f"Time: {result.metadata['time']:.3f}s")
+
+        if result.counterexample is not None:
+            print(f"Counterexample found:")
+            print(f"  Shape: {result.counterexample.shape}")
+            if backend_cfg.verbose:
+                print(f"  Values: {result.counterexample}")
+
+        if backend_cfg.verbose and result.metadata:
+            print(f"\nVerification metadata:")
+            for key, value in result.metadata.items():
+                print(f"  {key}: {value}")
+
+        print(f"\n{'=' * 80}\n")
+
+        return 0 if result.status == VerifyStatus.CERTIFIED else 1
+
+    print(f"\nRunning single-shot verification...\n")
+
+    results = verify_once(net=net)
+    B = len(results)
 
     print(f"\n{'=' * 80}")
-    print(f"VERIFICATION RESULT: {result.status}")
+    print(f"VERIFICATION RESULT: batch of N={B} lane(s)")
     print(f"{'=' * 80}")
 
-    if "time" in result.metadata:
-        print(f"Time: {result.metadata['time']:.3f}s")
-
-    if result.counterexample is not None:
-        print(f"Counterexample found:")
-        print(f"  Shape: {result.counterexample.shape}")
-        if backend_cfg.verbose:
-            print(f"  Values: {result.counterexample}")
-
-    if backend_cfg.verbose and result.metadata:
-        print(f"\nVerification metadata:")
-        for key, value in result.metadata.items():
-            print(f"  {key}: {value}")
+    for i, lane in enumerate(results):
+        print(f"\nLane {i}: {lane.status}")
+        if lane.counterexample is not None:
+            print(f"  Counterexample shape: {tuple(lane.counterexample.shape)}")
+            if backend_cfg.verbose:
+                print(f"  Counterexample values: {lane.counterexample}")
+        if backend_cfg.verbose and lane.metadata:
+            print(f"  Metadata: {lane.metadata}")
 
     print(f"\n{'=' * 80}\n")
 
-    return 0 if result.status == VerifyStatus.CERTIFIED else 1
+    # Exit 0 on normal completion regardless of verdict.
+    # CERT/FALS/UNK are all valid outcomes; non-zero exit only on exception.
+    return 0
 
 
 def run_network_factory(args, backend_cfg):

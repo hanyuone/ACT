@@ -1139,25 +1139,27 @@ class TorchToACT:
     
     def run(self) -> Net:
         """Convert wrapped PyTorch model to ACT Net."""
-        # Emit INPUT layer
         new_layers, out_vars = self.input_layer.to_act_layers(len(self.layers), [])
         self.layers.extend(new_layers)
         self.prev_out = out_vars
-        
-        # Process InputSpecLayers
+        # Capture batch dim from InputLayer for downstream spec encoding.
+        B = self.input_layer.shape[0]
+
         for mod in self.m.children():
             if type(mod).__name__ == "InputSpecLayer" and hasattr(mod, 'to_act_layers'):
-                new_layers, out_vars = mod.to_act_layers(len(self.layers), self.prev_out)
+                new_layers, out_vars = mod.to_act_layers(
+                    len(self.layers), self.prev_out, B
+                )
                 self.layers.extend(new_layers)
                 self.prev_out = out_vars
-        
-        # Build inner model using build_act()
+
         self._build_inner_model()
-        
-        # Process OutputSpecLayers
+
         for mod in self.m.children():
             if type(mod).__name__ == "OutputSpecLayer" and hasattr(mod, 'to_act_layers'):
-                new_layers, out_vars = mod.to_act_layers(len(self.layers), self.prev_out)
+                new_layers, out_vars = mod.to_act_layers(
+                    len(self.layers), self.prev_out, B
+                )
                 self.layers.extend(new_layers)
                 self.prev_out = out_vars
         
@@ -1276,7 +1278,7 @@ def main():
     wrapped_models = model_synthesis()
     print(f"  Generated {len(wrapped_models)} wrapped models")
     
-    # Step 2: Test all models with inference (input data now stored in models)
+    # Step 2: Test all models with inference (each wrapped model carries its own input data).
     print("\n Step 2: Testing model inference...")
     successful_models = model_inference(wrapped_models)
     print(f"  {len(successful_models)} models passed inference tests")

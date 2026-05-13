@@ -99,7 +99,7 @@ def parse_vnnlib_to_tensors(
         
         input_tensor = torch.tensor(input_values)
         
-        # Reshape if shape provided (shape now includes batch dimension)
+        # Reshape if shape is provided; the shape already includes a leading batch dimension.
         if input_shape is not None:
             expected_numel = 1
             for dim in input_shape:

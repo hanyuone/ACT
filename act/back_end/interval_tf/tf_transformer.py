@@ -15,23 +15,33 @@
 import torch
 from typing import List
 from act.back_end.core import Bounds, Con, ConSet, Fact, Layer
-from act.back_end.utils import pwl_meta, bound_var_interval, scale_interval
+from act.back_end.utils import pwl_meta, scale_interval
 from act.back_end.interval_tf.tf_mlp import tf_concat
 
-def tf_embedding(L: Layer) -> Fact:
-    E=L.params["emb_vec"]; B=Bounds(E.clone(), E.clone()); C=ConSet(); C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+# tf_embedding is provided by act.back_end.interval_tf.tf_rnn (signature
+# (L, Bin) -> Fact). The previous transformer-local definition had a wrong
+# signature and would shadow the rnn one via `from tf_transformer import *`
+# in interval_tf.py — both EMBEDDING and EMBEDDING_TF would have raised
+# TypeError at runtime. Single source of truth lives in tf_rnn.
 
 def tf_posenc(L: Layer, Bin: Bounds) -> Fact:
     P=L.params["pos_vec"]; B=Bounds(Bin.lb+P, Bin.ub+P); C=ConSet()
     C.replace(Con("EQ", tuple(L.out_vars+L.in_vars), {"tag":f"posenc:{L.id}"})); C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_layernorm(L: Layer, Bin: Bounds) -> Fact:
-    mu_lb, mu_ub = torch.mean(Bin.lb), torch.mean(Bin.ub)
+    if Bin.lb.dim() < 2:
+        raise ValueError(f"LAYERNORM expects batched bounds [B, *], got shape {tuple(Bin.lb.shape)}")
+    norm_dims = tuple(range(1, Bin.lb.dim()))
+    mu_lb = torch.mean(Bin.lb, dim=norm_dims, keepdim=True)
+    mu_ub = torch.mean(Bin.ub, dim=norm_dims, keepdim=True)
     cx_lb, cx_ub = Bin.lb - mu_ub, Bin.ub - mu_lb
-    v_lo, v_hi = bound_var_interval(Bin.lb, Bin.ub)
+    radius = 0.5 * (Bin.ub - Bin.lb)
+    v_lo = torch.zeros_like(mu_lb)
+    v_hi = torch.mean((2 * radius) ** 2, dim=norm_dims, keepdim=True)
     eps=float(L.params.get("eps",1e-5))
-    inv_lb = 1.0/torch.sqrt(torch.tensor(v_hi+eps, dtype=Bin.lb.dtype, device=Bin.lb.device))
-    inv_ub = 1.0/torch.sqrt(torch.tensor(max(v_lo,0.0)+eps, dtype=Bin.lb.dtype, device=Bin.lb.device))
+    eps_t = Bin.lb.new_tensor(eps)
+    inv_lb = torch.rsqrt(v_hi + eps_t)
+    inv_ub = torch.rsqrt(torch.clamp_min(v_lo, 0.0) + eps_t)
     sh_lb, sh_ub = scale_interval(cx_lb, cx_ub, inv_lb, inv_ub)
     gamma,beta=L.params["gamma"],L.params["beta"]
     lb=torch.where(gamma>=0, gamma*sh_lb+beta, gamma*sh_ub+beta)
@@ -40,13 +50,22 @@ def tf_layernorm(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_gelu(L: Layer, Bin: Bounds) -> Fact:
-    f=lambda x: 0.5*x*(1+torch.tanh(torch.sqrt(torch.tensor(2.0/torch.pi))*(x+0.044715*(x**3))))
-    B=Bounds(f(Bin.lb), f(Bin.ub)); C=ConSet()
+    GELU_MIN_X = -0.7517916
+    GELU_MIN_Y = -0.17004
+    f = lambda x: 0.5*x*(1+torch.tanh(torch.sqrt(torch.tensor(2.0/torch.pi))*(x+0.044715*(x**3))))
+    f_lb, f_ub = f(Bin.lb), f(Bin.ub)
+    contains_min = (Bin.lb <= GELU_MIN_X) & (Bin.ub >= GELU_MIN_X)
+    lb = torch.where(contains_min, torch.full_like(f_lb, GELU_MIN_Y), torch.minimum(f_lb, f_ub))
+    ub = torch.maximum(f_lb, f_ub)
+    B = Bounds(lb, ub); C = ConSet()
     C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":f"gelu:{L.id}","segs":pwl_meta(Bin.lb,Bin.ub,3)}))
-    C.add_box(L.id,L.out_vars,B); return Fact(B,C)
+    C.add_box(L.id, L.out_vars, B); return Fact(B, C)
 
 def tf_att_scores(L: Layer, Bq: Bounds, Bk: Bounds) -> Fact:
-    s=torch.tensor(1.0/float(L.params["dk"]), dtype=Bq.lb.dtype, device=Bq.lb.device)
+    batch_size = Bq.lb.shape[0]
+    if Bk.lb.shape[0] != batch_size:
+        raise ValueError(f"ATT_SCORES expects matching batch dims, got {batch_size} and {Bk.lb.shape[0]}")
+    s=Bq.lb.new_tensor(1.0/float(L.params["dk"]))
     lo=torch.minimum(torch.minimum(Bq.lb*Bk.lb, Bq.lb*Bk.ub), torch.minimum(Bq.ub*Bk.lb, Bq.ub*Bk.ub))
     hi=torch.maximum(torch.maximum(Bq.lb*Bk.lb, Bq.lb*Bk.ub), torch.maximum(Bq.ub*Bk.lb, Bq.ub*Bk.ub))
     lb=s*lo.sum(dim=-1); ub=s*hi.sum(dim=-1)
@@ -57,7 +76,7 @@ def tf_att_scores(L: Layer, Bq: Bounds, Bk: Bounds) -> Fact:
 
 def tf_softmax(L: Layer, Bin: Bounds) -> Fact:
     B=Bounds(torch.zeros_like(Bin.lb), torch.ones_like(Bin.ub))
-    rowsize=int(L.params["rowsize"]); mode=L.params.get("mode","simplex"); tag=f"softmax:{mode}:{L.id}"
+    rowsize=int(Bin.lb.shape[-1]); mode=L.params.get("mode","simplex"); tag=f"softmax:{mode}:{L.id}"
     C=ConSet()
     if mode=="simplex": C.replace(Con("INEQ", tuple(L.out_vars), {"tag":tag,"rowsize":rowsize}))
     elif mode=="pwl":  C.replace(Con("INEQ", tuple(L.out_vars+L.in_vars), {"tag":tag,"rowsize":rowsize,"segs":{"K":3}}))
@@ -65,6 +84,9 @@ def tf_softmax(L: Layer, Bin: Bounds) -> Fact:
     C.add_box(L.id,L.out_vars,B); return Fact(B,C)
 
 def tf_att_mix(L: Layer, Bw: Bounds, Bv: Bounds) -> Fact:
+    batch_size = Bw.lb.shape[0]
+    if Bv.lb.shape[0] != batch_size:
+        raise ValueError(f"ATT_MIX expects matching batch dims, got {batch_size} and {Bv.lb.shape[0]}")
     lo=torch.minimum(torch.minimum(Bw.lb*Bv.lb, Bw.lb*Bv.ub), torch.minimum(Bw.ub*Bv.lb, Bw.ub*Bv.ub)).sum(dim=-1)
     hi=torch.maximum(torch.maximum(Bw.lb*Bv.lb, Bw.lb*Bv.ub), torch.maximum(Bw.ub*Bv.lb, Bw.ub*Bv.ub)).sum(dim=-1)
     B=Bounds(lo,hi); C=ConSet()

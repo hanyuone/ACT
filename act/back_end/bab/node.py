@@ -13,7 +13,11 @@
 #   with leading batch dimension (N, …) so that branching, bounding, and
 #   (future) batched solving operate in pure tensor arithmetic.
 #
-#   BabNode is retained for backward compatibility with existing callers.
+#   BabNode is a thin single-subproblem wrapper that carries one priority
+#   score and one optional candidate counterexample. ``BabNode.to_batch``
+#   converts a single node into a ``SubproblemBatch`` of size 1 so that
+#   call sites holding a single node can dispatch through the batched
+#   code path.
 #
 # ===---------------------------------------------------------------------====#
 
@@ -141,15 +145,19 @@ def split_subproblems(
 
 
 # ---------------------------------------------------------------------------
-# Legacy compat
+# Single-subproblem wrapper
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class BabNode:
-    """Legacy single-node representation (backward compatibility).
+    """Single-subproblem record: one bounds box, one priority score, one
+    optional candidate counterexample.
 
-    New code should prefer :class:`SubproblemBatch`.
+    Prefer :class:`SubproblemBatch` for batch-parallel processing; use this
+    record when a call site only ever holds one subproblem at a time and
+    wants priority-queue ordering. ``to_batch`` lifts a single node into a
+    ``SubproblemBatch`` of size 1 for dispatch through the batched path.
     """
 
     box: Bounds
