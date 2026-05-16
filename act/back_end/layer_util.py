@@ -15,6 +15,9 @@
 from __future__ import annotations
 from typing import Dict, Any, List
 import difflib
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Import validation components
 try:
@@ -95,8 +98,9 @@ def validate_layer(layer: "Layer") -> None:
                     raise TypeError(
                         f"{kind}.params['labeled_input'].tensor must be torch.Tensor, got {type(val.tensor)}."
                     )
-            except ImportError:
-                pass
+            except ImportError as e:
+                # Intentional: torch is optional here; skip tensor-type check when torch is unavailable.
+                logger.debug("suppressed: %s", e)
             # Validate label component (accepts int, list[int], or torch.Tensor)
             if val.label is not None:
                 try:

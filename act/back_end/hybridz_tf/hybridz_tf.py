@@ -58,6 +58,16 @@ class HybridzTF(TransferFunction):
         # Multi-input: HZ + interval
         LayerKind.ADD.value: lambda L, b, tf: hz_mlp.tf_add(L, b, tf),
         LayerKind.MUL.value: lambda L, b, tf: hz_mlp.tf_mul(L, b, tf),
+        LayerKind.SUB.value: lambda L, b, tf: interval_mlp.tf_sub(
+            L,
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1),
+        ),
+        LayerKind.DIV.value: lambda L, b, tf: interval_mlp.tf_div(
+            L,
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 0),
+            tf._net.get_predecessor_bounds(L.id, tf._after, tf._before, 1),
+        ),
         LayerKind.CONCAT.value: lambda L, b, tf: hz_mlp.tf_concat(L, b, tf),
         # CNN: HZ + interval
         LayerKind.CONV2D.value: lambda L, b, tf: hz_cnn.tf_conv2d(L, b, tf),
@@ -90,7 +100,10 @@ class HybridzTF(TransferFunction):
             L, tf._net.get_all_predecessor_bounds(L.id, tf._after, tf._before)
         ),
         # CNN: interval-only
+        LayerKind.AVGPOOL1D.value: lambda L, b, tf: interval_cnn.tf_avgpool1d(L, b),
         LayerKind.AVGPOOL2D.value: lambda L, b, tf: interval_cnn.tf_avgpool2d(L, b),
+        LayerKind.MAXPOOL3D.value: lambda L, b, tf: interval_cnn.tf_maxpool3d(L, b),
+        LayerKind.PAD.value:      lambda L, b, tf: interval_cnn.tf_pad(L, b),
         LayerKind.CONV1D.value: lambda L, b, tf: interval_cnn.tf_conv1d(L, b),
         LayerKind.CONV3D.value: lambda L, b, tf: interval_cnn.tf_conv3d(L, b),
         LayerKind.CONVTRANSPOSE2D.value: lambda L, b, tf: (
@@ -102,8 +115,9 @@ class HybridzTF(TransferFunction):
         LayerKind.TRANSPOSE.value: lambda L, b, tf: interval_mlp.tf_transpose(L, b),
         LayerKind.SQUEEZE.value: lambda L, b, tf: interval_mlp.tf_squeeze(L, b),
         LayerKind.UNSQUEEZE.value: lambda L, b, tf: interval_mlp.tf_unsqueeze(L, b),
-        LayerKind.TILE.value: lambda L, b, tf: interval_mlp.tf_tile(L, b),
         LayerKind.EXPAND.value: lambda L, b, tf: interval_mlp.tf_expand(L, b),
+        LayerKind.SLICE.value: lambda L, b, tf: interval_mlp.tf_slice(L, b),
+        LayerKind.GATHER.value: lambda L, b, tf: interval_mlp.tf_gather(L, b),
         # RNN
         LayerKind.LSTM.value: lambda L, b, tf: hz_rnn.tf_lstm(L, b, tf),
         LayerKind.GRU.value: lambda L, b, tf: hz_rnn.tf_gru(L, b, tf),

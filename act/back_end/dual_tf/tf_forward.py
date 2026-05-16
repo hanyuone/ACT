@@ -54,12 +54,12 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
         lid, kind = layer.id, layer.kind.upper() if isinstance(layer.kind, str) else layer.kind
         
         # Input layers
-        if kind in [LayerKind.INPUT.value, LayerKind.INPUT_SPEC.value, "INPUT", "INPUT_SPEC"]:
+        if kind in (LayerKind.INPUT.value, LayerKind.INPUT_SPEC.value):
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             continue
         
         # Dispatch
-        if kind in [LayerKind.RELU.value, "RELU"]:
+        if kind == LayerKind.RELU.value:
             if not post_activation:
                 bounds_dict[lid] = Bounds(lb.clone(), ub.clone())  # PRE-activation (for dual backward)
             A, bias, lb, ub = _fwd_relu(A, bias, x0, eps, lb, ub)
@@ -68,32 +68,32 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
                 # Reset state after ReLU in post_activation mode for sound interval propagation
                 A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
             
-        elif kind in [LayerKind.DENSE.value, "DENSE"]:
+        elif kind == LayerKind.DENSE.value:
             A, bias, lb, ub = _fwd_dense(layer, A, bias, x0, eps)
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
-            
-        elif kind in [LayerKind.CONV2D.value, "CONV2D"]:
+
+        elif kind == LayerKind.CONV2D.value:
             lb, ub = _fwd_conv2d(layer, lb, ub)
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
-            
-        elif kind == "BIAS":
+
+        elif kind == LayerKind.BIAS.value:
             A, bias, lb, ub = _fwd_bias(layer, A, bias, x0, eps)
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
-            
-        elif kind == "SCALE":
+
+        elif kind == LayerKind.SCALE.value:
             A, bias, lb, ub = _fwd_scale(layer, A, bias, x0, eps)
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
-            
-        elif kind == "BN":
+
+        elif kind == LayerKind.BN.value:
             A, bias, lb, ub = _fwd_bn(layer, A, bias, x0, eps)
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
-            
-        elif kind in ["FLATTEN", "RESHAPE"]:
+
+        elif kind in (LayerKind.FLATTEN.value, LayerKind.RESHAPE.value):
             lb, ub = lb.flatten(), ub.flatten()
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
-            
-        elif kind in [LayerKind.SIGMOID.value, "SIGMOID"]:
+
+        elif kind == LayerKind.SIGMOID.value:
             if not post_activation:
                 bounds_dict[lid] = Bounds(lb.clone(), ub.clone())  # PRE-activation (for dual backward)
             lb, ub = torch.sigmoid(lb), torch.sigmoid(ub)
@@ -101,15 +101,15 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
                 bounds_dict[lid] = Bounds(lb.clone(), ub.clone())  # POST-activation (for validation)
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
             
-        elif kind in [LayerKind.TANH.value, "TANH"]:
+        elif kind == LayerKind.TANH.value:
             if not post_activation:
                 bounds_dict[lid] = Bounds(lb.clone(), ub.clone())  # PRE-activation (for dual backward)
             lb, ub = torch.tanh(lb), torch.tanh(ub)
             if post_activation:
                 bounds_dict[lid] = Bounds(lb.clone(), ub.clone())  # POST-activation (for validation)
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
-            
-        elif kind in ["LRELU", "LEAKY_RELU"]:
+
+        elif kind == LayerKind.LRELU.value:
             if not post_activation:
                 bounds_dict[lid] = Bounds(lb.clone(), ub.clone())  # PRE-activation (for dual backward)
             alpha = float(layer.params.get("alpha", 0.01))
@@ -119,33 +119,34 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
                 # Keep forward validation sound: do not keep propagating affine
                 # coefficients from an upper relaxation through subsequent layers.
                 A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
-            
-        elif kind in ["MAXPOOL2D"]:
+
+        elif kind == LayerKind.MAXPOOL2D.value:
             lb, ub = _fwd_maxpool2d(layer, lb, ub)
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
-            
-        elif kind in ["AVGPOOL2D"]:
+
+        elif kind == LayerKind.AVGPOOL2D.value:
             lb, ub = _fwd_avgpool2d(layer, lb, ub)
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
-            
-        elif kind in [LayerKind.ASSERT.value, "ASSERT", "TRANSPOSE", "SQUEEZE", "UNSQUEEZE"]:
+
+        elif kind in (LayerKind.ASSERT.value, LayerKind.TRANSPOSE.value,
+                      LayerKind.SQUEEZE.value, LayerKind.UNSQUEEZE.value):
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
 
-        elif kind in [LayerKind.CONSTANT.value, "CONSTANT"]:
+        elif kind == LayerKind.CONSTANT.value:
             val = layer.params["value"].flatten().to(device=device, dtype=dtype)
             lb, ub = val.clone(), val.clone()
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
 
-        elif kind in [LayerKind.SIGN.value, "SIGN"]:
+        elif kind == LayerKind.SIGN.value:
             lb = torch.sign(lb)
             ub = torch.sign(ub)
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
 
-        elif kind in [LayerKind.COMPARE.value, "COMPARE"]:
+        elif kind == LayerKind.COMPARE.value:
             pred_ids = list(net.preds.get(lid, []) or [])
             if len(pred_ids) >= 2 and all(p in bounds_dict for p in pred_ids[:2]):
                 op = layer.params["op"]
@@ -181,7 +182,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
 
-        elif kind in [LayerKind.WHERE.value, "WHERE"]:
+        elif kind == LayerKind.WHERE.value:
             pred_ids = list(net.preds.get(lid, []) or [])
             if len(pred_ids) >= 3 and all(p in bounds_dict for p in pred_ids[:3]):
                 n_out = len(layer.out_vars)
@@ -203,7 +204,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
 
-        elif kind in [LayerKind.MATMUL.value, "MATMUL"]:
+        elif kind == LayerKind.MATMUL.value:
             pred_ids = list(net.preds.get(lid, []) or [])
             if len(pred_ids) >= 2 and all(p in bounds_dict for p in pred_ids[:2]):
                 x_shape = tuple(layer.params["x_shape"])
@@ -221,7 +222,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
 
-        elif kind in [LayerKind.ARG_EXTREMUM.value, "ARG_EXTREMUM"]:
+        elif kind == LayerKind.ARG_EXTREMUM.value:
             in_shape = layer.params.get("input_shape")
             axis = int(layer.params.get("axis", 0))
             if in_shape is not None and axis < 0:
@@ -233,7 +234,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
 
-        elif kind in [LayerKind.UPSAMPLE.value, "UPSAMPLE"]:
+        elif kind == LayerKind.UPSAMPLE.value:
             in_shape = layer.params.get("input_shape")
             out_shape = layer.params.get("output_shape")
             mode = str(layer.params.get("mode", "nearest")).lower()
@@ -257,7 +258,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
 
-        elif kind in [LayerKind.EXPAND.value, "EXPAND"]:
+        elif kind == LayerKind.EXPAND.value:
             in_shape = layer.params.get("input_shape")
             out_shape = layer.params.get("output_shape") or layer.params.get("shape")
             if in_shape is not None and out_shape is not None:
@@ -268,7 +269,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
 
-        elif kind in [LayerKind.SCATTER_ND.value, "SCATTER_ND"]:
+        elif kind == LayerKind.SCATTER_ND.value:
             pred_ids = list(net.preds.get(lid, []) or [])
             if len(pred_ids) >= 3 and all(p in bounds_dict for p in pred_ids[:3]):
                 d_lb = bounds_dict[pred_ids[0]].lb.flatten()
@@ -287,7 +288,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
 
-        elif kind in [LayerKind.REDUCE_SUM.value, "REDUCE_SUM"]:
+        elif kind == LayerKind.REDUCE_SUM.value:
             axes = layer.params.get("axes")
             keepdims = bool(layer.params.get("keepdims", 0))
             in_shape = layer.params.get("input_shape")
@@ -301,7 +302,7 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
             bounds_dict[lid] = Bounds(lb.clone(), ub.clone())
             A, bias, x0, eps = _reset_state(lb, ub, device, dtype)
             
-        elif kind == "ADD":
+        elif kind == LayerKind.ADD.value:
             # ADD layer: z = x + y (+ bias if present)
             # Predecessor layer IDs come from the ACT Net graph (``net.preds``).
             # The prior implementation read ``x_src`` / ``y_src`` from

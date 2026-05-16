@@ -12,7 +12,7 @@
 
 import torch
 import torch.nn.functional as F
-from typing import Tuple
+from typing import Callable, Tuple
 from act.back_end.core import Bounds, Con, ConSet, Fact, Layer
 
 
@@ -74,13 +74,9 @@ def tf_conv2d(L: Layer, Bin: Bounds) -> Fact:
     # Compute bounds via torch
     lb_4d = Bin.lb.view(B_in, in_channels, in_h, in_w)
     ub_4d = Bin.ub.view(B_in, in_channels, in_h, in_w)
-    
-    W_pos = weight.clamp(min=0)
-    W_neg = weight.clamp(max=0)
+
     conv_kw = dict(stride=stride, padding=padding, dilation=dilation, groups=groups)
-    
-    lb_out = F.conv2d(lb_4d, W_pos, None, **conv_kw) + F.conv2d(ub_4d, W_neg, None, **conv_kw)
-    ub_out = F.conv2d(ub_4d, W_pos, None, **conv_kw) + F.conv2d(lb_4d, W_neg, None, **conv_kw)
+    lb_out, ub_out = _conv_bound_pair(F.conv2d, lb_4d, ub_4d, weight, **conv_kw)
     
     if bias is not None:
         lb_out = lb_out + bias.view(1, -1, 1, 1)
@@ -449,11 +445,8 @@ def tf_conv1d(L: Layer, Bin: Bounds) -> Fact:
     lb_in = Bin.lb.view(B_in, channels, in_w)
     ub_in = Bin.ub.view(B_in, channels, in_w)
 
-    W_pos = weight.clamp(min=0)
-    W_neg = weight.clamp(max=0)
     conv_kw = dict(stride=stride, padding=padding, dilation=dilation, groups=groups)
-    lb_out = F.conv1d(lb_in, W_pos, None, **conv_kw) + F.conv1d(ub_in, W_neg, None, **conv_kw)
-    ub_out = F.conv1d(ub_in, W_pos, None, **conv_kw) + F.conv1d(lb_in, W_neg, None, **conv_kw)
+    lb_out, ub_out = _conv_bound_pair(F.conv1d, lb_in, ub_in, weight, **conv_kw)
     if bias is not None:
         lb_out = lb_out + bias.view(1, -1, 1)
         ub_out = ub_out + bias.view(1, -1, 1)
@@ -517,11 +510,8 @@ def tf_conv3d(L: Layer, Bin: Bounds) -> Fact:
     lb_in = Bin.lb.view(B_in, channels, in_d, in_h, in_w)
     ub_in = Bin.ub.view(B_in, channels, in_d, in_h, in_w)
 
-    W_pos = weight.clamp(min=0)
-    W_neg = weight.clamp(max=0)
     conv_kw = dict(stride=stride, padding=padding, dilation=dilation, groups=groups)
-    lb_out = F.conv3d(lb_in, W_pos, None, **conv_kw) + F.conv3d(ub_in, W_neg, None, **conv_kw)
-    ub_out = F.conv3d(ub_in, W_pos, None, **conv_kw) + F.conv3d(lb_in, W_neg, None, **conv_kw)
+    lb_out, ub_out = _conv_bound_pair(F.conv3d, lb_in, ub_in, weight, **conv_kw)
     if bias is not None:
         lb_out = lb_out + bias.view(1, -1, 1, 1, 1)
         ub_out = ub_out + bias.view(1, -1, 1, 1, 1)
@@ -586,11 +576,8 @@ def tf_convtranspose2d(L: Layer, Bin: Bounds) -> Fact:
     lb_in = Bin.lb.view(B_in, in_channels, in_h, in_w)
     ub_in = Bin.ub.view(B_in, in_channels, in_h, in_w)
 
-    W_pos = weight.clamp(min=0)
-    W_neg = weight.clamp(max=0)
     conv_kw = dict(stride=stride, padding=padding, output_padding=output_padding, dilation=dilation, groups=groups)
-    lb_out = F.conv_transpose2d(lb_in, W_pos, None, **conv_kw) + F.conv_transpose2d(ub_in, W_neg, None, **conv_kw)
-    ub_out = F.conv_transpose2d(ub_in, W_pos, None, **conv_kw) + F.conv_transpose2d(lb_in, W_neg, None, **conv_kw)
+    lb_out, ub_out = _conv_bound_pair(F.conv_transpose2d, lb_in, ub_in, weight, **conv_kw)
     if bias is not None:
         lb_out = lb_out + bias.view(1, -1, 1, 1)
         ub_out = ub_out + bias.view(1, -1, 1, 1)
@@ -680,6 +667,30 @@ def tf_upsample(L: Layer, Bin: Bounds) -> Fact:
 
 
 # -------- Helper functions for new conv layers --------
+
+def _conv_bound_pair(
+    conv_fn: Callable[..., torch.Tensor],
+    lb_in: torch.Tensor,
+    ub_in: torch.Tensor,
+    weight: torch.Tensor,
+    **conv_kw,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """(lb, ub) = (conv(lb_in, W+) + conv(ub_in, W-), conv(ub_in, W+) + conv(lb_in, W-))
+    fused into 2 conv launches via batch-stacking. W+ = weight.clamp(min=0), W- = weight.clamp(max=0).
+    """
+    assert lb_in.shape == ub_in.shape, (
+        f"_conv_bound_pair: lb/ub shape mismatch ({tuple(lb_in.shape)} vs {tuple(ub_in.shape)})"
+    )
+    W_pos = weight.clamp(min=0)
+    W_neg = weight.clamp(max=0)
+    B = lb_in.shape[0]
+    in_for_pos = torch.cat([lb_in, ub_in], dim=0)
+    in_for_neg = torch.cat([ub_in, lb_in], dim=0)
+    out_pos = conv_fn(in_for_pos, W_pos, None, **conv_kw)
+    out_neg = conv_fn(in_for_neg, W_neg, None, **conv_kw)
+    out = out_pos + out_neg
+    return out[:B], out[B:]
+
 
 def _conv1d_to_linear_matrix(
     weight: torch.Tensor,

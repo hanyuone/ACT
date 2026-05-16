@@ -15,7 +15,10 @@ from .act2torch import *
 from .validate_verifier import VerificationValidator
 from .model_factory import *
 from .utils import *
-from .llm_probe import *
+try:
+    from .llm_probe import *
+except ImportError:
+    pass
 
 __all__ = [
     # torch2act exports

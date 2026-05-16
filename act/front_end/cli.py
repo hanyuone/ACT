@@ -282,26 +282,66 @@ def print_list_downloads(creator: Optional[str] = None):
 def print_creators():
     """Print information about all available creators."""
     creators = list_creators()
-    
+
     print(f"\n{'='*100}")
     print(f"AVAILABLE CREATORS")
     print(f"{'='*100}")
-    
+
     for creator_name in sorted(creators):
+        creator = get_creator(creator_name)
         print(f"\n{creator_name.upper()}")
         print('-' * 100)
-        
+        print(f"  Class:       {type(creator).__name__}")
+
         if creator_name == 'torchvision':
             datasets = list(tv_mapping.DATASET_MODEL_MAPPING.keys())
             print(f"  Description: TorchVision datasets and models")
-            print(f"  Module: act.front_end.torchvision_loader")
-            print(f"  Total Items: {len(datasets)}")
+            print(f"  Module:      act.front_end.torchvision_loader")
+            print(f"  Items:       {len(datasets)} datasets")
+            print(f"  Kinds:       classification, regression")
         elif creator_name == 'vnnlib':
             categories = vnnlib_mapping.list_categories()
             print(f"  Description: VNNLIB verification benchmarks")
-            print(f"  Module: act.front_end.vnnlib_loader")
-            print(f"  Total Items: {len(categories)}")
-    
+            print(f"  Module:      act.front_end.vnnlib_loader")
+            print(f"  Items:       {len(categories)} VNN-COMP categories")
+            print(f"  Kinds:       robustness, safety, reachability")
+
+    print(f"\n{'='*100}\n")
+
+
+def print_creator_info(name: str) -> None:
+    try:
+        creator = get_creator(name)
+        creators = list_creators()
+    except ValueError as e:
+        print(f"Error: {e}")
+        print(f"Available creators: {list_creators()}")
+        return
+
+    print(f"\n{'='*100}")
+    print(f"CREATOR: {name.upper()}")
+    print(f"{'='*100}")
+    print(f"  Class:        {type(creator).__name__}")
+    print(f"  Module:       {type(creator).__module__}")
+    print(f"  All creators: {creators}")
+
+    if hasattr(creator, 'config') and creator.config:
+        config_keys = sorted(creator.config.keys())
+        print(f"  Config keys:  {config_keys}")
+
+    if name == 'torchvision':
+        datasets = sorted(tv_mapping.DATASET_MODEL_MAPPING.keys())
+        sample = datasets[:5]
+        print(f"  Datasets ({len(datasets)}):  {sample} ...")
+        print(f"  Kinds:        classification, regression")
+        print(f"  Spec types:   BOX, LINF_BALL (epsilon perturbations)")
+    elif name == 'vnnlib':
+        categories = sorted(vnnlib_mapping.list_categories())
+        sample = categories[:5]
+        print(f"  Categories ({len(categories)}): {sample} ...")
+        print(f"  Kinds:        robustness, safety, reachability")
+        print(f"  Spec types:   VNNLIB SMT-LIB format")
+
     print(f"\n{'='*100}\n")
 
 
@@ -325,8 +365,12 @@ Examples:
   # List only VNNLIB categories
   python -m act.front_end --list --creator vnnlib
   
-  # Show available creators with details
+  # Show available creators with details (name, class, item count, supported kinds)
   python -m act.front_end --list-creators
+  
+  # Show detailed metadata for a specific creator
+  python -m act.front_end --info-creator vnnlib
+  python -m act.front_end --info-creator torchvision
   
   # ============================================================================
   # SEARCHING - Find specific datasets or categories
@@ -490,6 +534,13 @@ Examples:
         dest="list_creators",
         help="Show information about all available creators"
     )
+    parser.add_argument(
+        "--info-creator",
+        type=str,
+        metavar="NAME",
+        dest="info_creator",
+        help="Show detailed metadata for a specific creator (e.g. vnnlib, torchvision)"
+    )
     
     # Model synthesis and inference
     parser.add_argument(
@@ -529,7 +580,10 @@ Examples:
     
     elif args.list_creators:
         print_creators()
-    
+
+    elif args.info_creator:
+        print_creator_info(args.info_creator)
+
     elif args.synthesis:
         creator_name = args.creator if args.creator else 'torchvision'
         print(f"\n{'='*100}")

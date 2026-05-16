@@ -45,12 +45,20 @@
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
+import logging
 from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.fx as fx
 from torch.nn.modules.batchnorm import _BatchNorm
-from torchvision.ops import StochasticDepth
+
+logger = logging.getLogger(__name__)
+try:
+    from torchvision.ops import StochasticDepth
+    _HAS_STOCHASTIC_DEPTH = True
+except (ImportError, RuntimeError):
+    StochasticDepth = None  # type: ignore[assignment,misc]
+    _HAS_STOCHASTIC_DEPTH = False
 
 from act.back_end.core import Net, Layer
 from act.back_end.layer_schema import LayerKind
@@ -239,7 +247,9 @@ class _LayerGraphBuilder:
                     continue
                 try:
                     val = resolver(target)
-                except (AttributeError, KeyError, RuntimeError):
+                except (AttributeError, KeyError, RuntimeError) as e:
+                    # Intentional: resolver may not own this target; try the next resolver.
+                    logger.debug("suppressed: %s", e)
                     continue
                 if isinstance(val, torch.Tensor):
                     return val.detach().clone()
@@ -572,7 +582,9 @@ class _LayerGraphBuilder:
         }
         
         # No-op modules (identity during inference)
-        if isinstance(mod, (nn.Dropout, StochasticDepth)):
+        if isinstance(mod, nn.Dropout) or (
+            _HAS_STOCHASTIC_DEPTH and isinstance(mod, StochasticDepth)
+        ):
             return
         
         for mod_type, converter in converters.items():
@@ -1309,14 +1321,12 @@ def main():
     
     try:
         gurobi_solver = GurobiSolver()
-        gurobi_solver.begin("act_verification")
         print("  Gurobi solver available")
     except Exception as e:
         print(f"  Gurobi initialization failed: {e}")
-    
+
     try:
         torch_solver = TorchLPSolver()
-        torch_solver.begin("act_verification")
         print(f"  TorchLP solver available (device: {torch_solver._device})")
     except Exception as e:
         print(f"  TorchLP initialization failed: {e}")

@@ -134,8 +134,9 @@ def convert_onnx_to_pytorch(
                 try:
                     from onnx import shape_inference
                     raw_model = shape_inference.infer_shapes(raw_model)
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Intentional: shape inference is best-effort; converter handles missing shapes downstream.
+                    logger.debug("suppressed: %s", e)
                 pytorch_model = convert(raw_model)
             else:
                 raise

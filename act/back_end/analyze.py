@@ -14,7 +14,8 @@
 
 import torch
 from collections import deque
-from typing import Dict, Tuple
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple, cast
 from act.back_end.core import Bounds, Fact, Net, ConSet
 from act.back_end.layer_schema import LayerKind
 from act.back_end.utils import box_join, changed_or_maskdiff, update_cache
@@ -25,8 +26,24 @@ def initialize_tf_mode(mode: str = "interval"):
     """Initialize transfer function mode. Call this before using analyze()."""
     set_transfer_function_mode(mode)
 
+
+@dataclass
+class AnalyzeCache:
+    """Reusable dataflow state for monotone BaB input-box refinements."""
+    before: Dict[int, Fact]
+    after: Dict[int, Fact]
+    globalC: ConSet
+
+
 @torch.no_grad()
-def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple[Dict[int, Fact], Dict[int, Fact], ConSet]:
+def analyze(
+    net: Net,
+    entry_id: int,
+    entry_fact: Fact,
+    eps: float = 1e-9,
+    *,
+    cache: Optional[AnalyzeCache] = None,
+) -> Tuple[Dict[int, Fact], Dict[int, Fact], ConSet]:
     """
     Perform abstract interpretation on the network starting from entry_fact.
     Args:
@@ -34,59 +51,72 @@ def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple
         entry_id: ID of the entry (INPUT) layer
         entry_fact: Initial Fact containing bounds and constraints for the input
         eps: Convergence epsilon for fixpoint iteration
-    
+        cache: Optional state from a prior monotone-refinement analysis.
+
     Returns:
         Tuple of (before, after, globalC) containing propagated facts and global constraints
     """
     # Auto-initialize transfer function mode if not set
     try:
         from act.back_end.transfer_functions import get_transfer_function
-        get_transfer_function()  # Check if already initialized
+        _ = get_transfer_function()  # Check if already initialized
     except RuntimeError:
         initialize_tf_mode("interval")  # Default to interval mode
-        
-    before: Dict[int, Fact] = {}
-    after:  Dict[int, Fact] = {}
-    globalC = ConSet()
 
-    # Default bounds must carry the leading batch dim. Consumer TFs assume
-    # bounds are [B, n] and reshape on that axis; a (n,) default would
-    # silently broadcast in some paths and fail loudly in others.
-    seed = entry_fact.bounds.lb
-    B = seed.shape[0] if seed.dim() >= 2 else 1
-    for L in net.layers:
-        n = len(L.out_vars)
-        hi = seed.new_full((B, n), float("inf"))
-        lo = seed.new_full((B, n), -float("inf"))
-        before[L.id] = Fact(bounds=Bounds(lo.clone(), hi.clone()), cons=ConSet())
-        after[L.id]  = Fact(bounds=Bounds(lo.clone(), hi.clone()), cons=ConSet())
-        L.cache.clear()
+    if cache is None:
+        before: Dict[int, Fact] = {}
+        after:  Dict[int, Fact] = {}
+        globalC = ConSet()
 
-    # Seed entry with provided Fact (includes all input constraints)
-    before[entry_id] = entry_fact
+        # Default bounds must carry the leading batch dim. Consumer TFs assume
+        # bounds are [B, n] and reshape on that axis; a (n,) default would
+        # silently broadcast in some paths and fail loudly in others.
+        seed = entry_fact.bounds.lb
+        B = seed.shape[0] if seed.dim() >= 2 else 1
+        for layer in net.layers:
+            n = len(layer.out_vars)
+            hi = seed.new_full((B, n), float("inf"))
+            lo = seed.new_full((B, n), -float("inf"))
+            before[layer.id] = Fact(bounds=Bounds(lo.clone(), hi.clone()), cons=ConSet())
+            after[layer.id] = Fact(bounds=Bounds(lo.clone(), hi.clone()), cons=ConSet())
+            layer.cache.clear()
 
-    # Seed every other zero-indegree source (e.g. CONSTANT layers emitted by
-    # torch2act for ONNX initializers). Without this, source-layer bounds stay
-    # at +/-inf forever because the worklist starts at entry_id and CONSTANTs
-    # have no predecessor that would ever push them on. (Oracle finding #5.)
-    seeds = [entry_id]
-    for L in net.layers:
-        if L.id == entry_id or net.preds.get(L.id):
-            continue
-        if L.kind == LayerKind.CONSTANT.value:
-            B_size = entry_fact.bounds.lb.shape[0]
-            val = L.params["value"].reshape(-1).to(
-                device=entry_fact.bounds.lb.device,
-                dtype=entry_fact.bounds.lb.dtype,
-            )
-            val_b = val.unsqueeze(0).expand(B_size, -1).contiguous()  # [B, numel]
-            before[L.id] = Fact(bounds=Bounds(val_b.clone(), val_b.clone()), cons=ConSet())
-        # Other zero-indegree kinds (none today) would be seeded similarly.
-        seeds.append(L.id)
+        # Seed entry with provided Fact (includes all input constraints)
+        before[entry_id] = entry_fact
+
+        # Seed every other zero-indegree source (e.g. CONSTANT layers emitted by
+        # torch2act for ONNX initializers). Without this, source-layer bounds stay
+        # at +/-inf forever because the worklist starts at entry_id and CONSTANTs
+        # have no predecessor that would ever push them on. (Oracle finding #5.)
+        seeds = [entry_id]
+        for layer in net.layers:
+            if layer.id == entry_id or net.preds.get(layer.id):
+                continue
+            if layer.kind == LayerKind.CONSTANT.value:
+                B_size = entry_fact.bounds.lb.shape[0]
+                raw_value = cast(object, layer.params["value"])
+                if not isinstance(raw_value, torch.Tensor):
+                    raise TypeError(
+                        f"CONSTANT layer {layer.id} requires tensor param 'value', got {type(raw_value).__name__}."
+                    )
+                val = raw_value.reshape(-1).to(
+                    device=entry_fact.bounds.lb.device,
+                    dtype=entry_fact.bounds.lb.dtype,
+                )
+                val_b = val.unsqueeze(0).expand(B_size, -1).contiguous()  # [B, numel]
+                before[layer.id] = Fact(bounds=Bounds(val_b.clone(), val_b.clone()), cons=ConSet())
+            # Other zero-indegree kinds (none today) would be seeded similarly.
+            seeds.append(layer.id)
+    else:
+        before = cache.before
+        after = cache.after
+        globalC = cache.globalC
+        before[entry_id] = entry_fact
+        seeds = [entry_id]
 
     WL = deque(seeds)
     while WL:
-        lid = WL.popleft(); L = net.by_id[lid]
+        lid = WL.popleft(); layer = net.by_id[lid]
 
         # merge predecessors into before[lid]
         if net.preds.get(lid):
@@ -108,11 +138,11 @@ def analyze(net: Net, entry_id: int, entry_fact: Fact, eps: float=1e-9) -> Tuple
                 for con in after[pid].cons: Cjoin.replace(con)
             before[lid] = Fact(Bjoin, Cjoin)
 
-        out_fact = dispatch_tf(L, before, after, net)
+        out_fact = dispatch_tf(layer, before, after, net)
 
-        if changed_or_maskdiff(L, out_fact.bounds, None, eps):
+        if changed_or_maskdiff(layer, out_fact.bounds, None, eps):
             after[lid] = out_fact
-            update_cache(L, out_fact.bounds, None)
+            update_cache(layer, out_fact.bounds, None)
             for con in out_fact.cons: globalC.replace(con)
             for sid in net.succs.get(lid, []): WL.append(sid)
 

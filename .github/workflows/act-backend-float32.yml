@@ -28,7 +28,7 @@ jobs:
 
       - name: Clean pip cache
         run: |
-          pip cache purge || true
+          pip cache purge
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,12 +36,12 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.9"
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install coverage torch torchvision onnx onnx2torch tensorflow pandas numpy pyyaml tqdm pytest psutil transformers scikit-learn
+          pip install coverage torch torchvision onnx onnx2torch tensorflow pandas numpy pyyaml tqdm psutil transformers scikit-learn
 
       # Network Generation & Basic Tests
 
@@ -71,35 +71,37 @@ jobs:
         run: |
           cd ${{ github.workspace }}
           coverage run -p --source=act -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float32
-
       # Level 2: Bounds Validation (per TF mode)
 
       - name: Run Bounds Validation (float32, interval)
         run: |
           cd ${{ github.workspace }}
           coverage run -p --source=act -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float32 --tf-modes interval
-
       - name: Run Bounds Validation (float32, hybridz)
         run: |
           cd ${{ github.workspace }}
           coverage run -p --source=act -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float32 --tf-modes hybridz
-
       - name: Run Bounds Validation (float32, dual)
         run: |
           cd ${{ github.workspace }}
           coverage run -p --source=act -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float32 --tf-modes dual
 
+      - name: List example networks (back_end)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p --source=act -m act.back_end --list-examples
+
       - name: Combine coverage data
         if: always()
         run: |
           cd ${{ github.workspace }}
-          coverage combine || true
-          coverage xml -o coverage.xml || true
-          coverage report || true
+          coverage combine
+          coverage xml -o coverage.xml
+          coverage report
 
       - name: Upload coverage to Codecov
         if: always()
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           files: ./coverage.xml
           flags: backend-float32

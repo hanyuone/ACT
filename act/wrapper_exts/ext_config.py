@@ -3,6 +3,7 @@
 
 This file consolidates configuration utilities for external verifier usage.
 """
+import logging
 from typing import Union, Optional, List, Tuple, Dict, Any
 import os
 import numpy as np
@@ -20,6 +21,8 @@ from enum import Enum
 
 # Import verification types from canonical location (act/util/stats.py)
 from act.util.stats import VerifyStatus, VerifyResult
+
+logger = logging.getLogger(__name__)
 
 
 class SplitType(Enum):
@@ -186,7 +189,9 @@ class Model:
                 dummy = torch.zeros(*shape)
                 self.pytorch_model(dummy)
                 return shape
-            except Exception:
+            except Exception as e:
+                # Intentional: probing common input shapes; non-matching shapes raise and we try the next.
+                logger.debug("suppressed: %s", e)
                 continue
         raise RuntimeError("Cannot infer model input shape automatically.")
 

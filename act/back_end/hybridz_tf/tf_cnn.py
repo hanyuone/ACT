@@ -16,7 +16,7 @@
 import torch
 import torch.nn.functional as F
 from act.back_end.core import Bounds, Fact
-from act.back_end.solver.solver_hz import HZono, hz_compute_bounds
+from act.back_end.solver.solver_hz import HZono
 from act.back_end.hybridz_tf.tf_mlp import _hz_fact
 import act.back_end.interval_tf.tf_cnn as interval
 
@@ -42,48 +42,17 @@ def tf_conv2d(L, bounds, tf):
 
 
 def tf_maxpool2d(L, bounds, tf):
-    hz_in = tf._hz_cache.get(L.id)
-    if hz_in is not None:
-        bds = hz_compute_bounds(hz_in)
-        shape = L.params.get("input_shape")
-        done = False
-        if shape is not None:
-            if len(shape) == 4:
-                _, C, H, W = shape
-            elif len(shape) == 3:
-                C, H, W = shape
-            else:
-                hz_in = None
-            if hz_in is not None:
-                spatial = C * H * W
-                B = bds.lb.numel() // spatial
-                _, idx = F.max_pool2d(
-                    bds.lb.view(B, C, H, W),
-                    kernel_size=L.params.get("kernel_size", 2),
-                    stride=L.params.get("stride", L.params.get("kernel_size", 2)),
-                    padding=L.params.get("padding", 0),
-                    return_indices=True,
-                )
-                # idx values are per-batch flat indices in [0, C*H*W);
-                # add per-batch offsets to recover global flat indices in
-                # [0, B*C*H*W) so hz_in.c[w] / .Gc[w] / .Gb[w] index the
-                # correct batch element's row.
-                offsets = (
-                    torch.arange(B, device=idx.device, dtype=idx.dtype)
-                    .view(B, 1, 1, 1) * spatial
-                )
-                w = (idx + offsets).reshape(-1)
-                tf._hz_cache[L.id] = HZono(
-                    c=hz_in.c[w], Gc=hz_in.Gc[w], Gb=hz_in.Gb[w],
-                    Ac=hz_in.Ac.clone(), Ab=hz_in.Ab.clone(), b=hz_in.b.clone(),
-                )
-                done = True
-        if not done:
-            hz_in = None
-    fact = interval.tf_maxpool2d(L, bounds)
-    if hz_in is not None:
-        return _hz_fact(fact, tf._hz_cache[L.id])
-    return fact
+    # MaxPool over the K×K window of HZ-encoded inputs has no compositional
+    # zonotope form: the output is the elementwise max of K² candidates each
+    # represented by independent HZ rows. The previous implementation gathered
+    # ONE row per window by `argmax(bds.lb)`, but the concrete maximum can
+    # come from a different window position whose HZ row has a higher UB
+    # (surfaced by layer_testing_cnn_pool — concrete=0.347 > picked_row_ub=0.275).
+    # Until a sound HZ-domain MaxPool (e.g. via per-window UB envelope over all
+    # K² generator-row maxes) is implemented, drop HZ refinement and fall back
+    # to interval, which IS sound.
+    tf._hz_cache[L.id] = None
+    return interval.tf_maxpool2d(L, bounds)
 
 
 # --- HZ conv2d (zonotope domain) ---

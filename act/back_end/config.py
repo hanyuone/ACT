@@ -163,6 +163,23 @@ class BackendConfig:
     bab_enabled: bool = False
     bab: BaBConfig = field(default_factory=BaBConfig)
 
+    # -- batched-API knobs (C11) --------------------------------------------
+    lp_enabled: bool = True
+    """Enable the LP-batched tier (tier 2) in the 3-tier cascade.
+
+    Set to False to skip verify_lp_batched and fall through directly to BaB.
+    Must be False when solver='gurobi' (Gurobi solve_batch is N=1 only;
+    see commit af797ff / C6).
+    """
+
+    bab_max_batch_size: int = 8
+    """Maximum K for BaB sub-problem batching (tier 3).
+
+    BaB dispatches up to K sub-problems per solve_batch call.  Set to 1 to
+    disable batching inside BaB (equivalent to the legacy sequential loop).
+    Must be 1 when solver='gurobi' (same N=1 restriction as lp_enabled).
+    """
+
     generation: GenerationConfig = field(default_factory=GenerationConfig)
 
     # -- validation ---------------------------------------------------------
@@ -180,6 +197,24 @@ class BackendConfig:
             raise ValueError(
                 f"Invalid dtype {self.dtype!r}; expected one of {_VALID_DTYPES}"
             )
+        # Gurobi solve_batch is restricted to N=1 (commit af797ff / C6).
+        # Fail loud at config-load time rather than at the first batched call.
+        if self.solver == "gurobi":
+            if self.lp_enabled:
+                raise ValueError(
+                    "BackendConfig: solver='gurobi' is incompatible with "
+                    "lp_enabled=True.  GurobiSolver.solve_batch raises for N>1 "
+                    "(Gurobi does not expose a truly parallel multi-LP API for "
+                    "varying constraint matrices; see commit af797ff).  "
+                    "Either set lp_enabled=False or switch to solver='torch'."
+                )
+            if self.bab_max_batch_size > 1:
+                raise ValueError(
+                    f"BackendConfig: solver='gurobi' is incompatible with "
+                    f"bab_max_batch_size={self.bab_max_batch_size} > 1.  "
+                    f"GurobiSolver.solve_batch raises for N>1.  "
+                    f"Either set bab_max_batch_size=1 or switch to solver='torch'."
+                )
 
     # -- YAML I/O -----------------------------------------------------------
 
@@ -278,3 +313,55 @@ class BackendConfig:
                 sort_keys=False,
             )
         return path
+
+
+if __name__ == "__main__":
+    import sys
+
+    passed = 0
+    failed = 0
+
+    def _check(label: str, fn) -> None:  # pragma: no cover
+        global passed, failed
+        try:
+            fn()
+            print(f"  PASS  {label}")
+            passed += 1
+        except Exception as exc:
+            print(f"  FAIL  {label}: {exc}")
+            failed += 1
+
+    print("BackendConfig.__post_init__ rejection tests")
+
+    def _t1():  # pragma: no cover
+        try:
+            BackendConfig(solver="gurobi", lp_enabled=True)
+            raise AssertionError("expected ValueError not raised")
+        except ValueError as e:
+            assert "lp_enabled" in str(e), f"wrong message: {e}"
+
+    def _t2():  # pragma: no cover
+        try:
+            BackendConfig(solver="gurobi", lp_enabled=False, bab_max_batch_size=2)
+            raise AssertionError("expected ValueError not raised")
+        except ValueError as e:
+            assert "bab_max_batch_size" in str(e), f"wrong message: {e}"
+
+    def _t3():  # pragma: no cover
+        cfg = BackendConfig(solver="gurobi", lp_enabled=False, bab_max_batch_size=1)
+        assert cfg.solver == "gurobi"
+        assert not cfg.lp_enabled
+        assert cfg.bab_max_batch_size == 1
+
+    def _t4():  # pragma: no cover
+        cfg = BackendConfig()
+        assert cfg.lp_enabled is True
+        assert cfg.bab_max_batch_size == 8
+
+    _check("gurobi + lp_enabled=True raises ValueError", _t1)
+    _check("gurobi + bab_max_batch_size=2 raises ValueError", _t2)
+    _check("gurobi + lp_enabled=False + bab_max_batch_size=1 succeeds", _t3)
+    _check("default config has lp_enabled=True, bab_max_batch_size=8", _t4)
+
+    print(f"\n{passed}/{passed + failed} passed")
+    sys.exit(0 if failed == 0 else 1)

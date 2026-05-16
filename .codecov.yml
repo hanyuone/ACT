@@ -1,0 +1,61 @@
+# Codecov.io project configuration for the ACT repo.
+# Docs: https://docs.codecov.com/docs/codecovyml-reference
+#
+# Local exclusion of ``assert`` lines lives in .coveragerc (since codecov.yml
+# operates on whole-file paths, not line-level patterns). This file controls
+# codecov.io-side behaviour: coverage targets, PR comment shape, and which
+# files / directories are ignored in the codecov dashboard.
+
+coverage:
+  precision: 2
+  round: down
+  range: "65...85"
+
+  status:
+    project:
+      default:
+        target: 70%
+        threshold: 1%
+        informational: false
+    patch:
+      default:
+        target: 65%
+        threshold: 5%
+        informational: false
+
+comment:
+  layout: "header, diff, flags, components, files, footer"
+  behavior: default
+  require_changes: false
+  require_base: false
+  require_head: true
+
+# Files / directories that should NOT influence project coverage.
+# Tests and entry-point scripts are not what we're measuring.
+ignore:
+  - "tests/"
+  - "scripts/"
+  - "act/back_end/examples/"
+  - "act/pipeline/log/"
+  - "**/__main__.py"
+  - "**/conftest.py"
+  - "**/test_*.py"
+  - "**/_kind_builders.py"
+  - "act/pipeline/fuzzing/trace_reader.py"
+  - "act/front_end/vnnlib_loader/cli.py"
+  - "act/pipeline/verification/llm_probe.py"
+  - "act/wrapper_exts/"
+  - "act/back_end/cli.py"
+  - "act/front_end/cli.py"
+  - "act/pipeline/cli.py"
+  - "act/front_end/torchvision_loader/cli.py"
+  - "act/back_end/serialization/test_serialization.py"
+
+# Flag definitions matching the workflow upload steps. Each CI job uploads with
+# a flag so codecov can show per-job coverage in the PR comment / dashboard.
+flags:
+  backend-float64: {}
+  backend-float32: {}
+  bab: {}
+  pipeline: {}
+  frontend: {}

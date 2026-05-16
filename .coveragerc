@@ -1,0 +1,47 @@
+# Coverage.py configuration for the ACT project.
+#
+# Used by both local runs (scripts/coverage.sh) and CI workflows (act-backend-*,
+# act-bab, act-pipeline). The CI workflows invoke ``coverage run -p --source=act``
+# so this file's ``[run]`` source is informational and ``[report] exclude_lines``
+# governs what counts as "missing" when generating coverage.xml for codecov.
+
+[run]
+source = act
+branch = False
+parallel = True
+
+[report]
+# Lines matching any of these regexes are NOT counted as missing.
+# Rationale per pattern:
+#   * defensive ``assert`` statements check invariants that successful tests
+#     never trigger; they're noise in coverage metrics
+#   * ``raise <SomeClass>`` lines are safety guards (ValueError on bad input,
+#     RuntimeError on broken invariant, NotImplementedError on abstract stub,
+#     KeyError / TypeError / custom *Error subclasses for defensive validation).
+#     They run only on the error path; their non-execution on the happy path
+#     is the expected behaviour and should NOT count as missing coverage.
+#   * ``if TYPE_CHECKING`` and ``if __name__ == "__main__"`` are import-time /
+#     entry-point guards that production paths don't hit
+#   * bare ``...`` (Ellipsis) lines appear in Protocol/ABC stubs
+exclude_lines =
+    pragma: no cover
+    ^\s*assert\s
+    ^\s*raise\s+[A-Z]\w*
+    if TYPE_CHECKING:
+    if __name__ == .__main__.:
+    ^\s*\.\.\.\s*$
+
+# Skip files that are entry points / scripts / vendor code.
+omit =
+    act/back_end/examples/*
+    act/pipeline/log/*
+    */__main__.py
+    act/pipeline/verification/llm_probe.py
+    act/wrapper_exts/ext_runner.py
+
+precision = 2
+show_missing = True
+skip_covered = False
+
+[xml]
+output = coverage.xml

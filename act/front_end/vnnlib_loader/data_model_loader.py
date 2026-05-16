@@ -416,7 +416,9 @@ def _probe_model_shape(pytorch_model, total_count: int, onnx_shape):
             with torch.no_grad():
                 pytorch_model(x)
             return shape
-        except Exception:
+        except Exception as e:
+            # Intentional: probing candidate input shapes; mismatches are expected, try the next.
+            logger.debug("suppressed: %s", e)
             continue
     return None
 

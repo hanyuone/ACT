@@ -24,21 +24,16 @@
 #      become FALSIFIED. Remaining samples are UNKNOWN.
 #   6. Return List[VerifyResult] of length B (one per input lane).
 #
-# BaB-only architecture — setup_and_solve / add_negated_assert_to_solver:
-#   Single-spec CSP path used by the BaB driver:
-#   interval propagation -> export to solver -> add negated ASSERT
-#   -> SAT/UNSAT. verify_once does not call this path.
-#
 #===---------------------------------------------------------------------===#
 
 # Public API:
 #   - verify_once(net, *, model_fn=None) -> List[VerifyResult]
 #       Pure-tensor batched single-shot verifier.
-#   - setup_and_solve(net, input_bounds, solver, timelimit=None)
-#       Single-spec CSP setup helper used by the BaB driver.
-#   - add_negated_assert_to_solver / find_entry_layer_id / get_input_ids /
-#     get_output_ids / gather_input_spec_layers / get_assert_layer /
-#     seed_from_input_specs / add_all_input_specs (helpers).
+#   - setup_and_solve_batch(net, input_bounds_per_b, solver, timelimit=None)
+#       Batch-native CSP setup helper used by LP and BaB refinement.
+#   - find_entry_layer_id / get_input_ids / get_output_ids /
+#     gather_input_spec_layers / get_assert_layer / seed_from_input_specs /
+#     add_all_input_specs (helpers).
 #
 # Notes:
 #   * Spec-free verification: all constraints extracted from ACT Net layers.
@@ -46,26 +41,107 @@
 #   * INPUT_SPEC constraints (including LIN_POLY) are propagated through
 #     analyze(); they enter via add_all_input_specs into entry_fact.cons.
 #     LIN_POLY constraints are not consumed by verify_once's interval
-#     certification; they are preserved for the BaB / setup_and_solve path
-#     which is solver-aware.
+#     certification; they are preserved for the batch-native solver path.
 
 from __future__ import annotations
-from typing import Optional, List, Callable, Dict, Any
+from typing import Optional, List, Callable, Dict, Any, TYPE_CHECKING
 
-import numpy as np
 import torch
+import copy
 
 # ACT backend imports
-from act.back_end.core import Bounds, Con, ConSet, Fact
-from act.back_end.solver.solver_base import Solver, SolveStatus
+from act.back_end.core import Bounds, Con, ConSet, Fact, Net
+from act.back_end.solver.solver_base import Solver, SolveStatus, BatchLPSolution
 from act.back_end.layer_schema import LayerKind
 from act.back_end.utils import validate_constraints
+
+if TYPE_CHECKING:
+    from act.back_end.analyze import AnalyzeCache
 
 # Front-end enums (kinds)
 from act.front_end.specs import InKind, OutKind
 
 # Verification types (canonical location: act/util/stats.py)
 from act.util.stats import VerifyStatus, VerifyResult
+
+# -----------------------------------------------------------------------------
+# Sequential per-sample slicing (for B>1 BaB)
+# -----------------------------------------------------------------------------
+
+def _slice_first_dim(value: Any, sample_idx: int, expected_b: int) -> Any:
+    if isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[0] == expected_b:
+        return value[sample_idx:sample_idx + 1]
+    return value
+
+
+def slice_net_to_sample(net: Net, sample_idx: int) -> Net:
+    from act.front_end.spec_creator_base import LabeledInputTensor
+
+    mutable_kinds = {
+        LayerKind.INPUT.value,
+        LayerKind.INPUT_SPEC.value,
+        LayerKind.ASSERT.value,
+    }
+    layers = []
+    for layer in net.layers:
+        if layer.kind not in mutable_kinds:
+            layers.append(layer)
+            continue
+        layer2 = copy.copy(layer)
+        layer2.params = dict(layer.params)
+        layer2.in_vars = list(layer.in_vars)
+        layer2.out_vars = list(layer.out_vars)
+        layer2.cache = dict(layer.cache)
+        layers.append(layer2)
+    net2 = copy.copy(net)
+    net2.layers = layers
+    net2.preds = net.preds
+    net2.succs = net.succs
+    net2.by_id = {layer.id: layer for layer in layers}
+
+    entry_id = find_entry_layer_id(net2)
+    input_layer = net2.by_id[entry_id]
+    shape = input_layer.params.get("shape") or []
+    shape_t = tuple(shape) if isinstance(shape, (list, tuple)) else ()
+    B = int(shape_t[0]) if shape_t else 1
+    if shape_t and int(shape_t[0]) == B:
+        input_layer.params["shape"] = (1,) + tuple(shape_t[1:])
+    li = input_layer.params.get("labeled_input")
+    if isinstance(li, LabeledInputTensor):
+        new_tensor = _slice_first_dim(li.tensor, sample_idx, B)
+        new_label = _slice_first_dim(li.label, sample_idx, B) if li.label is not None else None
+        input_layer.__dict__["params"]["labeled_input"] = LabeledInputTensor(
+            tensor=new_tensor, label=new_label,
+        )
+
+    for spec_layer in gather_input_spec_layers(net2):
+        for key in ("center", "eps", "lb", "ub", "A", "b"):
+            val = spec_layer.params.get(key)
+            if val is not None:
+                spec_layer.params[key] = _slice_first_dim(val, sample_idx, B)
+
+    assert_layer = get_assert_layer(net2)
+    m_raw = assert_layer.params.get("M", 1)
+    if isinstance(m_raw, torch.Tensor):
+        m_rows = int(m_raw.item())
+    elif isinstance(m_raw, int):
+        m_rows = m_raw
+    else:
+        raise ValueError(f"ASSERT M must be int or tensor, got {m_raw!r}")
+    for key in ("y_true", "margin", "c", "d", "lb", "ub"):
+        val = assert_layer.params.get(key)
+        if val is not None:
+            assert_layer.params[key] = _slice_first_dim(val, sample_idx, B)
+    # C is [B*M, n_out] — first dim is B*M not B, so slice rows manually
+    c_big = assert_layer.params.get("C")
+    if isinstance(c_big, torch.Tensor) and c_big.shape[0] == B * m_rows:
+        assert_layer.params["C"] = c_big[sample_idx * m_rows:(sample_idx + 1) * m_rows]
+    thresholds = assert_layer.params.get("thresholds")
+    if isinstance(thresholds, torch.Tensor) and thresholds.shape[0] == B:
+        assert_layer.params["thresholds"] = thresholds[sample_idx:sample_idx + 1]
+
+    return net2
+
 
 # -----------------------------------------------------------------------------
 # ACT Net extraction helpers
@@ -114,23 +190,23 @@ def seed_from_input_specs(spec_layers) -> Bounds:
     All constraints (including LIN_POLY) are added via add_all_input_specs().
     """
     # BOX first
-    for L in spec_layers:
-        if L.params.get("kind") == InKind.BOX and "lb" in L.params and "ub" in L.params:
-            return Bounds(L.params["lb"].clone(), L.params["ub"].clone())
+    for spec_layer in spec_layers:
+        if spec_layer.params.get("kind") == InKind.BOX and "lb" in spec_layer.params and "ub" in spec_layer.params:
+            return Bounds(spec_layer.params["lb"].clone(), spec_layer.params["ub"].clone())
     
     # LINF_BALL next
-    for L in spec_layers:
-        if L.params.get("kind") == InKind.LINF_BALL:
-            if "lb" in L.params and "ub" in L.params:
-                return Bounds(L.params["lb"].clone(), L.params["ub"].clone())
-            center = L.params.get("center")
-            eps = L.params.get("eps")
+    for spec_layer in spec_layers:
+        if spec_layer.params.get("kind") == InKind.LINF_BALL:
+            if "lb" in spec_layer.params and "ub" in spec_layer.params:
+                return Bounds(spec_layer.params["lb"].clone(), spec_layer.params["ub"].clone())
+            center = spec_layer.params.get("center")
+            eps = spec_layer.params.get("eps")
             if center is not None and eps is not None:
                 e = torch.tensor(eps)
                 return Bounds(center - e, center + e)
     
     # LIN_POLY only -> error
-    if any(L.params.get("kind") == InKind.LIN_POLY for L in spec_layers):
+    if any(spec_layer.params.get("kind") == InKind.LIN_POLY for spec_layer in spec_layers):
         raise ValueError("LIN_POLY requires a seed box (BOX or LINF_BALL).")
     
     raise ValueError("No valid input specification found for seeding.")
@@ -145,7 +221,7 @@ def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> N
     - LIN_POLY constraints (linear polytope A·x ≤ b)
     
     The LIN_POLY constraints are tagged with "in:linpoly" and will be
-    exported to the solver via export_to_solver() in cons_exportor.py.
+    exported by export_to_batch_problem() in cons_exportor.py.
     """
     for L in spec_layers:
         k = L.params.get("kind")
@@ -165,246 +241,171 @@ def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> N
         else:
             raise NotImplementedError(f"Unsupported INPUT_SPEC kind: {k}")
 
-def _b1_scalar(val: Any, name: str) -> float:
-    """Extract a Python scalar from a BaB-path ASSERT param.
 
-    BaB MILP encoding is single-instance by contract: every high-level
-    field is either a Python scalar or a ``torch.Tensor[B=1]`` produced by
-    ``OutputSpec.encode_linear``. Tensors with ``B > 1`` are rejected
-    because the existential encoding for TOP1 / MARGIN intrinsically
-    requires a single ``y_true`` / ``margin``.
-    """
-    if isinstance(val, torch.Tensor):
-        if val.numel() != 1:
-            raise ValueError(
-                f"BaB MILP requires B=1; param '{name}' has "
-                f"numel={val.numel()}, shape={tuple(val.shape)}"
-            )
-        return float(val.item())
-    return float(val)
-
-
-def _b1_int(val: Any, name: str) -> int:
-    """Same as ``_b1_scalar`` but returns int (for ``y_true``)."""
-    if isinstance(val, torch.Tensor):
-        if val.numel() != 1:
-            raise ValueError(
-                f"BaB MILP requires B=1; param '{name}' has "
-                f"numel={val.numel()}, shape={tuple(val.shape)}"
-            )
-        return int(val.item())
-    return int(val)
-
-
-def _b1_vec(val: Any, name: str, expected_len: int) -> torch.Tensor:
-    """Extract a ``[expected_len]`` 1-D tensor from a BaB-path ASSERT param.
-
-    Accepts a 1-D ``Tensor[expected_len]`` or a 2-D ``Tensor[B=1, expected_len]``
-    (as produced by ``encode_linear``); rejects ``B > 1``.
-    """
-    t = val if isinstance(val, torch.Tensor) else torch.as_tensor(val)
-    if t.dim() == 2:
-        if t.shape[0] != 1:
-            raise ValueError(
-                f"BaB MILP requires B=1; param '{name}' has "
-                f"shape={tuple(t.shape)}"
-            )
-        t = t[0]
-    if t.dim() != 1 or t.shape[0] != expected_len:
-        raise ValueError(
-            f"BaB MILP: param '{name}' must reduce to [{expected_len}]; "
-            f"got shape={tuple(t.shape)}"
-        )
-    return t
-
-
-def add_negated_assert_to_solver(solver: Solver, out_ids: List[int], assert_layer) -> None:
-    """Add the negation of ASSERT property as constraints to solver."""
-    from act.back_end.cons_exportor import to_numpy
-    k = assert_layer.params.get("kind")
-    n_out = len(out_ids)
-
-    if k == OutKind.LINEAR_LE:
-        c_vec = _b1_vec(assert_layer.params["c"], "c", n_out)
-        d = _b1_scalar(assert_layer.params["d"], "d")
-        coeffs = list(to_numpy(c_vec))
-        solver.add_lin_ge(out_ids, coeffs, d + 1e-6)
-
-    elif k == OutKind.UNSAFE_LINEAR:
-        c_raw = assert_layer.params["c"]
-        c_t = c_raw if isinstance(c_raw, torch.Tensor) else torch.as_tensor(c_raw)
-        if c_t.dim() == 3:
-            if c_t.shape[0] != 1:
-                raise ValueError(
-                    f"BaB MILP requires B=1; UNSAFE_LINEAR c has "
-                    f"shape={tuple(c_t.shape)}"
-                )
-            c_t = c_t[0]
-        if c_t.dim() == 1:
-            c_t = c_t.unsqueeze(0)
-        d_raw = assert_layer.params["d"]
-        d_t = d_raw if isinstance(d_raw, torch.Tensor) else torch.as_tensor(d_raw)
-        if d_t.dim() == 2:
-            if d_t.shape[0] != 1:
-                raise ValueError(
-                    f"BaB MILP requires B=1; UNSAFE_LINEAR d has "
-                    f"shape={tuple(d_t.shape)}"
-                )
-            d_t = d_t[0]
-        C = to_numpy(c_t)
-        d_vec = to_numpy(d_t).reshape(-1)
-        for i in range(C.shape[0]):
-            row = list(C[i])
-            solver.add_lin_le(out_ids, row, float(d_vec[i]) + 1e-6)
-
-    elif k == OutKind.TOP1_ROBUST:
-        t = _b1_int(assert_layer.params["y_true"], "y_true")
-        v = solver.n
-        solver.add_vars(1)
-        for j, oj in enumerate(out_ids):
-            if j != t:
-                solver.add_lin_ge([v, oj, out_ids[t]], [1.0, -1.0, 1.0], 0.0)
-        solver.add_lin_ge([v], [1.0], 0.0)
-
-    elif k == OutKind.MARGIN_ROBUST:
-        t = _b1_int(assert_layer.params["y_true"], "y_true")
-        margin = _b1_scalar(assert_layer.params["margin"], "margin")
-        v = solver.n
-        solver.add_vars(1)
-        for j, oj in enumerate(out_ids):
-            if j != t:
-                solver.add_lin_ge([v, oj, out_ids[t]], [1.0, -1.0, 1.0], -margin)
-        solver.add_lin_ge([v], [1.0], 0.0)
-
-    elif k == OutKind.RANGE:
-        lb_raw = assert_layer.params.get("lb", None)
-        ub_raw = assert_layer.params.get("ub", None)
-        if lb_raw is None and ub_raw is None:
-            raise ValueError("RANGE assert requires lb and/or ub.")
-
-        lb = to_numpy(_b1_vec(lb_raw, "lb", n_out)) if lb_raw is not None else None
-        ub = to_numpy(_b1_vec(ub_raw, "ub", n_out)) if ub_raw is not None else None
-
-        v = solver.n
-        solver.add_vars(1)
-        v_max_terms: List[float] = []
-
-        v_max = max(v_max_terms) if v_max_terms else 1e6
-        if (not np.isfinite(v_max)) or v_max < 1e-3:
-            v_max = 1e6
-
-        solver.add_lin_ge([v], [1.0], 0.0)
-        solver.add_lin_ge([v], [-1.0], -v_max)
-
-        for i, yi in enumerate(out_ids):
-            if lb is not None: solver.add_lin_ge([v, yi], [1.0, 1.0], float(lb[i]))
-            if ub is not None: solver.add_lin_ge([v, yi], [1.0, -1.0], float(-ub[i]))
-
-# -----------------------------------------------------------------------------
-# Core solver workflow (shared by verify_once and BaB)
-# -----------------------------------------------------------------------------
-
-def _reshape_input_bounds(input_bounds: Bounds, net) -> Bounds:
-    """Reshape 1D bounds to the network's INPUT shape.
-
-    BaB sub-problems arrive flat ([D]); analyze needs [B, *input_shape].
-    Bounds already 2-D+ pass through unchanged.
-    """
-    if input_bounds.lb.dim() >= 2:
-        return input_bounds
-    entry_id = find_entry_layer_id(net)
-    target = net.by_id[entry_id].params.get("shape")
-    if target is None:
-        raise ValueError(
-            f"_reshape_input_bounds: 1-D input_bounds requires "
-            f"INPUT.params['shape'] on the entry layer, but layer "
-            f"{entry_id} has no 'shape' param."
-        )
-    target_t = tuple(int(d) for d in target)
-    prod = 1
-    for d in target_t:
-        prod *= d
-    flat = input_bounds.lb
-    if flat.numel() != prod:
-        raise ValueError(
-            f"_reshape_input_bounds: 1-D input_bounds numel "
-            f"{flat.numel()} does not match prod(INPUT.shape)={prod} "
-            f"(shape={target_t})."
-        )
-    return Bounds(
-        lb=input_bounds.lb.reshape(*target_t).contiguous(),
-        ub=input_bounds.ub.reshape(*target_t).contiguous(),
-    )
 
 
 @torch.no_grad()
-def setup_and_solve(
+def setup_and_solve_batch(
     net,
-    input_bounds: Bounds,
+    input_bounds_per_b: Bounds,
     solver: Solver,
-    timelimit: Optional[float] = None
-) -> tuple[str, Optional[np.ndarray], Dict[str, Any]]:
-    """
-    Core verification workflow: setup constraints and solve.
-    
-    This function encapsulates the common verification pattern:
-    1. Extract network structure (entry layer, input/output IDs, specs)
-    2. Create entry_fact with input_bounds and all INPUT_SPEC constraints
-    3. Run abstract interpretation (analyze)
-    4. Export constraints to solver
-    5. Add negated ASSERT property
-    6. Solve and return status + counterexample (if found)
-    
-    Args:
-        net: ACT network
-        input_bounds: Input region bounds (seed box or refinement box)
-        solver: Solver instance
-        timelimit: Optional timeout in seconds
-    
-    Returns:
-        Tuple of (status, counterexample_input, stats):
-        - status: SolveStatus.SAT/UNSAT/UNKNOWN
-        - counterexample_input: np.ndarray if SAT, else None
-        - stats: Dict with metadata (ncons, status, etc.)
+    timelimit: Optional[float] = None,
+    *,
+    cache: Optional["AnalyzeCache"] = None,
+) -> BatchLPSolution:
+    """[BATCHED-API] Orchestrate analyze → export_to_batch_problem → solve_batch.
+
+    ``input_bounds_per_b`` must already be a tensor-view batch
+    ``[B, *input_shape]``; B=1 is just
+    the length-one batch case, not a scalar special case.
     """
     from act.back_end.analyze import analyze
-    from act.back_end.cons_exportor import export_to_solver
-    
-    # Extract network structure
+    from act.back_end.cons_exportor import export_to_batch_problem
+
+    if input_bounds_per_b.lb.dim() < 2 or input_bounds_per_b.ub.dim() < 2:
+        raise ValueError(
+            f"setup_and_solve_batch: input_bounds_per_b must be batched "
+            f"[B, *input_shape], got lb={tuple(input_bounds_per_b.lb.shape)} "
+            f"ub={tuple(input_bounds_per_b.ub.shape)}"
+        )
+
     entry_id = find_entry_layer_id(net)
     input_ids = get_input_ids(net)
-    output_ids = get_output_ids(net)
     spec_layers = gather_input_spec_layers(net)
     assert_layer = get_assert_layer(net)
 
-    input_bounds = _reshape_input_bounds(input_bounds, net)
-
-    # Create entry_fact with ALL input constraints
-    entry_fact = Fact(bounds=input_bounds, cons=ConSet())
+    entry_fact = Fact(bounds=input_bounds_per_b, cons=ConSet())
     add_all_input_specs(entry_fact.cons, input_ids, spec_layers)
-    
-    # Analyze with full input specification (propagates constraints)
-    before, after, globalC = analyze(net, entry_id, entry_fact)
-    
-    # Validate constraints (validation runs if enabled, logging only if debug_tf also enabled)
+
+    _before, after, globalC = analyze(net, entry_id, entry_fact, cache=cache)
     validate_constraints(globalC, after, net)
-    
-    # Export all constraints to solver (including LIN_POLY)
-    export_to_solver(globalC, solver, objective=None, sense="min")
-    add_negated_assert_to_solver(solver, output_ids, assert_layer)
-    
-    # Solve (feasibility check only)
-    solver.set_objective_linear([], [], 0.0, sense="min")
-    solver.optimize(timelimit)
-    
-    # Extract result
-    st = solver.status()
-    ce_input = None
-    if st == SolveStatus.SAT and solver.has_solution():
-        ce_input = solver.get_values(input_ids)
-    
-    stats = {"status": st, "ncons": len(globalC)}
-    return st, ce_input, stats
+
+    problem = export_to_batch_problem(
+        net=net,
+        globalC=globalC,
+        assert_layer=assert_layer,
+        input_box_per_b=input_bounds_per_b,
+    )
+    solution = solver.solve_batch(problem, timelimit=timelimit)
+
+    expected_n = int(input_bounds_per_b.lb.shape[0])
+    if len(solution.statuses) != expected_n:
+        raise ValueError(
+            f"setup_and_solve_batch: solver returned {len(solution.statuses)} "
+            f"statuses for B={expected_n}"
+        )
+    valid_statuses = {SolveStatus.SAT, SolveStatus.UNSAT, SolveStatus.UNKNOWN}
+    unexpected = [status for status in solution.statuses if status not in valid_statuses]
+    if unexpected:
+        raise ValueError(
+            f"setup_and_solve_batch: unexpected solver statuses {unexpected}"
+        )
+    if solution.max_viol.shape != (expected_n,):
+        raise ValueError(
+            f"setup_and_solve_batch: max_viol shape "
+            f"{tuple(solution.max_viol.shape)} != ({expected_n},)"
+        )
+    return solution
+
+
+@torch.no_grad()
+def verify_lp_batched(
+    net,
+    solver_factory: Callable[[], Solver],
+    timelimit: Optional[float] = None,
+) -> List[VerifyResult]:
+    """[BATCHED-API] Run one native batched LP verification pass.
+
+    The ACT net supplies a batched INPUT_SPEC seed ``[B, *input_shape]`` and a
+    batched ASSERT layer. ``setup_and_solve_batch`` solves all B LPs at once;
+    this function decodes each solver lane to a ``VerifyResult`` and validates
+    SAT candidates concretely before reporting FALSIFIED.
+    """
+    import importlib
+
+    spec_layers = gather_input_spec_layers(net)
+    seed_bounds = seed_from_input_specs(spec_layers)
+    if seed_bounds.lb.dim() < 2 or seed_bounds.ub.dim() < 2:
+        raise ValueError(
+            f"verify_lp_batched: seed bounds must be [B, *input_shape], "
+            f"got lb={tuple(seed_bounds.lb.shape)} ub={tuple(seed_bounds.ub.shape)}"
+        )
+    batch_size = int(seed_bounds.lb.shape[0])
+    solver = solver_factory()
+    solution = setup_and_solve_batch(
+        net,
+        Bounds(seed_bounds.lb.clone(), seed_bounds.ub.clone()),
+        solver,
+        timelimit=timelimit,
+    )
+    if len(solution.statuses) != batch_size:
+        raise ValueError(
+            f"verify_lp_batched: solver returned {len(solution.statuses)} "
+            f"statuses for B={batch_size}"
+        )
+    if solution.x.dim() != 2 or solution.x.shape[0] != batch_size:
+        raise ValueError(
+            f"verify_lp_batched: solution.x must be [B, nvars], got "
+            f"shape={tuple(solution.x.shape)} for B={batch_size}"
+        )
+
+    input_ids = get_input_ids(net)
+    input_index = torch.tensor(input_ids, device=solution.x.device, dtype=torch.long)
+    x_candidates = solution.x.index_select(1, input_index).reshape_as(seed_bounds.lb)
+    assert_layer = get_assert_layer(net)
+
+    sat_mask = torch.tensor(
+        [status in (SolveStatus.SAT, "FEASIBLE") for status in solution.statuses],
+        device=x_candidates.device,
+        dtype=torch.bool,
+    )
+    violations = torch.zeros(batch_size, device=x_candidates.device, dtype=torch.bool)
+    if bool(sat_mask.any().item()):
+        bab_module = importlib.import_module("act.back_end.bab.bab")
+        sat_idx = torch.where(sat_mask)[0]
+        checked_sat = bab_module.check_violations_batched(
+            net, x_candidates.index_select(0, sat_idx), assert_layer,
+        )
+        if checked_sat.shape != (int(sat_idx.numel()),):
+            raise ValueError(
+                f"verify_lp_batched: check_violations_batched returned "
+                f"shape={tuple(checked_sat.shape)} expected ({int(sat_idx.numel())},)"
+            )
+        violations.scatter_(
+            0, sat_idx, checked_sat.to(device=x_candidates.device, dtype=torch.bool),
+        )
+
+    results: List[VerifyResult] = []
+    x_cpu = x_candidates.detach().cpu()
+    max_viol_cpu = solution.max_viol.detach().cpu()
+    for lane, status in enumerate(solution.statuses):
+        metadata: Dict[str, Any] = {
+            "lane": lane,
+            "B": batch_size,
+            "solver_status": status,
+            "max_viol": float(max_viol_cpu[lane].item()),
+        }
+        if status in (SolveStatus.SAT, "FEASIBLE"):
+            if bool(violations[lane].item()):
+                results.append(
+                    VerifyResult(
+                        VerifyStatus.FALSIFIED,
+                        counterexample=x_cpu[lane].clone(),
+                        metadata=metadata,
+                    )
+                )
+            else:
+                metadata["validation"] = "no_verified_violation"
+                results.append(VerifyResult(VerifyStatus.UNKNOWN, metadata=metadata))
+        elif status in (SolveStatus.UNSAT, "INFEASIBLE"):
+            results.append(VerifyResult(VerifyStatus.CERTIFIED, metadata=metadata))
+        elif status == "TIMEOUT":
+            results.append(VerifyResult(VerifyStatus.TIMEOUT, metadata=metadata))
+        elif status == SolveStatus.UNKNOWN:
+            results.append(VerifyResult(VerifyStatus.UNKNOWN, metadata=metadata))
+        else:
+            raise ValueError(f"verify_lp_batched: unexpected solver status {status!r}")
+    return results
 
 
 # -----------------------------------------------------------------------------
@@ -573,9 +574,10 @@ def verify_once(
             )
         if falsified.any():
             x_center_cpu = x_center.detach().cpu()
-            for i in range(B):
-                if bool(falsified[i].item()):
-                    counterexamples[i] = x_center_cpu[i].clone()
+            # B1 (oracle-verified): single sync via .tolist() replaces B per-element .item() syncs.
+            # torch.where returns ascending indices; lane order is preserved.
+            for i in torch.where(falsified)[0].tolist():
+                counterexamples[i] = x_center_cpu[i].clone()
 
     # 6. Assemble per-lane results.
     results: List[VerifyResult] = []
@@ -608,7 +610,7 @@ def verify_once(
 #===---------------------------------------------------------------------===#
 
 
-def _test_build_top1_robust_drops_y_true_row() -> None:
+def _test_build_top1_robust_drops_y_true_row() -> None:  # pragma: no cover
     # Encoding is row-deletion, not masking: every row is e_j - e_{y_true}
     # for j != y_true, hence M = K-1 and Frobenius row norm = sqrt(2).
     from act.front_end.specs import OutputSpec, OutKind
@@ -636,7 +638,7 @@ def _test_build_top1_robust_drops_y_true_row() -> None:
     )
 
 
-def _test_build_linear_le_threshold_is_d_unchanged() -> None:
+def _test_build_linear_le_threshold_is_d_unchanged() -> None:  # pragma: no cover
     from act.front_end.specs import OutputSpec, OutKind
 
     out = OutputSpec(
@@ -655,7 +657,7 @@ def _test_build_linear_le_threshold_is_d_unchanged() -> None:
     ), f"thresholds mismatch: {out['thresholds'].tolist()}"
 
 
-def _test_build_margin_robust_threshold_is_negated_margin() -> None:
+def _test_build_margin_robust_threshold_is_negated_margin() -> None:  # pragma: no cover
     from act.front_end.specs import OutputSpec, OutKind
 
     out = OutputSpec(
@@ -672,7 +674,7 @@ def _test_build_margin_robust_threshold_is_negated_margin() -> None:
     )
 
 
-def _test_build_range_interleaves_pm_e_rows() -> None:
+def _test_build_range_interleaves_pm_e_rows() -> None:  # pragma: no cover
     from act.front_end.specs import OutputSpec, OutKind
 
     out = OutputSpec(
@@ -702,7 +704,7 @@ def _test_build_range_interleaves_pm_e_rows() -> None:
         )
 
 
-def _test_interval_margin_certification_shape() -> None:
+def _test_interval_margin_certification_shape() -> None:  # pragma: no cover
     # margin_max = sum_k (max(C_k,0)*ub_k + min(C_k,0)*lb_k) over [B*M, n_out];
     # per-sample CERTIFIED iff every M lane satisfies margin_max < threshold.
     from act.front_end.specs import OutputSpec, OutKind
@@ -736,7 +738,7 @@ def _test_interval_margin_certification_shape() -> None:
     )
 
 
-def _make_dense_net_box_test(
+def _make_dense_net_box_test(  # pragma: no cover
     B: int,
     n_in: int,
     n_out: int,
@@ -807,7 +809,81 @@ def _make_dense_net_box_test(
     return Net(layers=layers, preds=preds, succs=succs)
 
 
-def _test_verify_once_b3_all_certified() -> None:
+
+def _test_setup_and_solve_batch_b1_smoke() -> None:  # pragma: no cover
+    from act.back_end.solver.solver_interval import TorchLPSolver
+    from act.util.device_manager import get_default_device, get_default_dtype
+
+    device = get_default_device()
+    dtype = get_default_dtype()
+    weight = torch.ones(1, 1, device=device, dtype=dtype)
+    bias = torch.zeros(1, device=device, dtype=dtype)
+    lb_in = torch.full((1, 1), 1.0, device=device, dtype=dtype)
+    ub_in = torch.full((1, 1), 2.0, device=device, dtype=dtype)
+    net = _make_dense_net_box_test(
+        B=1, n_in=1, n_out=1, weight=weight, bias=bias,
+        lb_in=lb_in, ub_in=ub_in,
+        assert_params={
+            "kind": OutKind.LINEAR_LE,
+            "c": torch.ones(1, device=device, dtype=dtype),
+            "d": torch.tensor(0.0, device=device, dtype=dtype),
+        },
+    )
+
+    solution = setup_and_solve_batch(
+        net,
+        Bounds(lb_in.clone(), ub_in.clone()),
+        TorchLPSolver(),
+    )
+    assert solution.statuses == (SolveStatus.SAT,), f"got {solution.statuses}"
+    assert tuple(solution.max_viol.shape) == (1,)
+    assert float(solution.max_viol[0].item()) <= 1e-4
+
+
+def _test_setup_and_solve_batch_b_greater_than_1() -> None:  # pragma: no cover
+    from act.back_end.solver.solver_interval import TorchLPSolver
+    from act.util.device_manager import get_default_device, get_default_dtype
+
+    device = get_default_device()
+    dtype = get_default_dtype()
+
+    B = 4
+    weight = torch.ones(1, 1, device=device, dtype=dtype)
+    bias = torch.zeros(1, device=device, dtype=dtype)
+    lb_in = torch.tensor([[1.0], [1.25], [1.5], [1.75]], device=device, dtype=dtype)
+    ub_in = torch.tensor([[2.0], [2.25], [2.5], [2.75]], device=device, dtype=dtype)
+    net = _make_dense_net_box_test(
+        B=B, n_in=1, n_out=1, weight=weight, bias=bias,
+        lb_in=lb_in, ub_in=ub_in,
+        assert_params={
+            "kind": OutKind.LINEAR_LE,
+            "c": torch.ones(1, device=device, dtype=dtype),
+            "d": torch.tensor(0.0, device=device, dtype=dtype),
+        },
+    )
+
+    solution = setup_and_solve_batch(
+        net,
+        Bounds(lb_in.clone(), ub_in.clone()),
+        TorchLPSolver(),
+    )
+
+    assert solution.statuses == (SolveStatus.SAT,) * B, (
+        f"expected {B} SAT statuses, got {solution.statuses}"
+    )
+    assert tuple(solution.x.shape) == (B, solution.x.shape[1]), (
+        f"solution.x should retain leading batch B={B}, got "
+        f"{tuple(solution.x.shape)}"
+    )
+    for i in range(B):
+        assert float(solution.max_viol[i].item()) <= 1e-4, (
+            f"batch lane {i}: max_viol "
+            f"{float(solution.max_viol[i].item())} > 1e-4"
+        )
+
+
+
+def _test_verify_once_b3_all_certified() -> None:  # pragma: no cover
     # Zero DENSE -> abstract output is singleton {0}, well below d=10.
     # End-to-end check that the [B*M, n_out] cert pass folds to per-sample.
     from act.util.device_manager import get_default_device, get_default_dtype
@@ -840,7 +916,7 @@ def _test_verify_once_b3_all_certified() -> None:
         )
 
 
-def _test_verify_once_b8_mixed_outcomes() -> None:
+def _test_verify_once_b8_mixed_outcomes() -> None:  # pragma: no cover
     # 8 input boxes designed to produce CERT/FALS/UNK mix in one run,
     # proving the cert pass + concrete falsification operate sample-wise
     # rather than collapsing the batch.
@@ -912,14 +988,62 @@ def _test_verify_once_b8_mixed_outcomes() -> None:
     )
 
 
-_TESTS = [
+def _test_verify_lp_batched_multi_b1() -> None:  # pragma: no cover
+    from act.back_end.serialization.serialization import load_net_from_file
+    from act.back_end.solver.solver_interval import TorchLPSolver
+    from act.util.stats import VerifyStatus
+
+    net = load_net_from_file(
+        "act/back_end/examples/nets/layer_testing_top1_robust.json",
+        target_device="cpu",
+    )
+    results = verify_lp_batched(net, TorchLPSolver, timelimit=1.0)
+    valid = {VerifyStatus.CERTIFIED, VerifyStatus.FALSIFIED, VerifyStatus.UNKNOWN}
+    assert len(results) == 1, f"expected one result, got {len(results)}"
+    assert results[0].status in valid, f"unexpected status {results[0].status}"
+
+
+def _test_verify_lp_batched_batch_b4() -> None:  # pragma: no cover
+    from act.back_end.solver.solver_interval import TorchLPSolver
+    from act.util.device_manager import get_default_device, get_default_dtype
+    from act.util.stats import VerifyStatus
+
+    device = get_default_device()
+    dtype = get_default_dtype()
+    B = 4
+    weight = torch.ones(1, 1, device=device, dtype=dtype)
+    bias = torch.zeros(1, device=device, dtype=dtype)
+    lb_in = torch.tensor([[1.0], [1.25], [1.5], [1.75]], device=device, dtype=dtype)
+    ub_in = torch.tensor([[2.0], [2.25], [2.5], [2.75]], device=device, dtype=dtype)
+    net = _make_dense_net_box_test(
+        B=B, n_in=1, n_out=1, weight=weight, bias=bias,
+        lb_in=lb_in, ub_in=ub_in,
+        assert_params={
+            "kind": OutKind.LINEAR_LE,
+            "c": torch.ones(1, device=device, dtype=dtype),
+            "d": torch.tensor(0.0, device=device, dtype=dtype),
+        },
+    )
+
+    results = verify_lp_batched(net, TorchLPSolver, timelimit=1.0)
+    valid = {VerifyStatus.CERTIFIED, VerifyStatus.FALSIFIED, VerifyStatus.UNKNOWN}
+    assert len(results) == B, f"expected {B} results, got {len(results)}"
+    for i, result in enumerate(results):
+        assert result.status in valid, f"lane {i}: unexpected status {result.status}"
+
+
+_TESTS = [  # pragma: no cover
     _test_build_top1_robust_drops_y_true_row,
     _test_build_linear_le_threshold_is_d_unchanged,
     _test_build_margin_robust_threshold_is_negated_margin,
     _test_build_range_interleaves_pm_e_rows,
     _test_interval_margin_certification_shape,
+    _test_setup_and_solve_batch_b1_smoke,
+    _test_setup_and_solve_batch_b_greater_than_1,
     _test_verify_once_b3_all_certified,
     _test_verify_once_b8_mixed_outcomes,
+    _test_verify_lp_batched_multi_b1,
+    _test_verify_lp_batched_batch_b4,
 ]
 
 
@@ -952,4 +1076,3 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(main())
-

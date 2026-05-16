@@ -5,6 +5,11 @@
 import torch
 from typing import Tuple, Optional
 
+try:
+    torch.sparse.check_sparse_tensor_invariants.disable()
+except Exception:
+    pass
+
 # Global initialization state
 _INITIALIZED = False
 

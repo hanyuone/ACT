@@ -1,35 +1,26 @@
 from __future__ import annotations
-import math, os, time
-from typing import List, Optional, Tuple
-import numpy as np
+import math, time
+from typing import Optional
 import torch
 
-from act.back_end.solver.solver_base import Solver, SolveStatus, SolverCaps
+from act.back_end.solver.solver_base import (
+    Solver,
+    SolveStatus,
+    SolverCaps,
+    BatchLPProblem,
+    BatchLPSolution,
+)
 from act.util.device_manager import get_default_device, get_default_dtype
 
 class TorchLPSolver(Solver):
     """Continuous LP solver using Torch + Adam with penalty and box projection.
 
     - Supports GPU via device hint in begin(...).
-    - No integrality: add_binary_vars() creates [0,1] continuous vars.
-    - add_sos2 is a no-op.
+    - LP-only: no integrality constraints (no binary vars, no SOS2).
     """
     def __init__(self):
         self._device = get_default_device()
         self._dtype = get_default_dtype()
-        self._n = 0
-        self._x = None                 # torch.nn.Parameter
-        self._lb = None                # torch.Tensor [n]
-        self._ub = None                # torch.Tensor [n]
-        self._eq = []                  # rows: (vids, coeffs, rhs)
-        self._le = []
-        self._ge = []
-        self._objective = ([], [], 0.0, "min")
-        self._status = SolveStatus.UNKNOWN
-        self._has_solution = False
-        self._sol = None
-        self._timelimit = None
-
         # parameters
         self.rho_eq = 10.0
         self.rho_ineq = 10.0
@@ -50,150 +41,71 @@ class TorchLPSolver(Solver):
     def capabilities(self) -> SolverCaps:
         return SolverCaps(supports_gpu=True)
 
-    @property
-    def n(self) -> int:
-        return self._n
+    def solve_batch(
+        self,
+        problem: BatchLPProblem,
+        timelimit: Optional[float] = None,
+    ) -> BatchLPSolution:
+        """Native batched LP solve via Adam + penalty on block-diagonal sparse.
 
-    def begin(self, name: str = "verify", device: Optional[str] = None):
-        # Use global device manager for default, allow override
-        if device is not None:
-            self._device = torch.device(device)
-        # else keep the device_manager default from __init__
-        
-        self._n = 0
-        self._x = None
-        self._lb = None
-        self._ub = None
-        self._eq.clear(); self._le.clear(); self._ge.clear()
-        self._objective = ([], [], 0.0, "min")
-        self._status = SolveStatus.UNKNOWN
-        self._has_solution = False
-        self._sol = None
+        Operates uniformly over all N instances (no scalar special-case for
+        N=1) using ``torch.sparse.mm`` against the ``[N*m, N*nvars]``
+        block-diagonal matrices in ``problem``. The per-N feasibility gate
+        preserves the C2 soundness invariant: penalty-on-Adam CANNOT certify
+        infeasibility, so any instance whose
+        final residual exceeds ``tol_feas`` is reported as UNKNOWN, never
+        UNSAT. The returned iterate is the box-clamped last state for all
+        N; callers must check ``statuses[i] == SAT`` before consuming
+        ``x[i]``.
+        """
+        N = problem.N
+        nvars = problem.nvars
+        m_eq = problem.m_eq
+        m_le = problem.m_le
 
-    def add_vars(self, n: int) -> None:
-        if n <= 0:
-            return
-        if self._n == 0:
-            self._n = n
-            # Create tensors on the correct device and dtype
-            self._lb = torch.full((n,), -np.inf, device=self._device, dtype=self._dtype)
-            self._ub = torch.full((n,), +np.inf, device=self._device, dtype=self._dtype)
-        else:
-            old_n = self._n
-            self._n += n
-            # Extend tensors on the correct device and dtype
-            self._lb = torch.cat([self._lb, torch.full((n,), -np.inf, device=self._device, dtype=self._dtype)])
-            self._ub = torch.cat([self._ub, torch.full((n,), +np.inf, device=self._device, dtype=self._dtype)])
+        device = problem.lb.device
+        dtype = problem.lb.dtype
 
-    def add_binary_vars(self, n: int) -> List[int]:
-        start = self._n
-        self.add_vars(n)
-        idxs = list(range(start, start + n))
-        # relax to [0,1]
-        self._lb[idxs] = 0.0
-        self._ub[idxs] = 1.0
-        return idxs
-
-    def set_bounds(self, idxs: List[int], lb: np.ndarray, ub: np.ndarray) -> None:
-        # Convert to tensors with correct device and dtype
-        lb_t = torch.as_tensor(lb, device=self._device, dtype=self._dtype)
-        ub_t = torch.as_tensor(ub, device=self._device, dtype=self._dtype)
-        self._lb[idxs] = lb_t
-        self._ub[idxs] = ub_t
-
-    def add_lin_eq(self, vids: List[int], coeffs: List[float], rhs: float) -> None:
-        self._eq.append((vids, coeffs, rhs))
-
-    def add_lin_le(self, vids: List[int], coeffs: List[float], rhs: float) -> None:
-        self._le.append((vids, coeffs, rhs))
-
-    def add_lin_ge(self, vids: List[int], coeffs: List[float], rhs: float) -> None:
-        vids2 = vids
-        coeffs2 = [-float(a) for a in coeffs]
-        rhs2 = -float(rhs)
-        self._le.append((vids2, coeffs2, rhs2))
-
-    def add_sum_eq(self, vids: List[int], rhs: float) -> None:
-        coeffs = [1.0] * len(vids)
-        self.add_lin_eq(vids, coeffs, rhs)
-
-    def add_ge_zero(self, vids: List[int]) -> None:
-        for i in vids:
-            self.add_lin_le([i], [-1.0], 0.0)
-
-    def add_sos2(self, var_ids: List[int], weights: Optional[List[float]] = None) -> None:
-        return  # no-op
-
-    def set_objective_linear(self, vids: List[int], coeffs: List[float], const: float = 0.0, sense: str = "min") -> None:
-        self._objective = (vids, coeffs, float(const), "min" if sense != "max" else "max")
-
-    def optimize(self, timelimit: Optional[float] = None) -> None:
-        self._timelimit = timelimit
-        t_end = None if timelimit is None else (time.time() + float(timelimit))
-
+        total_vars = N * nvars
         eff_max_iter = self.max_iter
         eff_tol_feas = self.tol_feas
-        if self._n > self._large_n_threshold:
+        if total_vars > self._large_n_threshold:
             eff_max_iter = min(eff_max_iter, self._large_n_max_iter)
             eff_tol_feas = max(eff_tol_feas, self._large_n_tol)
 
-        # initialize x at box center (or zeros where infinite)
-        if self._x is None:
-            lb = torch.where(torch.isfinite(self._lb), self._lb, torch.zeros_like(self._lb))
-            ub = torch.where(torch.isfinite(self._ub), self._ub, torch.zeros_like(self._ub))
-            mid = 0.5 * (lb + ub)
-            both_inf = (~torch.isfinite(self._lb)) & (~torch.isfinite(self._ub))
-            mid = torch.where(both_inf, torch.zeros_like(mid), mid)
-            self._x = torch.nn.Parameter(mid.clone().to(device=self._device, dtype=self._dtype), requires_grad=True)
-        else:
-            self._x = torch.nn.Parameter(self._x.detach().to(device=self._device, dtype=self._dtype), requires_grad=True)
+        t_end = None if timelimit is None else (time.time() + float(timelimit))
 
-        vids, coeffs, c0, sense = self._objective
-        is_max = (sense == "max")
-        if vids:
-            vids_t = torch.as_tensor(vids, device=self._device, dtype=torch.long)
-            coeffs_t = torch.as_tensor(coeffs, device=self._device, dtype=self._dtype)
-        else:
-            vids_t = None
-            coeffs_t = None
-        const_term = float(c0)
+        lb = problem.lb
+        ub = problem.ub
 
-        lb = self._lb.to(device=self._device, dtype=self._dtype)
-        ub = self._ub.to(device=self._device, dtype=self._dtype)
+        lb_finite = torch.where(torch.isfinite(lb), lb, torch.zeros_like(lb))
+        ub_finite = torch.where(torch.isfinite(ub), ub, torch.zeros_like(ub))
+        mid = 0.5 * (lb_finite + ub_finite)
+        both_inf = (~torch.isfinite(lb)) & (~torch.isfinite(ub))
+        mid = torch.where(both_inf, torch.zeros_like(mid), mid)
+        x = torch.nn.Parameter(mid.clone().contiguous(), requires_grad=True)
 
-        def build_sparse(rows):
-            if not rows:
-                zero = torch.zeros((0,), device=self._device, dtype=self._dtype)
-                return None, zero
-            m = len(rows)
-            b = torch.empty((m,), device=self._device, dtype=self._dtype)
-            ri: List[int] = []
-            ci: List[int] = []
-            vals: List[float] = []
-            for r, (vids_row, coeffs_row, rhs) in enumerate(rows):
-                b[r] = float(rhs)
-                ri.extend([r] * len(vids_row))
-                ci.extend(vids_row)
-                vals.extend(coeffs_row)
-            if not vals:
-                idx = torch.zeros((2, 0), device=self._device, dtype=torch.long)
-                val_t = torch.zeros((0,), device=self._device, dtype=self._dtype)
-            else:
-                idx = torch.tensor([ri, ci], device=self._device, dtype=torch.long)
-                val_t = torch.as_tensor(vals, device=self._device, dtype=self._dtype)
-            A = torch.sparse_coo_tensor(idx, val_t, (m, self._n), device=self._device, dtype=self._dtype)
-            return A.coalesce(), b
+        has_eq = m_eq > 0
+        has_le = m_le > 0
+        A_eq = problem.A_eq_blockdiag.coalesce() if has_eq else None
+        A_le = problem.A_le_blockdiag.coalesce() if has_le else None
+        b_eq = problem.b_eq
+        b_le = problem.b_le
+        obj_c = problem.obj_c
+        obj_const = problem.obj_const
+        is_max = (problem.sense == "max")
 
-        Aeq, beq = build_sparse(self._eq)
-        Ale, ble = build_sparse(self._le)
+        opt = torch.optim.Adam(
+            [x],
+            lr=self.lr,
+            betas=(self.beta1, self.beta2),
+            weight_decay=self.weight_decay,
+        )
 
-        opt = torch.optim.Adam([self._x], lr=self.lr, betas=(self.beta1, self.beta2), weight_decay=self.weight_decay)
-        self._status = SolveStatus.UNKNOWN
-        self._has_solution = False
         best_max_viol = math.inf
         stagnation_steps = 0
-        viol_eq = None
-        viol_le = None
+        cached_v_eq: Optional[torch.Tensor] = None
+        cached_v_le: Optional[torch.Tensor] = None
 
         for it in range(eff_max_iter):
             if t_end is not None and time.time() >= t_end:
@@ -201,65 +113,244 @@ class TorchLPSolver(Solver):
 
             opt.zero_grad(set_to_none=True)
             with torch.enable_grad():
-                obj = 0.001 * (self._x * self._x).sum() + const_term
-                if vids_t is not None and coeffs_t is not None and vids_t.numel() > 0:
-                    obj = obj + torch.dot(coeffs_t, self._x.index_select(0, vids_t))
+                obj = (
+                    0.001 * (x * x).sum()
+                    + obj_const.sum()
+                    + (obj_c * x).sum()
+                )
                 if is_max:
                     obj = -obj
-
-                viol_eq = None if Aeq is None else torch.sparse.mm(Aeq, self._x.unsqueeze(1)).squeeze(1) - beq
-                if viol_eq is not None:
-                    obj = obj + self.rho_eq * (viol_eq * viol_eq).sum()
-
-                viol_le = None if Ale is None else torch.sparse.mm(Ale, self._x.unsqueeze(1)).squeeze(1) - ble
-                if viol_le is not None:
-                    obj = obj + self.rho_ineq * (torch.relu(viol_le) ** 2).sum()
-
+                x_flat = x.reshape(N * nvars).unsqueeze(1)
+                if has_eq and A_eq is not None:
+                    Ax_eq = torch.sparse.mm(A_eq, x_flat).squeeze(1)
+                    v_eq_mat = Ax_eq.view(N, m_eq) - b_eq
+                    obj = obj + self.rho_eq * (v_eq_mat * v_eq_mat).sum()
+                    cached_v_eq = v_eq_mat.detach()
+                if has_le and A_le is not None:
+                    Ax_le = torch.sparse.mm(A_le, x_flat).squeeze(1)
+                    v_le_mat = Ax_le.view(N, m_le) - b_le
+                    obj = obj + self.rho_ineq * (torch.relu(v_le_mat) ** 2).sum()
+                    cached_v_le = v_le_mat.detach()
                 obj.backward()
             opt.step()
 
             with torch.no_grad():
-                self._x.data.clamp_(lb, ub)
+                x.data.clamp_(lb, ub)
 
-            recompute = (it % self._feas_check_stride == 0)
             with torch.no_grad():
-                if recompute:
-                    v_eq = None if Aeq is None else torch.sparse.mm(Aeq, self._x.unsqueeze(1)).squeeze(1) - beq
-                    v_le = None if Ale is None else torch.sparse.mm(Ale, self._x.unsqueeze(1)).squeeze(1) - ble
-                else:
-                    v_eq = viol_eq
-                    v_le = viol_le
+                if it % self._feas_check_stride == 0:
+                    x_flat_no = x.reshape(N * nvars).unsqueeze(1)
+                    if has_eq and A_eq is not None:
+                        Ax_eq_no = torch.sparse.mm(A_eq, x_flat_no).squeeze(1)
+                        cached_v_eq = Ax_eq_no.view(N, m_eq) - b_eq
+                    if has_le and A_le is not None:
+                        Ax_le_no = torch.sparse.mm(A_le, x_flat_no).squeeze(1)
+                        cached_v_le = Ax_le_no.view(N, m_le) - b_le
 
-                max_viol = 0.0
-                if v_eq is not None and v_eq.numel() > 0:
-                    max_viol = max(max_viol, float(v_eq.abs().max().item()))
-                if v_le is not None and v_le.numel() > 0:
-                    max_viol = max(max_viol, float(torch.relu(v_le).max().item()))
+                max_viol_per_n = torch.zeros(N, device=device, dtype=dtype)
+                if has_eq and cached_v_eq is not None:
+                    max_viol_per_n = torch.maximum(
+                        max_viol_per_n,
+                        cached_v_eq.abs().max(dim=1).values,
+                    )
+                if has_le and cached_v_le is not None:
+                    max_viol_per_n = torch.maximum(
+                        max_viol_per_n,
+                        torch.relu(cached_v_le).max(dim=1).values,
+                    )
+                global_max_viol = float(max_viol_per_n.max().item())
 
-            if max_viol < best_max_viol - self._stagnation_tol:
-                best_max_viol = max_viol
+            if global_max_viol < best_max_viol - self._stagnation_tol:
+                best_max_viol = global_max_viol
                 stagnation_steps = 0
             else:
                 stagnation_steps += 1
 
-            if max_viol <= eff_tol_feas or stagnation_steps >= self._stagnation_patience:
+            if (
+                global_max_viol <= eff_tol_feas
+                or stagnation_steps >= self._stagnation_patience
+            ):
                 break
 
-        self._status = SolveStatus.SAT
-        self._has_solution = True
-        self._sol = self._x.detach().clone()
-
-    def status(self) -> str:
-        return self._status
-
-    def has_solution(self) -> bool:
-        return bool(self._has_solution)
-
-    def get_values(self, vids: List[int]) -> np.ndarray:
-        assert self._sol is not None, "No solution available"
         with torch.no_grad():
-            return self._sol[vids].detach().cpu().to(self._dtype).numpy()
+            max_viol_final = torch.zeros(N, device=device, dtype=dtype)
+            x_flat_final = x.reshape(N * nvars).unsqueeze(1)
+            if has_eq and A_eq is not None:
+                Ax_eq_f = torch.sparse.mm(A_eq, x_flat_final).squeeze(1)
+                v_eq_final = Ax_eq_f.view(N, m_eq) - b_eq
+                max_viol_final = torch.maximum(
+                    max_viol_final,
+                    v_eq_final.abs().max(dim=1).values,
+                )
+            if has_le and A_le is not None:
+                Ax_le_f = torch.sparse.mm(A_le, x_flat_final).squeeze(1)
+                v_le_final = Ax_le_f.view(N, m_le) - b_le
+                max_viol_final = torch.maximum(
+                    max_viol_final,
+                    torch.relu(v_le_final).max(dim=1).values,
+                )
 
-    def get_counterexample(self, input_ids: List[int]) -> np.ndarray:
-        # Already projected to box during optimize(); can return directly.
-        return self.get_values(input_ids)
+            # Penalty-on-Adam CANNOT certify infeasibility (C2 invariant).
+            statuses = tuple(
+                SolveStatus.SAT
+                if float(max_viol_final[i].item()) <= eff_tol_feas
+                else SolveStatus.UNKNOWN
+                for i in range(N)
+            )
+            x_out = x.detach().clone()
+
+        return BatchLPSolution(
+            statuses=statuses,
+            x=x_out,
+            max_viol=max_viol_final,
+        )
+
+
+def _empty_blockdiag_local(N: int, m: int, nvars: int) -> torch.Tensor:
+    return torch.sparse_coo_tensor(
+        torch.zeros((2, 0), dtype=torch.long),
+        torch.zeros(0),
+        (N * m, N * nvars),
+    )
+
+
+def _test_solve_batch_n1_sat_feasible():
+    N, nvars = 1, 1
+    problem = BatchLPProblem(
+        nvars=nvars,
+        m_eq=0,
+        m_le=0,
+        lb=torch.zeros(N, nvars),
+        ub=torch.ones(N, nvars),
+        A_eq_blockdiag=_empty_blockdiag_local(N, 0, nvars),
+        b_eq=torch.zeros(N, 0),
+        A_le_blockdiag=_empty_blockdiag_local(N, 0, nvars),
+        b_le=torch.zeros(N, 0),
+        obj_c=torch.tensor([[1.0]]),
+        obj_const=torch.zeros(N),
+    )
+    sol = TorchLPSolver().solve_batch(problem)
+    assert sol.statuses == (SolveStatus.SAT,), f"got {sol.statuses}"
+    assert sol.x.shape == (N, nvars), f"got shape {tuple(sol.x.shape)}"
+    assert sol.max_viol.shape == (N,)
+    assert float(sol.max_viol[0].item()) <= 1e-4, (
+        f"max_viol[0]={float(sol.max_viol[0].item())} > tol"
+    )
+    x00 = float(sol.x[0, 0].item())
+    assert 0.0 <= x00 <= 1.0, f"x[0,0]={x00} outside [0, 1]"
+
+
+def _test_solve_batch_n4_homogeneous():
+    N, nvars = 4, 1
+    problem = BatchLPProblem(
+        nvars=nvars,
+        m_eq=0,
+        m_le=0,
+        lb=torch.zeros(N, nvars),
+        ub=torch.ones(N, nvars),
+        A_eq_blockdiag=_empty_blockdiag_local(N, 0, nvars),
+        b_eq=torch.zeros(N, 0),
+        A_le_blockdiag=_empty_blockdiag_local(N, 0, nvars),
+        b_le=torch.zeros(N, 0),
+        obj_c=torch.ones(N, nvars),
+        obj_const=torch.zeros(N),
+    )
+    sol = TorchLPSolver().solve_batch(problem)
+    assert sol.statuses == (SolveStatus.SAT,) * N, f"got {sol.statuses}"
+    assert sol.x.shape == (N, nvars)
+    assert sol.max_viol.shape == (N,)
+    for i in range(N):
+        assert float(sol.max_viol[i].item()) <= 1e-4
+        assert 0.0 <= float(sol.x[i, 0].item()) <= 1.0
+    x0 = sol.x[0, 0].item()
+    for i in range(1, N):
+        assert sol.x[i, 0].item() == x0, (
+            f"sub-LP {i} diverged from sub-LP 0: {sol.x[i,0].item()} vs {x0}"
+        )
+
+
+def _test_solve_batch_n4_mixed():
+    N, nvars = 4, 1
+    m_le = 1
+    # Block-diagonal A_le shape (N*m_le, N*nvars) = (4, 4). Instances 0,1 have
+    # no non-zero row (trivial 0 <= 1); instances 2,3 encode x >= 3 (i.e.
+    # -x <= -3), infeasible against box [0, 1]. Block (i, i) lives at row i,
+    # column i because nvars = m_le = 1.
+    indices = torch.tensor([[2, 3], [2, 3]], dtype=torch.long)
+    values = torch.tensor([-1.0, -1.0])
+    A_le = torch.sparse_coo_tensor(indices, values, (N * m_le, N * nvars))
+    b_le = torch.tensor([[1.0], [1.0], [-3.0], [-3.0]])
+    problem = BatchLPProblem(
+        nvars=nvars,
+        m_eq=0,
+        m_le=m_le,
+        lb=torch.zeros(N, nvars),
+        ub=torch.ones(N, nvars),
+        A_eq_blockdiag=_empty_blockdiag_local(N, 0, nvars),
+        b_eq=torch.zeros(N, 0),
+        A_le_blockdiag=A_le,
+        b_le=b_le,
+        obj_c=torch.zeros(N, nvars),
+        obj_const=torch.zeros(N),
+    )
+    sol = TorchLPSolver().solve_batch(problem)
+    assert sol.statuses == (
+        SolveStatus.SAT,
+        SolveStatus.SAT,
+        SolveStatus.UNKNOWN,
+        SolveStatus.UNKNOWN,
+    ), f"got {sol.statuses}"
+    assert sol.x.shape == (N, nvars)
+    assert sol.max_viol.shape == (N,)
+
+
+def _test_solve_batch_max_viol_correct():
+    """SAT instances have max_viol <= tol_feas; UNKNOWN have max_viol > tol_feas."""
+    N, nvars = 4, 1
+    m_le = 1
+    indices = torch.tensor([[2, 3], [2, 3]], dtype=torch.long)
+    values = torch.tensor([-1.0, -1.0])
+    A_le = torch.sparse_coo_tensor(indices, values, (N * m_le, N * nvars))
+    b_le = torch.tensor([[1.0], [1.0], [-3.0], [-3.0]])
+    problem = BatchLPProblem(
+        nvars=nvars,
+        m_eq=0,
+        m_le=m_le,
+        lb=torch.zeros(N, nvars),
+        ub=torch.ones(N, nvars),
+        A_eq_blockdiag=_empty_blockdiag_local(N, 0, nvars),
+        b_eq=torch.zeros(N, 0),
+        A_le_blockdiag=A_le,
+        b_le=b_le,
+        obj_c=torch.zeros(N, nvars),
+        obj_const=torch.zeros(N),
+    )
+    solver = TorchLPSolver()
+    sol = solver.solve_batch(problem)
+    tol = solver.tol_feas
+    sat_viols = [float(sol.max_viol[i].item()) for i in (0, 1)]
+    unk_viols = [float(sol.max_viol[i].item()) for i in (2, 3)]
+    for v in sat_viols:
+        assert v <= tol, f"SAT instance had max_viol={v} > tol={tol}"
+    for v in unk_viols:
+        assert v > tol, f"UNKNOWN instance had max_viol={v} <= tol={tol}"
+
+
+if __name__ == "__main__":
+    import sys
+    tests = [
+        _test_solve_batch_n1_sat_feasible,
+        _test_solve_batch_n4_homogeneous,
+        _test_solve_batch_n4_mixed,
+        _test_solve_batch_max_viol_correct,
+    ]
+    failed = 0
+    for t in tests:
+        try:
+            t()
+            print(f"PASS  {t.__name__}")
+        except Exception as e:
+            print(f"FAIL  {t.__name__}: {e}")
+            failed += 1
+    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    sys.exit(failed)

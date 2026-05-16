@@ -30,7 +30,7 @@ jobs:
 
       - name: Clean pip cache
         run: |
-          pip cache purge || true
+          pip cache purge
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,12 +38,12 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.9"
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install coverage torch torchvision onnx onnx2torch tensorflow pandas numpy pyyaml tqdm pytest psutil transformers scikit-learn
+          pip install coverage torch torchvision onnx onnx2torch tensorflow pandas numpy pyyaml tqdm psutil transformers scikit-learn
 
       - name: Download CIFAR-100 benchmark
         run: |
@@ -80,17 +80,56 @@ jobs:
           cd ${{ github.workspace }}
           coverage run -p --source=act -m act.pipeline --search cifar
 
+      - name: Verify act2torch round-trip on example nets
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p --source=act -m act.pipeline --verify act2torch --device cpu --dtype float64
+
+      - name: Validate verifier counterexample mode
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p --source=act -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float64
+
+      - name: Validate verifier bounds mode (interval)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p --source=act -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float64 --tf-modes interval
+
+      - name: Validate verifier bounds mode (hybridz)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p --source=act -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float64 --tf-modes hybridz
+
+      - name: Validate verifier bounds mode (dual)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p --source=act -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float64 --tf-modes dual
+
+      - name: VNNLIB real-instance coverage (tiny test fixtures) + execution tracing
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p --source=act -m act.pipeline --fuzz --category test --max-instances 5 --timeout 10 --iterations 50 --trace-level 1 --trace-sample 5
+          # Exercise trace_reader.py on the freshest trace file produced above.
+          # Default CLI output is Path("fuzzing_results") which is CWD-relative; the
+          # YAML-loaded normalization only applies when the value enters as a string,
+          # so the actual landing site is <cwd>/fuzzing_results/traces_*.json. We
+          # also check the YAML-normalized path for robustness.
+          TRACE_FILE=$(ls -1 fuzzing_results/traces_*.json act/pipeline/log/fuzzing_results/traces_*.json 2>/dev/null | head -1)
+          if [ -n "$TRACE_FILE" ]; then
+            coverage run -p --source=act -m act.pipeline.fuzzing.trace_reader "$TRACE_FILE" --summary
+          fi
+
       - name: Combine coverage data
         if: always()
         run: |
           cd ${{ github.workspace }}
-          coverage combine || true
-          coverage xml -o coverage.xml || true
-          coverage report || true
+          coverage combine
+          coverage xml -o coverage.xml
+          coverage report
 
       - name: Upload coverage to Codecov
         if: always()
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           files: ./coverage.xml
           flags: pipeline

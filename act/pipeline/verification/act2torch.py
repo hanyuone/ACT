@@ -232,7 +232,13 @@ class ActGraphModule(nn.Module):
             target = layer.params.get("target_shape") or layer.params.get("output_shape")
             if target is None:
                 return inputs[0]
-            return inputs[0].reshape(*target)
+            # target encodes a per-sample shape (leading dim is conceptual
+            # batch slot = 1 in the template). At runtime the input carries
+            # the actual batch B from VerifiableModel batchification, so
+            # substitute B for the leading dim rather than reshaping literally
+            # — otherwise B>1 fails with "shape '[1, n]' invalid for input of
+            # size B*n".
+            return inputs[0].reshape(inputs[0].shape[0], *target[1:])
         if kind == LayerKind.MAX.value:
             if len(inputs) < 2:
                 raise RuntimeError(
@@ -352,6 +358,24 @@ class ActGraphModule(nn.Module):
             indices_per_dim = tuple(idx_long[..., d] for d in range(idx_long.shape[-1]))
             out.index_put_(indices_per_dim, upd, accumulate=False)
             return out
+        if kind == LayerKind.PAD.value:
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"ActGraphModule: PAD layer {layer.id} expects exactly 1 input, "
+                    f"got {len(inputs)}."
+                )
+            import torch.nn.functional as F
+            pad = layer.params.get("pad")
+            if pad is None:
+                pad = layer.params.get("pads")
+            if pad is None:
+                return inputs[0].clone()
+            pad_list = [int(p) for p in pad]
+            mode = str(layer.params.get("mode", "constant")).lower()
+            if mode == "constant":
+                value = float(layer.params.get("value", 0.0))
+                return F.pad(inputs[0], pad_list, mode=mode, value=value)
+            return F.pad(inputs[0], pad_list, mode=mode)
         if kind == LayerKind.MASK_ADD.value:
             if len(inputs) != 1:
                 raise RuntimeError(
@@ -404,62 +428,66 @@ class ActGraphModule(nn.Module):
                 )
             p = float(layer.params["p"])
             return torch.pow(torch.clamp(inputs[0], min=0.0), p)
-        if kind in (LayerKind.MAX.value, LayerKind.MIN.value):
-            if len(inputs) < 2:
+        if kind == LayerKind.SUB.value:
+            if len(inputs) != 2:
                 raise RuntimeError(
-                    f"ActGraphModule: {kind} layer {layer.id} expects at least 2 inputs, "
+                    f"ActGraphModule: SUB layer {layer.id} expects exactly 2 inputs, "
                     f"got {len(inputs)}."
                 )
-            stacked = torch.stack(list(inputs), dim=0)
-            reduce_fn = stacked.amax if kind == LayerKind.MAX.value else stacked.amin
-            return reduce_fn(dim=0)
-        if kind == LayerKind.RELU6.value:
+            return inputs[0] - inputs[1]
+        if kind == LayerKind.DIV.value:
+            if len(inputs) != 2:
+                raise RuntimeError(
+                    f"ActGraphModule: DIV layer {layer.id} expects exactly 2 inputs, "
+                    f"got {len(inputs)}."
+                )
+            return inputs[0] / inputs[1]
+        if kind == LayerKind.ABS.value:
             if len(inputs) != 1:
                 raise RuntimeError(
-                    f"ActGraphModule: RELU6 layer {layer.id} expects exactly 1 input, "
+                    f"ActGraphModule: ABS layer {layer.id} expects exactly 1 input, "
                     f"got {len(inputs)}."
                 )
-            return torch.clamp(inputs[0], min=0.0, max=6.0)
-        if kind == LayerKind.HARDTANH.value:
+            return torch.abs(inputs[0])
+        if kind == LayerKind.BN.value:
             if len(inputs) != 1:
                 raise RuntimeError(
-                    f"ActGraphModule: HARDTANH layer {layer.id} expects exactly 1 input, "
+                    f"ActGraphModule: BN layer {layer.id} expects exactly 1 input, "
                     f"got {len(inputs)}."
                 )
-            min_val = float(layer.params.get("min_val", -1.0))
-            max_val = float(layer.params.get("max_val", 1.0))
-            return torch.clamp(inputs[0], min=min_val, max=max_val)
-        if kind == LayerKind.HARDSIGMOID.value:
+            A = layer.params["A"].to(device=inputs[0].device, dtype=inputs[0].dtype)
+            c = layer.params["c"].to(device=inputs[0].device, dtype=inputs[0].dtype)
+            return A * inputs[0] + c
+        if kind == LayerKind.SLICE.value:
             if len(inputs) != 1:
                 raise RuntimeError(
-                    f"ActGraphModule: HARDSIGMOID layer {layer.id} expects exactly 1 input, "
+                    f"ActGraphModule: SLICE layer {layer.id} expects exactly 1 input, "
                     f"got {len(inputs)}."
                 )
-            alpha = float(layer.params.get("alpha", 1.0 / 6.0))
-            beta = float(layer.params.get("beta", 0.5))
-            return torch.clamp(alpha * inputs[0] + beta, min=0.0, max=1.0)
-        if kind == LayerKind.HARDSWISH.value:
+            starts = layer.params["starts"]
+            ends = layer.params["ends"]
+            axes = layer.params.get("axes")
+            x = inputs[0]
+            if axes is None:
+                axes = list(range(len(starts)))
+            # Axis indices in the slice spec are 0-based over the per-sample
+            # spatial layout (excluding batch dim). At forward time the tensor
+            # carries the leading batch dim, so shift each axis by +1.
+            for s, e, a in zip(starts, ends, axes):
+                x = x.narrow(int(a) + 1, int(s), int(e) - int(s))
+            return x
+        if kind == LayerKind.GATHER.value:
             if len(inputs) != 1:
                 raise RuntimeError(
-                    f"ActGraphModule: HARDSWISH layer {layer.id} expects exactly 1 input, "
+                    f"ActGraphModule: GATHER layer {layer.id} expects exactly 1 input, "
                     f"got {len(inputs)}."
                 )
-            return inputs[0] * torch.clamp(inputs[0] + 3.0, min=0.0, max=6.0) / 6.0
-        if kind == LayerKind.MISH.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: MISH layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            import torch.nn.functional as F
-            return inputs[0] * torch.tanh(F.softplus(inputs[0]))
-        if kind == LayerKind.SOFTSIGN.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: SOFTSIGN layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            return inputs[0] / (1.0 + torch.abs(inputs[0]))
+            indices = layer.params["indices"]
+            axis = int(layer.params.get("axis", 0))
+            # Same per-sample-axis convention as SLICE: shift by +1 to skip
+            # the leading batch dimension restored by VerifiableModel.
+            idx = torch.as_tensor(indices, dtype=torch.long, device=inputs[0].device)
+            return torch.index_select(inputs[0], dim=axis + 1, index=idx)
         raise NotImplementedError(
             f"ActGraphModule: functional layer kind '{kind}' (id={layer.id}) not supported."
         )
