@@ -9,8 +9,11 @@ Copyright (C) 2025 SVF-tools/ACT
 License: AGPLv3+
 """
 
+import logging
 from typing import Dict, Tuple, Optional, List
 from act.front_end.spec_creator_base import BaseSpecCreator
+
+logger = logging.getLogger(__name__)
 
 
 class CreatorRegistry:
@@ -143,16 +146,18 @@ class CreatorRegistry:
             from act.front_end.torchvision_loader.data_model_mapping import find_dataset_name
             tv_name = find_dataset_name(name)
             torchvision_match = True
-        except ValueError:
-            pass
+        except ValueError as e:
+            # Intentional: auto-detection probe; name not in TorchVision is normal, try VNNLIB next.
+            logger.debug("suppressed: %s", e)
         
         # Try VNNLIB
         try:
             from act.front_end.vnnlib_loader.category_mapping import find_category_name
             vnnlib_name = find_category_name(name)
             vnnlib_match = True
-        except ValueError:
-            pass
+        except ValueError as e:
+            # Intentional: auto-detection probe; absence in VNNLIB is reported via the match flags below.
+            logger.debug("suppressed: %s", e)
         
         # Handle results
         if torchvision_match and vnnlib_match:

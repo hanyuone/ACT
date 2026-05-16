@@ -439,6 +439,10 @@ def main():
         print("⚠️  Some models had issues - see details above")
     print("=" * 80)
 
+    if not all_passed:
+        import sys
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

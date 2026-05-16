@@ -292,6 +292,8 @@ class AsyncTraceStorage(TraceStorage):
                 self.backend.write(trace)
                 self.queue.task_done()
             except queue.Empty:
+                # Intentional: queue.Empty is the 100ms polling signal, not an error;
+                # logger.debug omitted to avoid log spam at ~10Hz while idle.
                 continue
     
     def flush(self):

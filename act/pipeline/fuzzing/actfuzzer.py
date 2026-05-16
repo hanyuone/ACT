@@ -270,10 +270,7 @@ class ACTFuzzer:
         self.config = config or FuzzingConfig.from_yaml()
         self.device = get_default_device()
 
-        # Use wrapped model directly (already on correct device from model_synthesis).
-        # VerifiableModel supports batch inference natively — spec layers check constraints
-        # without modifying tensors, so the batch dimension is consistent throughout.
-        self.model = wrapped_model
+        self.model = wrapped_model.to(self.device)
 
         # Extract specs for MutationEngine (projection) and PropertyChecker (violation detection).
         self.input_spec = self._extract_spec(InputSpecLayer)

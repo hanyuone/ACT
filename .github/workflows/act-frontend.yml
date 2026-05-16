@@ -30,7 +30,7 @@ jobs:
 
       - name: Clean pip cache
         run: |
-          pip cache purge || true
+          pip cache purge
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,12 +38,12 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.9"
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install coverage torch torchvision onnx onnx2torch tensorflow pandas numpy pyyaml tqdm pytest psutil transformers scikit-learn
+          pip install coverage torch torchvision onnx onnx2torch tensorflow pandas numpy pyyaml tqdm psutil transformers scikit-learn
 
       - name: Run VNNLIB Data-Model and Synthesis
         run: |
@@ -60,6 +60,23 @@ jobs:
           coverage run -p --source=act -m act.front_end --list-downloads
           coverage run -p --source=act -m act.front_end --synthesis --creator torchvision
 
+      - name: List torchvision loader datasets (CLI coverage)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p --source=act -m act.front_end.torchvision_loader --list
+
+      - name: List vnnlib loader categories (CLI coverage)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p --source=act -m act.front_end.vnnlib_loader --list
+
+      - name: Run front_end CLI commands (creator registry, info)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p --source=act -m act.front_end --help
+          coverage run -p --source=act -m act.front_end --list-creators
+          coverage run -p --source=act -m act.front_end --info-creator vnnlib
+
       - name: Generate Networks for Testing
         run: |
           cd ${{ github.workspace }}
@@ -75,17 +92,22 @@ jobs:
           cd ${{ github.workspace }}
           coverage run -p --source=act -m act.pipeline --verify torch2act --device cpu --dtype float64
 
+      - name: Run frontend fuzzing (acasxu_2023, light smoke)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p --source=act -m act.pipeline --fuzz --category acasxu_2023 --max-instances 2 --timeout 10 --iterations 50
+
       - name: Combine coverage data
         if: always()
         run: |
           cd ${{ github.workspace }}
-          coverage combine || true
-          coverage xml -o coverage.xml || true
-          coverage report || true
+          coverage combine
+          coverage xml -o coverage.xml
+          coverage report
 
       - name: Upload coverage to Codecov
         if: always()
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           files: ./coverage.xml
           flags: frontend

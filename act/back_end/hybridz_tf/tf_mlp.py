@@ -229,16 +229,15 @@ def tf_abs(L, bounds, tf):
 
 
 def tf_bn(L, bounds, tf):
-    hz_in = tf._hz_cache.get(L.id)
-    if hz_in is not None:
-        A = L.params["A"].to(hz_in.c).flatten()
-        c = L.params["c"].to(hz_in.c)
-        hz = hz_multiply(hz_in, torch.diag(A))
-        tf._hz_cache[L.id] = hz_add_const(hz, c.view(-1, 1) if c.ndim == 1 else c)
-    fact = interval.tf_bn(L, bounds)
-    if hz_in is not None:
-        return _hz_fact(fact, tf._hz_cache[L.id])
-    return fact
+    # BN's HZ refinement built a per-sample diag(A) of shape (n, n) and tried
+    # to multiply with hz_in.c of shape (B*n, 1). That only works for B=1;
+    # at B>1 it raises "mat1 and mat2 shapes cannot be multiplied" because
+    # the HZ row layout flattens batch×feature into a single leading dim.
+    # A batch-aware fix would require block-diag(A) replicated B times, which
+    # is the same scope as a proper HZ batchify rewrite. Until that lands,
+    # fall back to interval (sound, works at any B).
+    tf._hz_cache[L.id] = None
+    return interval.tf_bn(L, bounds)
 
 
 def tf_add(L, bounds, tf):
@@ -416,7 +415,8 @@ def hz_apply_relu(hz: HZono) -> HZono:
     active = lb >= 0
     inactive = ub <= 0
     unstable = ~active & ~inactive
-    k = int(unstable.sum().item())
+    unstable_idx = torch.where(unstable)[0]
+    k = len(unstable_idx)
 
     out_Gc = hz.c.new_zeros(n, ng + 4 * k)
     out_Gb = hz.c.new_zeros(n, nb + k)
@@ -437,7 +437,6 @@ def hz_apply_relu(hz: HZono) -> HZono:
             b=hz.b.clone(),
         )
 
-    unstable_idx = torch.where(unstable)[0]
     alpha = lb[unstable_idx]
     beta = ub[unstable_idx]
     t = torch.arange(k, device=device)
@@ -528,7 +527,8 @@ def hz_apply_leaky_relu(hz: HZono, alpha_arg: float) -> HZono:
     active = lb >= 0
     inactive = ub <= 0
     unstable = ~active & ~inactive
-    k = int(unstable.sum().item())
+    unstable_idx = torch.where(unstable)[0]
+    k = len(unstable_idx)
 
     out_Gc = hz.c.new_zeros(n, ng + 4 * k)
     out_Gb = hz.c.new_zeros(n, nb + k)
@@ -554,7 +554,6 @@ def hz_apply_leaky_relu(hz: HZono, alpha_arg: float) -> HZono:
             b=hz.b.clone(),
         )
 
-    unstable_idx = torch.where(unstable)[0]
     alpha = lb[unstable_idx]
     beta = ub[unstable_idx]
     t = torch.arange(k, device=device)

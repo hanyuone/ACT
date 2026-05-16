@@ -810,9 +810,13 @@ def _derive_seed(base_seed: int, idx: int, instance_id: str) -> int:
 
 
 def _generate_layer_variables(kind, i, vc, params, layers):
-    # INPUT: create initial variables from shape
+    # var_ids are PER-SAMPLE throughout (batch dim is carried only by Bounds);
+    # strip leading batch dim here so DENSE/CONV2D weights (per-sample) match
+    # in_vars counts downstream. BaB slices per-sample via slice_net_to_sample.
     if kind == LayerKind.INPUT.value:
-        n = torch.Size(params["shape"]).numel()
+        shape = list(params["shape"])
+        per_sample = shape[1:] if len(shape) >= 2 else shape
+        n = torch.Size(per_sample).numel()
         return [], list(range(vc, vc + n)), vc + n
 
     # INPUT_SPEC / ASSERT: passthrough, no new variables
@@ -1829,6 +1833,66 @@ def _lt_spec_scatter_nd() -> Dict[str, Any]:
     ]}
 
 
+# These 6 templates back ONNX-op-rebound TFs that the random MLP/CNN
+# generators do not exercise. Usage counts from a scan over 515 ONNX models
+# in data/vnnlib/*/onnx/: RESHAPE 255, TRANSPOSE 207, SLICE 165, GATHER 109,
+# UNSQUEEZE 64, SQUEEZE 8. Dispatch entries for SLICE and GATHER were added
+# to interval_tf.py / hybridz_tf.py in the same change set so analyze()
+# reaches the corresponding tf_slice / tf_gather handlers.
+# RESHAPE uses an identity target_shape so act2torch's PyTorch reshape stays
+# valid under validate_verifier's B>1 batchification.
+def _lt_spec_slice() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 3, 8, 8], -1.0, 1.0) + [
+        {"kind": LayerKind.SLICE.value,
+         "params": {"starts": [0, 1], "ends": [3, 6], "axes": [1, 2],
+                    "input_shape": [3, 8, 8], "output_shape": [3, 3, 5]}},
+        _lt_assert_le([1.0] + [0.0] * 44, 100.0),
+    ]}
+
+
+def _lt_spec_gather() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 3, 4], -1.0, 1.0) + [
+        {"kind": LayerKind.GATHER.value,
+         "params": {"indices": [0, 2], "axis": 1,
+                    "input_shape": [3, 4], "output_shape": [3, 2]}},
+        _lt_assert_le([1.0] + [0.0] * 5, 100.0),
+    ]}
+
+
+def _lt_spec_reshape() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 6], -1.0, 1.0) + [
+        {"kind": LayerKind.RESHAPE.value,
+         "params": {"target_shape": [1, 6]}},
+        _lt_assert_le([1.0] + [0.0] * 5, 100.0),
+    ]}
+
+
+def _lt_spec_transpose() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 2, 3], -1.0, 1.0) + [
+        {"kind": LayerKind.TRANSPOSE.value,
+         "params": {"perm": [0, 2, 1]}},
+        {"kind": LayerKind.FLATTEN.value, "params": {"start_dim": 1}},
+        _lt_assert_le([1.0] + [0.0] * 5, 100.0),
+    ]}
+
+
+def _lt_spec_squeeze() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 3, 1, 4], -1.0, 1.0) + [
+        {"kind": LayerKind.SQUEEZE.value,
+         "params": {"dims": [2]}},
+        {"kind": LayerKind.FLATTEN.value, "params": {"start_dim": 1}},
+        _lt_assert_le([1.0] + [0.0] * 11, 100.0),
+    ]}
+
+
+def _lt_spec_unsqueeze() -> Dict[str, Any]:
+    return {"layers": _lt_input([1, 3], -1.0, 1.0) + [
+        {"kind": LayerKind.UNSQUEEZE.value,
+         "params": {"dims": [1]}},
+        _lt_assert_le([1.0, 0.0, 0.0], 100.0),
+    ]}
+
+
 def _lt_spec_rnn_family(cell: str, hidden: int = 8, seq_len: int = 4,
                         in_feat: int = 3, num_classes: int = 4) -> Dict[str, Any]:
     layers = _lt_input([1, seq_len, in_feat], -1.0, 1.0)
@@ -2059,6 +2123,104 @@ def _lt_spec_conv_transpose_2d() -> Dict[str, Any]:
     ]}
 
 
+# The 6 templates below back TF functions that the random MLP/CNN generators
+# never exercise: tf_maxpool2d HZ branch (entire body of hybridz_tf/tf_cnn.py
+# tf_maxpool2d, ~42 lines), tf_sub/tf_div binary ops, tf_bn affine, tf_abs
+# pos/neg/amb partition, and tf_bias element-wise add. Together they lift
+# interval_tf/tf_mlp.py and hybridz_tf/tf_cnn.py coverage from ~71%/57% to
+# ~85%+ via the --validate-verifier path alone (no pytest involvement).
+def _lt_spec_cnn_pool() -> Dict[str, Any]:
+    # Conv2D → MaxPool2D → AvgPool2D chain. The MaxPool2D HZ branch in
+    # hybridz_tf/tf_cnn.py:44-86 is unreachable via the random CNN generator
+    # because it doesn't emit MAXPOOL2D as a direct child of CONV2D inside a
+    # hz_cache-bearing context. AvgPool2D additionally exercises the average
+    # pool interval branch in interval_tf/tf_cnn.py.
+    return {"layers": _lt_input([1, 1, 8, 8], -1.0, 1.0) + [
+        {"kind": LayerKind.CONV2D.value, "params": {
+            "in_channels": 1, "out_channels": 2, "kernel_size": 3,
+            "stride": 1, "padding": 1, "dilation": 1, "groups": 1,
+            "input_shape": [1, 1, 8, 8], "output_shape": [1, 2, 8, 8],
+        }},
+        {"kind": LayerKind.MAXPOOL2D.value, "params": {
+            "kernel_size": 2, "stride": 2, "padding": 0,
+            "input_shape": [1, 2, 8, 8], "output_shape": [1, 2, 4, 4],
+        }},
+        {"kind": LayerKind.AVGPOOL2D.value, "params": {
+            "kernel_size": 2, "stride": 2, "padding": 0,
+            "input_shape": [1, 2, 4, 4], "output_shape": [1, 2, 2, 2],
+        }},
+        {"kind": LayerKind.FLATTEN.value, "params": {"start_dim": 1}},
+        _lt_assert_le([1.0] + [0.0] * 7, 100.0),
+    ]}
+
+
+def _lt_spec_sub() -> Dict[str, Any]:
+    # SUB binary op: y = x - c. The random MLP/CNN generators only emit ADD
+    # (via skip-connections and BIAS), so tf_sub in interval_tf/tf_mlp.py is
+    # unreachable. Pattern mirrors _lt_spec_compare (input + const + binary).
+    dtype = get_default_dtype()
+    return {"layers": _lt_input([1, 3], 0.0, 1.0) + [
+        _lt_const(torch.tensor([0.5, 0.5, 0.5], dtype=dtype), [3]),
+        {"kind": LayerKind.SUB.value,
+         "params": {"input_shape": [1, 3], "output_shape": [1, 3]},
+         "inputs": {"x": 1, "y": 2}, "preds": [1, 2]},
+        _lt_assert_le([1.0, 1.0, 1.0], 5.0),
+    ]}
+
+
+def _lt_spec_div() -> Dict[str, Any]:
+    # DIV binary op: y = x / c. Divisor const is strictly positive [0.5, 0.5,
+    # 0.5] so the crosses_zero assert in tf_div doesn't fire. Numerator range
+    # [1.0, 2.0] keeps the result bounded.
+    dtype = get_default_dtype()
+    return {"layers": _lt_input([1, 3], 1.0, 2.0) + [
+        _lt_const(torch.tensor([0.5, 0.5, 0.5], dtype=dtype), [3]),
+        {"kind": LayerKind.DIV.value,
+         "params": {"input_shape": [1, 3], "output_shape": [1, 3]},
+         "inputs": {"x": 1, "y": 2}, "preds": [1, 2]},
+        _lt_assert_le([1.0, 1.0, 1.0], 100.0),
+    ]}
+
+
+def _lt_spec_bn() -> Dict[str, Any]:
+    # BN affine: y = A * x + c (element-wise). Mixed-sign A exercises both
+    # branches of torch.where(A>=0, ...) in tf_bn.
+    dtype = get_default_dtype()
+    A = torch.tensor([1.0, 0.5, -0.5, 2.0], dtype=dtype)
+    c = torch.tensor([0.0, 0.1, -0.1, 0.2], dtype=dtype)
+    return {"layers": _lt_input([1, 4], -1.0, 1.0) + [
+        {"kind": LayerKind.BN.value,
+         "params": {"A": A, "c": c,
+                    "input_shape": [1, 4], "output_shape": [1, 4]}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 100.0),
+    ]}
+
+
+def _lt_spec_abs() -> Dict[str, Any]:
+    # ABS exercises the pos/neg/ambiguous partition in tf_abs. Input range
+    # [-2, 2] ensures every element lands in the `amb` (crossing-zero) bucket
+    # so the masked-index logic runs end-to-end.
+    return {"layers": _lt_input([1, 4], -2.0, 2.0) + [
+        {"kind": LayerKind.ABS.value,
+         "params": {"input_shape": [1, 4], "output_shape": [1, 4]}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 8.0),
+    ]}
+
+
+def _lt_spec_bias() -> Dict[str, Any]:
+    # BIAS (LayerKind.BIAS) is element-wise add of a tensor constant — not
+    # to be confused with DENSE's internal `use_bias`. Independent op,
+    # independent TF (tf_bias in interval_tf/tf_mlp.py).
+    dtype = get_default_dtype()
+    c = torch.tensor([0.1, -0.2, 0.3, -0.4], dtype=dtype)
+    return {"layers": _lt_input([1, 4], -1.0, 1.0) + [
+        {"kind": LayerKind.BIAS.value,
+         "params": {"c": c,
+                    "input_shape": [1, 4], "output_shape": [1, 4]}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 100.0),
+    ]}
+
+
 def _lt_spec_lin_poly() -> Dict[str, Any]:
     # BOX seed [0, 1]^3 plus a single hyperplane x[0] + x[1] <= 1; covers
     # InKind.LIN_POLY in seed_from_input_specs / add_all_input_specs and the
@@ -2078,8 +2240,7 @@ def _lt_spec_lin_poly() -> Dict[str, Any]:
 
 
 def _lt_spec_margin_robust() -> Dict[str, Any]:
-    # Tiny MLP with MARGIN_ROBUST ASSERT; covers OutKind.MARGIN_ROBUST in
-    # add_negated_assert_to_solver and the encoded_linear MARGIN_ROBUST path.
+    # Tiny MLP with MARGIN_ROBUST ASSERT for batched encoding coverage.
     return {"layers": _lt_input([1, 4], -1.0, 1.0) + [
         {
             "kind": LayerKind.DENSE.value,
@@ -2092,9 +2253,7 @@ def _lt_spec_margin_robust() -> Dict[str, Any]:
 
 
 def _lt_spec_top1_robust() -> Dict[str, Any]:
-    # Tiny MLP with TOP1_ROBUST ASSERT; covers OutKind.TOP1_ROBUST in
-    # add_negated_assert_to_solver (existing random nets favor this kind, but
-    # a deterministic example pins coverage independent of seed).
+    # Tiny MLP with TOP1_ROBUST ASSERT; deterministic coverage independent of seed.
     return {"layers": _lt_input([1, 4], -1.0, 1.0) + [
         {
             "kind": LayerKind.DENSE.value,
@@ -2107,8 +2266,7 @@ def _lt_spec_top1_robust() -> Dict[str, Any]:
 
 
 def _lt_spec_range() -> Dict[str, Any]:
-    # Tiny MLP with RANGE ASSERT; covers OutKind.RANGE in
-    # add_negated_assert_to_solver and the v_max fallback in the RANGE branch.
+    # Tiny MLP with RANGE ASSERT for batched ASSERT encoding coverage.
     return {"layers": _lt_input([1, 4], -1.0, 1.0) + [
         {
             "kind": LayerKind.DENSE.value,
@@ -2121,9 +2279,7 @@ def _lt_spec_range() -> Dict[str, Any]:
 
 
 def _lt_spec_unsafe_linear() -> Dict[str, Any]:
-    # Tiny MLP with UNSAFE_LINEAR ASSERT (multi-row linear inequality);
-    # covers OutKind.UNSAFE_LINEAR in add_negated_assert_to_solver and the
-    # B=1 tensor-vs-scalar branch in the verifier's _b1_vec helper.
+    # Tiny MLP with UNSAFE_LINEAR ASSERT (multi-row linear inequality).
     return {"layers": _lt_input([1, 4], -1.0, 1.0) + [
         {
             "kind": LayerKind.DENSE.value,
@@ -2138,6 +2294,45 @@ def _lt_spec_unsafe_linear() -> Dict[str, Any]:
     ]}
 
 
+def _lt_spec_tanh() -> Dict[str, Any]:
+    # TANH: input [-3, 3] hits the saturation region (|tanh(3)| ≈ 0.995),
+    # exercising tf_tanh's concave/convex branches in tf_mlp.py.
+    return {"layers": _lt_input([1, 4], -3.0, 3.0) + [
+        {"kind": LayerKind.TANH.value, "params": {}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
+    ]}
+
+
+def _lt_spec_sigmoid() -> Dict[str, Any]:
+    # SIGMOID: input [-3, 3] hits the saturation region, exercising
+    # tf_sigmoid's PWL relaxation in tf_mlp.py.
+    return {"layers": _lt_input([1, 4], -3.0, 3.0) + [
+        {"kind": LayerKind.SIGMOID.value, "params": {}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
+    ]}
+
+
+def _lt_spec_lrelu() -> Dict[str, Any]:
+    # LRELU: negative_slope=0.01, input [-2, 2] exercises the on/off/amb
+    # partition in tf_lrelu (tf_mlp.py) and the lrelu: constraint handler.
+    return {"layers": _lt_input([1, 4], -2.0, 2.0) + [
+        {"kind": LayerKind.LRELU.value, "params": {"negative_slope": 0.01}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 4.0),
+    ]}
+
+
+def _lt_spec_scale() -> Dict[str, Any]:
+    # SCALE (y = a * x element-wise). Mixed-sign `a` exercises both the
+    # positive-slope and negative-slope branches of tf_scale in tf_mlp.py.
+    dtype = get_default_dtype()
+    a = torch.tensor([2.0, 0.5, -1.0, 3.0], dtype=dtype)
+    return {"layers": _lt_input([1, 4], -1.0, 1.0) + [
+        {"kind": LayerKind.SCALE.value,
+         "params": {"a": a, "input_shape": [1, 4], "output_shape": [1, 4]}},
+        _lt_assert_le([1.0, 1.0, 1.0, 1.0], 100.0),
+    ]}
+
+
 LAYER_TESTING_SPECS: Dict[str, Any] = {
     f"{LAYER_TESTING_NAME_PREFIX}constant":      _lt_spec_constant,
     f"{LAYER_TESTING_NAME_PREFIX}sign":          _lt_spec_sign,
@@ -2149,6 +2344,12 @@ LAYER_TESTING_SPECS: Dict[str, Any] = {
     f"{LAYER_TESTING_NAME_PREFIX}upsample":      _lt_spec_upsample,
     f"{LAYER_TESTING_NAME_PREFIX}expand":        _lt_spec_expand,
     f"{LAYER_TESTING_NAME_PREFIX}scatter_nd":    _lt_spec_scatter_nd,
+    f"{LAYER_TESTING_NAME_PREFIX}slice":         _lt_spec_slice,
+    f"{LAYER_TESTING_NAME_PREFIX}gather":        _lt_spec_gather,
+    f"{LAYER_TESTING_NAME_PREFIX}reshape":       _lt_spec_reshape,
+    f"{LAYER_TESTING_NAME_PREFIX}transpose":     _lt_spec_transpose,
+    f"{LAYER_TESTING_NAME_PREFIX}squeeze":       _lt_spec_squeeze,
+    f"{LAYER_TESTING_NAME_PREFIX}unsqueeze":     _lt_spec_unsqueeze,
     f"{LAYER_TESTING_NAME_PREFIX}lstm":          _lt_spec_lstm,
     f"{LAYER_TESTING_NAME_PREFIX}gru":           _lt_spec_gru,
     f"{LAYER_TESTING_NAME_PREFIX}rnn":           _lt_spec_rnn,
@@ -2165,6 +2366,18 @@ LAYER_TESTING_SPECS: Dict[str, Any] = {
     f"{LAYER_TESTING_NAME_PREFIX}conv1d":              _lt_spec_conv1d,
     f"{LAYER_TESTING_NAME_PREFIX}conv3d":              _lt_spec_conv3d,
     f"{LAYER_TESTING_NAME_PREFIX}conv_transpose_2d":   _lt_spec_conv_transpose_2d,
+    # CNN pool chain: Conv2D → MaxPool2D → AvgPool2D. MaxPool2D HZ branch in
+    # hybridz_tf/tf_cnn.py:44-86 is otherwise unreachable.
+    f"{LAYER_TESTING_NAME_PREFIX}cnn_pool":            _lt_spec_cnn_pool,
+    # Elementwise / affine TFs in interval_tf/tf_mlp.py that the random MLP
+    # generator does not emit: SUB, DIV, BN (affine), ABS (pos/neg/amb),
+    # BIAS (independent from DENSE's internal bias).
+    f"{LAYER_TESTING_NAME_PREFIX}sub":                 _lt_spec_sub,
+    f"{LAYER_TESTING_NAME_PREFIX}div":                 _lt_spec_div,
+    f"{LAYER_TESTING_NAME_PREFIX}bn":                  _lt_spec_bn,
+    f"{LAYER_TESTING_NAME_PREFIX}abs":                 _lt_spec_abs,
+    f"{LAYER_TESTING_NAME_PREFIX}bias":                _lt_spec_bias,
+    f"{LAYER_TESTING_NAME_PREFIX}scale":               _lt_spec_scale,
     # Activation coverage: kinds in interval_tf/tf_mlp.py that the random
     # MLP generator does not pick. Several have non-monotonic dips (MISH,
     # HARDSWISH, GELU) whose interval TFs were fixed to dispatch on the
@@ -2179,6 +2392,9 @@ LAYER_TESTING_SPECS: Dict[str, Any] = {
     f"{LAYER_TESTING_NAME_PREFIX}pow":            _lt_spec_pow,
     # Multi-input MAX / MIN need preds=[i,j] so the factory builds
     # y_vars_list from predecessors and tf_max/tf_min get a List[Bounds].
+    f"{LAYER_TESTING_NAME_PREFIX}tanh":            _lt_spec_tanh,
+    f"{LAYER_TESTING_NAME_PREFIX}sigmoid":         _lt_spec_sigmoid,
+    f"{LAYER_TESTING_NAME_PREFIX}lrelu":           _lt_spec_lrelu,
     f"{LAYER_TESTING_NAME_PREFIX}max_op":         _lt_spec_max_op,
     f"{LAYER_TESTING_NAME_PREFIX}min_op":         _lt_spec_min_op,
     # Deep net designed so verify_once cannot certify via interval bounds

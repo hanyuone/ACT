@@ -13,10 +13,15 @@ License: AGPLv3+
 """
 
 import argparse
+import datetime
+import glob
+import json
 import os
+import statistics
 import sys
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, cast
 
 from act.util.cli_utils import add_device_args, initialize_from_args
 
@@ -40,85 +45,158 @@ def _make_solver(solver_name: str):
         return TorchLPSolver()
 
 
-def run_verification(args, backend_cfg):
-    """Run verification on a network using *backend_cfg*."""
-    print(f"\n{'=' * 80}")
-    print(f"ACT BACK-END VERIFICATION")
-    print(f"{'=' * 80}\n")
+def _verify_one_net(net_path: str, backend_cfg) -> tuple[list, Optional[str], Optional[int]]:
+    """[BATCHED-API] Verify *net_path* via 3-tier cascade; returns (results, error_or_None, n_layers_or_None).
 
+    Tier 1 — interval (verify_once): always runs; certifies or falsifies via
+              pure-tensor bounds propagation.
+    Tier 2 — LP-batched (verify_lp_batched): runs on UNKNOWN lanes when
+              backend_cfg.lp_enabled is True.  Skipped for solver='gurobi'
+              (N=1 restriction; caught at BackendConfig construction time).
+    Tier 3 — BaB (verify_bab_batched): runs on remaining UNKNOWN lanes when
+              backend_cfg.bab_enabled is True.  bab_max_batch_size=1 disables
+              K-batching inside BaB (falls back to sequential sub-problems).
+    """
+    from act.back_end.bab.bab import clear_violation_check_module_cache
     from act.back_end.serialization.serialization import load_net_from_file
-    from act.back_end.verifier import verify_once
-    from act.back_end.bab import verify_bab
+    from act.back_end.verifier import verify_once, verify_lp_batched
     from act.util.stats import VerifyStatus
 
-    print(f"Loading network from: {args.network}")
-    net = load_net_from_file(args.network)
-    print(f"Loaded network with {len(net.layers)} layers")
+    clear_violation_check_module_cache()
 
-    solver = _make_solver(backend_cfg.solver)
-    print(f"Solver: {backend_cfg.solver}")
+    try:
+        net = load_net_from_file(net_path, target_device=backend_cfg.device)
+        results: List[Any] = list(verify_once(net=net))
+        n_layers = len(net.layers)
 
-    if backend_cfg.bab_enabled:
-        bab = backend_cfg.bab
-        print(f"\nRunning Branch-and-Bound verification...")
-        print(f"  Max depth: {bab.max_depth}")
-        print(f"  Max subproblems: {bab.max_nodes}")
-        print(f"  Branching: {bab.branching_method}")
-        print(f"  Bounding: {bab.bounding_method}")
-        print(f"  Timeout: {backend_cfg.timeout}s\n")
+        any_unknown = any(r.status == VerifyStatus.UNKNOWN for r in results)
 
-        result = verify_bab(
-            net=net,
-            solver=solver,
-            config=bab,
-            time_budget_s=backend_cfg.timeout,
-        )
+        if any_unknown and backend_cfg.lp_enabled:
+            lp_results = verify_lp_batched(
+                net,
+                solver_factory=lambda: _make_solver(backend_cfg.solver),
+                timelimit=backend_cfg.timeout,
+            )
+            results = [
+                lp_results[i] if results[i].status == VerifyStatus.UNKNOWN else results[i]
+                for i in range(len(results))
+            ]
+            any_unknown = any(r.status == VerifyStatus.UNKNOWN for r in results)
 
-        print(f"\n{'=' * 80}")
-        print(f"VERIFICATION RESULT: {result.status}")
-        print(f"{'=' * 80}")
+        if any_unknown and backend_cfg.bab_enabled:
+            # verify_bab_batched operates on a single-instance (B=1) net and
+            # returns one VerifyResult. For multi-sample nets we slice per-lane
+            # and dispatch one BaB call per still-UNKNOWN sample.
+            from act.back_end.bab.bab import verify_bab_batched as _vbb
+            from act.back_end.verifier import slice_net_to_sample
 
-        if "time" in result.metadata:
-            print(f"Time: {result.metadata['time']:.3f}s")
+            results = [
+                _vbb(
+                    slice_net_to_sample(net, i),
+                    solver_factory=lambda: _make_solver(backend_cfg.solver),
+                    config=backend_cfg.bab,
+                    max_batch_size=backend_cfg.bab_max_batch_size,
+                    time_budget_s=backend_cfg.timeout,
+                )
+                if results[i].status == VerifyStatus.UNKNOWN
+                else results[i]
+                for i in range(len(results))
+            ]
 
-        if result.counterexample is not None:
-            print(f"Counterexample found:")
-            print(f"  Shape: {result.counterexample.shape}")
-            if backend_cfg.verbose:
-                print(f"  Values: {result.counterexample}")
+        return results, None, n_layers
+    except Exception as e:  # noqa: BLE001 — surface per-net error, keep iterating
+        return [], str(e), None
 
+
+def run_verification(args, backend_cfg):
+    """Run verification on a network using *backend_cfg*."""
+    from act.util.stats import VerifyStatus
+
+    results, err, n_layers = _verify_one_net(args.network, backend_cfg)
+    if err is not None:
+        print(f"❌ {args.network}: {err}")
+        return 1
+    print(f"Loaded {n_layers}-layer net; solver={backend_cfg.solver}")
+
+    valid_outcomes = (
+        VerifyStatus.CERTIFIED,
+        VerifyStatus.FALSIFIED,
+        VerifyStatus.UNKNOWN,
+        VerifyStatus.TIMEOUT,
+    )
+    multi = len(results) > 1
+    for i, result in enumerate(results):
+        prefix = f"Sample {i}: " if multi else f"Lane {i}: "
+        print(f"{prefix}{result.status}")
         if backend_cfg.verbose and result.metadata:
-            print(f"\nVerification metadata:")
-            for key, value in result.metadata.items():
-                print(f"  {key}: {value}")
+            for k, v in result.metadata.items():
+                print(f"  {k}: {v}")
+    return 0 if all(r.status in valid_outcomes for r in results) else 1
 
-        print(f"\n{'=' * 80}\n")
 
-        return 0 if result.status == VerifyStatus.CERTIFIED else 1
+def run_verify_all(args, backend_cfg):
+    """Verify every .json net under a directory in one Python process."""
+    from act.util.stats import VerifyStatus
 
-    print(f"\nRunning single-shot verification...\n")
+    nets_dir = args.verify_all
+    if not os.path.isdir(nets_dir):
+        print(f"❌ --verify-all: directory not found: {nets_dir}")
+        return 1
 
-    results = verify_once(net=net)
-    B = len(results)
+    paths = sorted(
+        p for p in glob.glob(os.path.join(nets_dir, "*.json"))
+        if "_meta" not in os.path.basename(p) and "manifest" not in os.path.basename(p)
+    )
+    if not paths:
+        print(f"❌ --verify-all: no .json nets under {nets_dir}")
+        return 1
 
     print(f"\n{'=' * 80}")
-    print(f"VERIFICATION RESULT: batch of N={B} lane(s)")
-    print(f"{'=' * 80}")
+    print(f"ACT VERIFY-ALL  ({len(paths)} nets, solver={backend_cfg.solver}, "
+          f"bab={'on' if backend_cfg.bab_enabled else 'off'})")
+    print(f"{'=' * 80}\n")
 
-    for i, lane in enumerate(results):
-        print(f"\nLane {i}: {lane.status}")
-        if lane.counterexample is not None:
-            print(f"  Counterexample shape: {tuple(lane.counterexample.shape)}")
-            if backend_cfg.verbose:
-                print(f"  Counterexample values: {lane.counterexample}")
-        if backend_cfg.verbose and lane.metadata:
-            print(f"  Metadata: {lane.metadata}")
+    total = len(paths)
+    failures: list = []
+    errors: list = []
 
-    print(f"\n{'=' * 80}\n")
+    for idx, net_path in enumerate(paths, 1):
+        name = os.path.basename(net_path)
+        results, err, _ = _verify_one_net(net_path, backend_cfg)
+        if err is not None:
+            print(f"[{idx:>3}/{total}] {name}: ❌ ERROR — {err}")
+            errors.append((name, err))
+            continue
+        statuses = [r.status for r in results]
+        tag = "  ".join(s.name for s in statuses)
+        print(f"[{idx:>3}/{total}] {name}: {tag}")
+        # Valid verifier outcomes: CERTIFIED (proof of safety), FALSIFIED
+        # (validated counterexample), UNKNOWN (could not prove), TIMEOUT
+        # (budget exhausted). Only VERIFIER_ERROR / MODEL_INFER_FAILURE are
+        # actual verifier bugs that should fail CI.
+        valid_outcomes = (
+            VerifyStatus.CERTIFIED,
+            VerifyStatus.FALSIFIED,
+            VerifyStatus.UNKNOWN,
+            VerifyStatus.TIMEOUT,
+        )
+        for r in results:
+            if r.status not in valid_outcomes:
+                failures.append((name, r.status))
 
-    # Exit 0 on normal completion regardless of verdict.
-    # CERT/FALS/UNK are all valid outcomes; non-zero exit only on exception.
-    return 0
+    print(f"\n{'=' * 80}")
+    print(f"verify-all summary:  total={total}  failures={len(failures)}  errors={len(errors)}")
+    if failures:
+        print("  Failures (verifier bugs only):")
+        for n, s in failures[:20]:
+            print(f"    - {n}: {s.name}")
+    if errors:
+        print("  Errors:")
+        for n, e in errors[:20]:
+            print(f"    - {n}: {e[:120]}")
+    print(f"{'=' * 80}\n")
+
+    return 1 if (failures or errors) else 0
 
 
 def run_network_factory(args, backend_cfg):
@@ -286,6 +364,245 @@ def list_examples(args):
     return 0
 
 
+def _bench_default_path(kind: str) -> str:
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join("act", "pipeline", "log", f"bench_{kind}_{ts}.json")
+
+
+def _write_bench_result(out_path: str, result: object) -> None:
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(out_path, "w") as fh:
+        json.dump(result, fh, indent=2)
+    print(f"Wrote {out_path}")
+
+
+def _run_bench_cnn(out_path: str) -> int:
+    import torch
+    from act.back_end.serialization.serialization import load_net_from_file
+    from act.back_end.analyze import analyze
+    from act.back_end.core import Fact, ConSet
+    from act.back_end.verifier import find_entry_layer_id, gather_input_spec_layers, seed_from_input_specs
+
+    nets = sorted(
+        p for p in glob.glob("act/back_end/examples/nets/cnn2d_plain_*.json")
+        if "_meta" not in p
+    )
+    if not nets:
+        print("No CNN example nets found at act/back_end/examples/nets/cnn2d_plain_*.json")
+        return 1
+
+    results: Dict[str, Any] = {}
+    for path in nets:
+        net = load_net_from_file(path)
+        entry = find_entry_layer_id(net)
+        seed = seed_from_input_specs(gather_input_spec_layers(net))
+        fact = Fact(bounds=seed, cons=ConSet())
+        for _ in range(2):
+            analyze(net, entry, fact)
+        times: List[float] = []
+        for _ in range(5):
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            analyze(net, entry, fact)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            times.append(time.perf_counter() - t0)
+        results[path] = {
+            "mean": statistics.mean(times),
+            "std": statistics.stdev(times) if len(times) > 1 else 0.0,
+            "all": times,
+        }
+        print(f"  {path}: mean={results[path]['mean']:.4f}s")
+
+    _write_bench_result(out_path, results)
+    return 0
+
+
+def _run_bench_hybridz(out_path: str) -> int:
+    import torch
+    from act.back_end.core import Net, Layer, Bounds, Fact, ConSet
+    from act.back_end.layer_schema import LayerKind
+    from act.back_end.analyze import analyze
+    from act.back_end.transfer_functions import set_transfer_function_mode
+    from act.front_end.specs import OutputSpec
+
+    def _build_net(B: int = 1, n_in: int = 8, n_hid: int = 16, n_out: int = 8) -> Net:
+        layers: List[Any] = []
+        next_id = 0
+        next_var = 0
+
+        def alloc_vars(n: int) -> List[int]:
+            nonlocal next_var
+            vs = list(range(next_var, next_var + n))
+            next_var += n
+            return vs
+
+        in_v = alloc_vars(n_in)
+        layers.append(Layer(id=next_id, kind=LayerKind.INPUT.value,
+            params={"shape": (B, n_in), "dtype": "torch.float32"},
+            in_vars=[], out_vars=in_v))
+        next_id += 1
+        layers.append(Layer(id=next_id, kind=LayerKind.INPUT_SPEC.value,
+            params={"kind": "BOX",
+                    "lb": torch.full((B, n_in), -1.0),
+                    "ub": torch.full((B, n_in),  1.0)},
+            in_vars=in_v, out_vars=in_v))
+        next_id += 1
+        h1_v = alloc_vars(n_hid)
+        W1 = torch.randn(n_hid, n_in)
+        b1 = torch.zeros(n_hid)
+        layers.append(Layer(id=next_id, kind=LayerKind.DENSE.value,
+            params={"weight": W1, "in_features": n_in, "out_features": n_hid,
+                    "weight_pos": W1.clamp(min=0), "weight_neg": W1.clamp(max=0),
+                    "bias": b1, "input_shape": (n_in,)},
+            in_vars=in_v, out_vars=h1_v))
+        next_id += 1
+        layers.append(Layer(id=next_id, kind=LayerKind.RELU.value,
+            params={"input_shape": (n_hid,)},
+            in_vars=h1_v, out_vars=h1_v))
+        next_id += 1
+        out_v = alloc_vars(n_out)
+        W2 = torch.randn(n_out, n_hid)
+        b2 = torch.zeros(n_out)
+        layers.append(Layer(id=next_id, kind=LayerKind.DENSE.value,
+            params={"weight": W2, "in_features": n_hid, "out_features": n_out,
+                    "weight_pos": W2.clamp(min=0), "weight_neg": W2.clamp(max=0),
+                    "bias": b2, "input_shape": (n_hid,)},
+            in_vars=h1_v, out_vars=out_v))
+        next_id += 1
+        assert_params = OutputSpec(
+            kind="LINEAR_LE",
+            c=torch.zeros(n_out),
+            d=torch.tensor(1.0),
+        ).encode_linear(B=B, n_out=n_out, device=torch.device("cpu"), dtype=torch.float32)
+        layers.append(Layer(id=next_id, kind=LayerKind.ASSERT.value,
+            params=assert_params, in_vars=out_v, out_vars=out_v))
+        preds = {0: [], 1: [0], 2: [1], 3: [2], 4: [3], 5: [4]}
+        succs = {0: [1], 1: [2], 2: [3], 3: [4], 4: [5], 5: []}
+        return Net(layers=layers, preds=preds, succs=succs)
+
+    torch.manual_seed(42)
+    net = _build_net()
+    set_transfer_function_mode("hybridz")
+    entry_id = next(l.id for l in net.layers if l.kind == LayerKind.INPUT.value)
+    spec_layer = next(l for l in net.layers if l.kind == LayerKind.INPUT_SPEC.value)
+    import torch as _torch
+    lb_t = cast(_torch.Tensor, spec_layer.params["lb"])
+    ub_t = cast(_torch.Tensor, spec_layer.params["ub"])
+    seed = Bounds(lb_t.clone(), ub_t.clone())
+    fact = Fact(bounds=seed, cons=ConSet())
+    for _ in range(2):
+        analyze(net, entry_id, fact)
+    times: List[float] = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        analyze(net, entry_id, fact)
+        times.append(time.perf_counter() - t0)
+    result = {
+        "mean": statistics.mean(times),
+        "std": statistics.stdev(times) if len(times) > 1 else 0.0,
+    }
+    print(f"  hybridz synthetic 4-layer MLP: mean={result['mean']:.4f}s")
+    _write_bench_result(out_path, result)
+    return 0
+
+
+def run_bench(args) -> int:
+    """Run timing benchmarks for CNN and/or HybridZ analyze() code paths."""
+    kind = args.bench
+    bench_out = getattr(args, "bench_out", None)
+
+    print(f"\n{'=' * 80}")
+    print(f"ACT BENCH: {kind.upper()}")
+    print(f"{'=' * 80}\n")
+
+    if kind in ("cnn", "all"):
+        out_path = bench_out if (bench_out and kind == "cnn") else _bench_default_path("cnn")
+        print(f"--- CNN benchmark ---")
+        rc = _run_bench_cnn(out_path)
+        if rc != 0:
+            return rc
+
+    if kind in ("hybridz", "all"):
+        out_path = bench_out if (bench_out and kind == "hybridz") else _bench_default_path("hybridz")
+        print(f"\n--- HybridZ benchmark ---")
+        rc = _run_bench_hybridz(out_path)
+        if rc != 0:
+            return rc
+
+    print(f"\n{'=' * 80}")
+    print(f"Bench complete")
+    print(f"{'=' * 80}\n")
+    return 0
+
+
+def run_diff_nets(args) -> int:
+    """Load two ACT Net JSON files and print a unified-diff-style layer comparison."""
+    from act.back_end.serialization.serialization import load_net_from_file
+
+    path_a, path_b = args.diff_nets
+
+    try:
+        net_a = load_net_from_file(path_a)
+    except Exception as e:
+        print(f"Error loading {path_a}: {e}")
+        return 1
+
+    try:
+        net_b = load_net_from_file(path_b)
+    except Exception as e:
+        print(f"Error loading {path_b}: {e}")
+        return 1
+
+    print(f"\n{'=' * 80}")
+    print(f"NET DIFF")
+    print(f"  A: {path_a}")
+    print(f"  B: {path_b}")
+    print(f"{'=' * 80}\n")
+
+    la, lb = len(net_a.layers), len(net_b.layers)
+    marker = "  " if la == lb else "!"
+    print(f"{marker} Layer count: A={la}  B={lb}")
+
+    n_common = min(la, lb)
+    for i in range(n_common):
+        lyr_a = net_a.layers[i]
+        lyr_b = net_b.layers[i]
+        diffs: List[str] = []
+        if lyr_a.kind != lyr_b.kind:
+            diffs.append(f"kind: {lyr_a.kind!r} -> {lyr_b.kind!r}")
+        if len(lyr_a.in_vars) != len(lyr_b.in_vars):
+            diffs.append(f"in_vars: {len(lyr_a.in_vars)} -> {len(lyr_b.in_vars)}")
+        if len(lyr_a.out_vars) != len(lyr_b.out_vars):
+            diffs.append(f"out_vars: {len(lyr_a.out_vars)} -> {len(lyr_b.out_vars)}")
+        keys_a = set(lyr_a.params.keys())
+        keys_b = set(lyr_b.params.keys())
+        if keys_a != keys_b:
+            only_a = sorted(keys_a - keys_b)
+            only_b = sorted(keys_b - keys_a)
+            if only_a:
+                diffs.append(f"params only in A: {only_a}")
+            if only_b:
+                diffs.append(f"params only in B: {only_b}")
+        if diffs:
+            print(f"! Layer {i:2d} ({lyr_a.kind:20s}): " + "; ".join(diffs))
+        else:
+            print(f"  Layer {i:2d} ({lyr_a.kind:20s}): identical")
+
+    if la != lb:
+        extra_net = net_a if la > lb else net_b
+        extra_side = "A" if la > lb else "B"
+        for i in range(n_common, max(la, lb)):
+            lyr = extra_net.layers[i]
+            print(f"+ Layer {i:2d} ({lyr.kind:20s}): only in {extra_side}")
+
+    print(f"\n{'=' * 80}\n")
+    return 0
+
+
 def main():
     """Main CLI entry point for ACT Back-End."""
     parser = argparse.ArgumentParser(
@@ -342,6 +659,28 @@ Examples:
   python -m act.back_end --test-serialization
   
   # ============================================================================
+  # BENCHMARKING - Time analyze() on example nets
+  # ============================================================================
+  
+  # Benchmark CNN analyze() on all cnn2d_plain_* example nets
+  python -m act.back_end --bench cnn
+  
+  # Benchmark HybridZ analyze() on a synthetic MLP
+  python -m act.back_end --bench hybridz
+  
+  # Run both benchmarks and write JSON output
+  python -m act.back_end --bench all
+  python -m act.back_end --bench cnn --bench-out /tmp/my_cnn_timing.json
+  
+  # ============================================================================
+  # NET DIFF - Compare two network JSON files
+  # ============================================================================
+  
+  # Compare layer count, kinds, variable widths, and param keys
+  python -m act.back_end --diff-nets act/back_end/examples/nets/net_a.json \\
+                                      act/back_end/examples/nets/net_b.json
+  
+  # ============================================================================
   # DEVICE CONFIGURATION
   # ============================================================================
   
@@ -380,6 +719,44 @@ Examples:
         action="store_true",
         dest="test_serialization",
         help="Run serialization tests",
+    )
+    cmd_group.add_argument(
+        "--bench",
+        type=str,
+        choices=["cnn", "hybridz", "all"],
+        metavar="{cnn,hybridz,all}",
+        dest="bench",
+        help="Run analyze() timing benchmarks: cnn nets, hybridz synthetic MLP, or all",
+    )
+    cmd_group.add_argument(
+        "--diff-nets",
+        nargs=2,
+        metavar=("NET_A", "NET_B"),
+        dest="diff_nets",
+        help="Load two ACT Net JSON files and print a layer-level diff summary",
+    )
+    cmd_group.add_argument(
+        "--verify-all",
+        type=str,
+        metavar="NETS_DIR",
+        dest="verify_all",
+        help=(
+            "Verify every .json net under NETS_DIR in ONE Python process "
+            "(amortizes ~5s of import startup per net; replaces per-net shell loops in CI)."
+        ),
+    )
+
+    # Bench options
+    bench_group = parser.add_argument_group("Bench Options")
+    bench_group.add_argument(
+        "--bench-out",
+        type=str,
+        default=None,
+        dest="bench_out",
+        help=(
+            "Output JSON path for bench results "
+            "(default: act/pipeline/log/bench_<kind>_<timestamp>.json)"
+        ),
     )
 
     # Network factory options
@@ -521,6 +898,9 @@ Examples:
         if not args.network:
             parser.error("--network is required for --verify and --info")
 
+    if args.diff_nets:
+        return run_diff_nets(args)
+
     # ── Build BackendConfig ──────────────────────────────────────────────
     # Load YAML as baseline, then overlay env vars and CLI flags on top.
     # Precedence: CLI flag > env var > config.yaml > dataclass default
@@ -544,12 +924,16 @@ Examples:
             return run_network_factory(args, backend_cfg)
         elif args.verify:
             return run_verification(args, backend_cfg)
+        elif args.verify_all:
+            return run_verify_all(args, backend_cfg)
         elif args.info:
             return run_network_info(args)
         elif args.list_examples:
             return list_examples(args)
         elif args.test_serialization:
             return run_serialization_test(args)
+        elif args.bench:
+            return run_bench(args)
         else:
             parser.print_help()
             return 1
@@ -565,89 +949,153 @@ Examples:
         return 1
 
 
+# (override_key, args_attr, env_var, env_cast, cli_check)
+# cli_check="user_set" for flags with non-None defaults (--device/--dtype/--registry-mode)
+_BACKEND_OVERRIDE_SPEC: List[tuple] = [
+    ("solver",               "solver",              "ACT_SOLVER",     None, "not_none"),
+    ("device",               "device",              "ACT_DEVICE",     None, "user_set"),
+    ("dtype",                "dtype",               "ACT_DTYPE",      None, "user_set"),
+    ("timeout",              "timeout",             None,             None, "not_none"),
+    ("bab_enabled",          "bab",                 None,             None, "not_none"),
+    ("bab_max_depth",        "bab_max_depth",       None,             None, "not_none"),
+    ("bab_max_nodes",        "bab_max_subproblems", None,             None, "not_none"),
+    ("bab_branching_method", "bab_branching",       None,             None, "not_none"),
+    ("bab_bounding_method",  "bab_bounding",        None,             None, "not_none"),
+    ("gen_gen_config_path",  "config",              None,             None, "not_none"),
+    ("gen_output_dir",       "output",              "ACT_GEN_OUTPUT", None, "not_none"),
+    ("gen_num_instances",    "num",                 "ACT_GEN_NUM",    int,  "not_none"),
+    ("gen_base_seed",        "base_seed",           "ACT_GEN_SEED",   int,  "not_none"),
+    ("gen_name_prefix",      "name_prefix",         None,             None, "not_none"),
+    ("gen_tf_targets",       "tf_targets",          None,             None, "not_none"),
+    ("gen_registry_mode",    "registry_mode",       None,             None, "user_set"),
+]
+
+
 def _collect_backend_overrides(args, _user_set) -> dict:
-    """Build overrides dict from CLI flags + env vars.
-
-    Only includes keys the user explicitly provided (CLI flag) or that are
-    set in the environment.  Everything else falls through to config.yaml.
-
-    Prefix conventions: ``bab_<field>`` → BaBConfig, ``gen_<field>`` → GenerationConfig.
-    """
+    """Build overrides dict from CLI flags + env vars (precedence: CLI > env > yaml)."""
     overrides: dict = {}
-
-    # ── Runtime selectors: CLI > env > config.yaml ──
-    if args.solver is not None:
-        overrides["solver"] = args.solver
-    elif os.environ.get("ACT_SOLVER"):
-        overrides["solver"] = os.environ["ACT_SOLVER"]
-
-    if _user_set("--device"):
-        overrides["device"] = args.device
-    elif os.environ.get("ACT_DEVICE"):
-        overrides["device"] = os.environ["ACT_DEVICE"]
-
-    if _user_set("--dtype"):
-        overrides["dtype"] = args.dtype
-    elif os.environ.get("ACT_DTYPE"):
-        overrides["dtype"] = os.environ["ACT_DTYPE"]
+    for key, attr, env, cast, check in _BACKEND_OVERRIDE_SPEC:
+        cli_val = getattr(args, attr, None)
+        if check == "user_set":
+            cli_provided = _user_set(f"--{attr.replace('_', '-')}")
+        else:
+            cli_provided = cli_val is not None
+        if cli_provided:
+            overrides[key] = cli_val
+        elif env is not None and os.environ.get(env):
+            overrides[key] = cast(os.environ[env]) if cast else os.environ[env]
 
     if args.verbose:
         overrides["verbose"] = True
 
-    # ── Verification ──
-    if args.timeout is not None:
-        overrides["timeout"] = args.timeout
-
-    # bab enabled: --bab / --no-bab (None = defer to config.yaml)
-    if args.bab is not None:
-        overrides["bab_enabled"] = args.bab
-
-    if args.bab_max_depth is not None:
-        overrides["bab_max_depth"] = args.bab_max_depth
-    if args.bab_max_subproblems is not None:
-        overrides["bab_max_nodes"] = args.bab_max_subproblems
-    if args.bab_branching is not None:
-        overrides["bab_branching_method"] = args.bab_branching
-    if args.bab_bounding is not None:
-        overrides["bab_bounding_method"] = args.bab_bounding
-
-    # ── Generation: CLI > env > config.yaml ──
-    config_flag = getattr(args, "config", None)
-    if config_flag is not None:
-        overrides["gen_gen_config_path"] = config_flag
-
-    output_flag = getattr(args, "output", None)
-    if output_flag is not None:
-        overrides["gen_output_dir"] = output_flag
-    elif os.environ.get("ACT_GEN_OUTPUT"):
-        overrides["gen_output_dir"] = os.environ["ACT_GEN_OUTPUT"]
-
-    num_flag = getattr(args, "num", None)
-    if num_flag is not None:
-        overrides["gen_num_instances"] = num_flag
-    elif os.environ.get("ACT_GEN_NUM"):
-        overrides["gen_num_instances"] = int(os.environ["ACT_GEN_NUM"])
-
-    seed_flag = getattr(args, "base_seed", None)
-    if seed_flag is not None:
-        overrides["gen_base_seed"] = seed_flag
-    elif os.environ.get("ACT_GEN_SEED"):
-        overrides["gen_base_seed"] = int(os.environ["ACT_GEN_SEED"])
-
-    prefix_flag = getattr(args, "name_prefix", None)
-    if prefix_flag is not None:
-        overrides["gen_name_prefix"] = prefix_flag
-
-    tf_flag = getattr(args, "tf_targets", None)
-    if tf_flag is not None:
-        overrides["gen_tf_targets"] = tf_flag
-
-    reg_flag = getattr(args, "registry_mode", None)
-    if reg_flag is not None and _user_set("--registry-mode"):
-        overrides["gen_registry_mode"] = reg_flag
-
     return overrides
 
 
+def _run_cli_cascade_smoke() -> int:
+    """Light integration smoke: build a tiny net, run the 3-tier cascade, verify dispatch."""
+    import torch
+    from act.back_end.core import Layer, Net, Bounds, Fact, ConSet
+    from act.back_end.layer_schema import LayerKind
+    from act.front_end.specs import OutputSpec
+    from act.back_end.config import BackendConfig
+    from act.util.stats import VerifyStatus
+
+    passed = 0
+    failed = 0
+
+    def _check(label: str, fn) -> None:
+        nonlocal passed, failed
+        try:
+            fn()
+            print(f"  PASS  {label}")
+            passed += 1
+        except Exception as exc:
+            print(f"  FAIL  {label}: {exc}")
+            import traceback
+            traceback.print_exc()
+            failed += 1
+
+    def _build_tiny_net(B: int = 1, n_in: int = 4, n_out: int = 2) -> Net:
+        layers: List[Any] = []
+        nv = 0
+
+        def alloc(n: int) -> List[int]:
+            nonlocal nv
+            vs = list(range(nv, nv + n))
+            nv += n
+            return vs
+
+        in_v = alloc(n_in)
+        layers.append(Layer(id=0, kind=LayerKind.INPUT.value,
+            params={"shape": (B, n_in), "dtype": "torch.float32"},
+            in_vars=[], out_vars=in_v))
+        layers.append(Layer(id=1, kind=LayerKind.INPUT_SPEC.value,
+            params={"kind": "BOX",
+                    "lb": torch.full((B, n_in), -1.0),
+                    "ub": torch.full((B, n_in),  1.0)},
+            in_vars=in_v, out_vars=in_v))
+        out_v = alloc(n_out)
+        W = torch.eye(n_out, n_in)
+        b = torch.zeros(n_out)
+        layers.append(Layer(id=2, kind=LayerKind.DENSE.value,
+            params={"weight": W, "in_features": n_in, "out_features": n_out,
+                    "weight_pos": W.clamp(min=0), "weight_neg": W.clamp(max=0),
+                    "bias": b, "input_shape": (n_in,)},
+            in_vars=in_v, out_vars=out_v))
+        assert_params = OutputSpec(
+            kind="LINEAR_LE",
+            c=torch.zeros(n_out),
+            d=torch.tensor(1.0),
+        ).encode_linear(B=B, n_out=n_out, device=torch.device("cpu"), dtype=torch.float32)
+        layers.append(Layer(id=3, kind=LayerKind.ASSERT.value,
+            params=assert_params, in_vars=out_v, out_vars=out_v))
+        preds = {0: [], 1: [0], 2: [1], 3: [2]}
+        succs = {0: [1], 1: [2], 2: [3], 3: []}
+        return Net(layers=layers, preds=preds, succs=succs)
+
+    def _t_interval_only():
+        from act.back_end.verifier import verify_once
+        net = _build_tiny_net()
+        results = list(verify_once(net=net))
+        assert len(results) == 1
+        assert results[0].status in (VerifyStatus.CERTIFIED, VerifyStatus.UNKNOWN, VerifyStatus.FALSIFIED)
+
+    def _t_cascade_default_config():
+        cfg = BackendConfig(solver="torch", lp_enabled=True, bab_enabled=False)
+        net = _build_tiny_net()
+        from act.back_end.verifier import verify_once, verify_lp_batched
+        results = list(verify_once(net=net))
+        assert len(results) == 1
+        if results[0].status == VerifyStatus.UNKNOWN and cfg.lp_enabled:
+            lp_results = verify_lp_batched(
+                net,
+                solver_factory=lambda: _make_solver(cfg.solver),
+                timelimit=cfg.timeout,
+            )
+            assert len(lp_results) == 1
+            assert lp_results[0].status in (
+                VerifyStatus.CERTIFIED, VerifyStatus.FALSIFIED, VerifyStatus.UNKNOWN
+            )
+
+    def _t_lp_disabled_skips_tier2():
+        cfg = BackendConfig(solver="torch", lp_enabled=False, bab_enabled=False)
+        assert not cfg.lp_enabled
+
+    def _t_bab_max_batch_size_default():
+        cfg = BackendConfig()
+        assert cfg.bab_max_batch_size == 8
+
+    print("cli.py cascade smoke tests")
+    _check("tier-1 interval verify_once returns VerifyStatus", _t_interval_only)
+    _check("cascade with lp_enabled=True dispatches tier-2 on UNKNOWN", _t_cascade_default_config)
+    _check("lp_enabled=False skips tier-2", _t_lp_disabled_skips_tier2)
+    _check("default bab_max_batch_size=8", _t_bab_max_batch_size_default)
+
+    print(f"\n{passed}/{passed + failed} passed")
+    return 0 if failed == 0 else 1
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+        sys.exit(_run_cli_cascade_smoke())
     sys.exit(main())

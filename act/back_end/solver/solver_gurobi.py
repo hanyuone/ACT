@@ -1,10 +1,14 @@
 
 from __future__ import annotations
-from typing import List, Optional
+from typing import Optional, TYPE_CHECKING
 import numpy as np
 import os
-from act.back_end.solver.solver_base import Solver, SolverCaps, SolveStatus
+from act.back_end.solver.solver_base import Solver, SolverCaps
 from act.util.path_config import get_project_root
+
+if TYPE_CHECKING:
+    from act.back_end.core import Bounds
+    from act.back_end.solver.solver_base import BatchLPProblem, BatchLPSolution
 
 try:
     import gurobipy as gp
@@ -52,87 +56,6 @@ class GurobiSolver(Solver):
     def __init__(self):
         if not GUROBI_AVAILABLE:
             raise RuntimeError("gurobipy is not available in this environment.")
-        self.m = None
-        self._x = []
-
-    @property
-    def n(self) -> int:
-        return len(self._x)
-
-    def begin(self, name: str = "verify", device: Optional[str] = None):
-        # device hint ignored (CPU solver)
-        self.m = gp.Model(name)
-        self.m.Params.OutputFlag = 0
-        self._x = []
-
-    def add_vars(self, n: int) -> None:
-        new = self.m.addVars(n, lb=-GRB.INFINITY, ub=+GRB.INFINITY, name="x")
-        self._x.extend(list(new.values()))
-
-    def set_bounds(self, idxs: List[int], lb: np.ndarray, ub: np.ndarray) -> None:
-        for idx, lo, hi in zip(idxs, lb, ub):
-            self._x[idx].LB = float(lo)
-            self._x[idx].UB = float(hi)
-
-    def add_binary_vars(self, n: int) -> List[int]:
-        start = len(self._x)
-        new = self.m.addVars(n, vtype=GRB.BINARY, name="b")
-        self._x.extend(list(new.values()))
-        return list(range(start, start + n))
-
-    def _lexpr(self, vids: List[int], coeffs: List[float]):
-        e = gp.LinExpr()
-        for i, a in zip(vids, coeffs):
-            e.addTerms(float(a), self._x[i])
-        return e
-
-    def add_lin_eq(self, vids: List[int], coeffs: List[float], rhs: float) -> None:
-        self.m.addConstr(self._lexpr(vids, coeffs) == float(rhs))
-
-    def add_lin_le(self, vids: List[int], coeffs: List[float], rhs: float) -> None:
-        self.m.addConstr(self._lexpr(vids, coeffs) <= float(rhs))
-
-    def add_lin_ge(self, vids: List[int], coeffs: List[float], rhs: float) -> None:
-        self.m.addConstr(self._lexpr(vids, coeffs) >= float(rhs))
-
-    def add_sum_eq(self, vids: List[int], rhs: float) -> None:
-        self.m.addConstr(gp.quicksum(self._x[i] for i in vids) == float(rhs))
-
-    def add_ge_zero(self, vids: List[int]) -> None:
-        for i in vids:
-            self.m.addConstr(self._x[i] >= 0.0)
-
-    def add_sos2(self, var_ids: List[int], weights: Optional[List[float]] = None) -> None:
-        self.m.addSOS(GRB.SOS_TYPE2, [self._x[i] for i in var_ids], weights)
-
-    def set_objective_linear(self, vids: List[int], coeffs: List[float], const: float = 0.0, sense: str = "min") -> None:
-        e = self._lexpr(vids, coeffs) + float(const)
-        self.m.setObjective(e, GRB.MINIMIZE if sense == "min" else GRB.MAXIMIZE)
-
-    def optimize(self, timelimit: Optional[float] = None) -> None:
-        if timelimit is not None:
-            self.m.Params.TimeLimit = float(timelimit)
-        self.m.update()
-        self.m.optimize()
-
-    def status(self) -> str:
-        if self.m.Status in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
-            return SolveStatus.SAT
-        if self.m.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
-            return SolveStatus.UNSAT
-        if self.m.SolCount > 0:
-            return SolveStatus.SAT
-        return SolveStatus.UNKNOWN
-
-    def has_solution(self) -> bool:
-        return self.m.SolCount > 0
-
-    def get_values(self, vids: List[int]) -> np.ndarray:
-        return np.array([self._x[i].X for i in vids], dtype=float)
-
-    def get_counterexample(self, input_ids: List[int]) -> np.ndarray:
-        # Gurobi returns exact LP/MILP solutions; just proxy.
-        return self.get_values(input_ids)
 
     @staticmethod
     def compute_bounds(hz) -> 'Bounds':
@@ -179,3 +102,247 @@ class GurobiSolver(Solver):
         dtype, device = hz.c.dtype, hz.c.device
         return Bounds(lb=torch.from_numpy(LB).to(device=device, dtype=dtype),
                       ub=torch.from_numpy(UB).to(device=device, dtype=dtype))
+
+    def solve_batch(
+        self,
+        problem: "BatchLPProblem",  # noqa: F821
+        timelimit: Optional[float] = None,
+    ) -> "BatchLPSolution":  # noqa: F821
+        """Solve a batch of N independent LPs.
+
+        N=1: builds a single gp.Model, solves, returns BatchLPSolution[N=1].
+        N>1: raises NotImplementedError — Gurobi's multi-scenario API does not
+             expose truly parallel solving for varying constraint matrices.
+        """
+        from act.back_end.solver.solver_base import BatchLPSolution
+        import torch
+
+        if problem.N != 1:
+            raise NotImplementedError(
+                f"GurobiSolver.solve_batch: N={problem.N} not supported. "
+                f"Gurobi does not expose a truly parallel multi-LP API for "
+                f"varying constraint matrices. Use TorchLPSolver for N>1, "
+                f"or constrain BaB to bab_max_batch_size=1 and "
+                f"verify_lp_batched is skipped (set lp_enabled=False)."
+            )
+
+        nvars = problem.nvars
+        lb = problem.lb[0].cpu().numpy().astype(np.float64)
+        ub = problem.ub[0].cpu().numpy().astype(np.float64)
+
+        env = gp.Env(empty=True)
+        env.setParam("OutputFlag", 0)
+        env.start()
+        m = gp.Model("verify_batch_n1", env=env)
+        x = m.addMVar(nvars, lb=lb, ub=ub, name="x")
+
+        # Decompose block-diagonal sparse: for N=1 the block is the full matrix.
+        if problem.m_eq > 0:
+            A_eq = (
+                problem.A_eq_blockdiag.to_dense()[: problem.m_eq, :nvars]
+                .cpu()
+                .numpy()
+                .astype(np.float64)
+            )
+            b_eq = problem.b_eq[0].cpu().numpy().astype(np.float64)
+            m.addConstr(A_eq @ x == b_eq)
+
+        if problem.m_le > 0:
+            A_le = (
+                problem.A_le_blockdiag.to_dense()[: problem.m_le, :nvars]
+                .cpu()
+                .numpy()
+                .astype(np.float64)
+            )
+            b_le = problem.b_le[0].cpu().numpy().astype(np.float64)
+            m.addConstr(A_le @ x <= b_le)
+
+        obj_c = problem.obj_c[0].cpu().numpy().astype(np.float64)
+        obj_const = float(problem.obj_const[0].item())
+        sense = GRB.MINIMIZE if problem.sense == "min" else GRB.MAXIMIZE
+        m.setObjective(obj_c @ x + obj_const, sense)
+
+        if timelimit is not None:
+            m.Params.TimeLimit = float(timelimit)
+        m.optimize()
+
+        dtype = problem.lb.dtype
+        device = problem.lb.device
+
+        if m.Status in (GRB.OPTIMAL, GRB.SUBOPTIMAL):
+            status = "SAT"
+            x_val = torch.as_tensor(x.X, dtype=dtype, device=device).unsqueeze(0)
+            max_viol = torch.zeros(1, dtype=dtype, device=device)
+        elif m.Status in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
+            status = "UNSAT"
+            x_val = torch.zeros_like(problem.lb)
+            max_viol = torch.full((1,), float("inf"), dtype=dtype, device=device)
+        else:
+            status = "UNKNOWN"
+            x_val = torch.zeros_like(problem.lb)
+            max_viol = torch.full((1,), float("nan"), dtype=dtype, device=device)
+
+        return BatchLPSolution(
+            statuses=(status,),
+            x=x_val,
+            max_viol=max_viol,
+        )
+
+
+# --- Self-tests (run with: python -m act.back_end.solver.solver_gurobi) ---
+
+import importlib.util as _ilu
+
+_HAS_GUROBI = _ilu.find_spec("gurobipy") is not None
+
+
+def _make_problem_n1(nvars, m_eq=0, m_le=0, lb_val=0.0, ub_val=1.0):
+    import torch
+    from act.back_end.solver.solver_base import BatchLPProblem
+
+    def _empty(N, m, nv):
+        return torch.sparse_coo_tensor(
+            torch.zeros((2, 0), dtype=torch.long),
+            torch.zeros(0),
+            (N * m, N * nv),
+        )
+
+    return BatchLPProblem(
+        nvars=nvars,
+        m_eq=m_eq,
+        m_le=m_le,
+        lb=torch.full((1, nvars), lb_val),
+        ub=torch.full((1, nvars), ub_val),
+        A_eq_blockdiag=_empty(1, m_eq, nvars),
+        b_eq=torch.zeros(1, m_eq),
+        A_le_blockdiag=_empty(1, m_le, nvars),
+        b_le=torch.zeros(1, m_le),
+        obj_c=torch.zeros(1, nvars),
+        obj_const=torch.zeros(1),
+    )
+
+
+def _test_solve_batch_n1_sat():
+    if not _HAS_GUROBI:
+        print("SKIP  _test_solve_batch_n1_sat (no gurobipy)")
+        return
+    import torch
+    from act.back_end.solver.solver_base import BatchLPProblem
+
+    def _empty(N, m, nv):
+        return torch.sparse_coo_tensor(
+            torch.zeros((2, 0), dtype=torch.long),
+            torch.zeros(0),
+            (N * m, N * nv),
+        )
+
+    nvars = 2
+    p = BatchLPProblem(
+        nvars=nvars, m_eq=0, m_le=0,
+        lb=torch.tensor([[0.0, 0.0]]),
+        ub=torch.tensor([[1.0, 1.0]]),
+        A_eq_blockdiag=_empty(1, 0, nvars),
+        b_eq=torch.zeros(1, 0),
+        A_le_blockdiag=_empty(1, 0, nvars),
+        b_le=torch.zeros(1, 0),
+        obj_c=torch.tensor([[1.0, 0.0]]),
+        obj_const=torch.zeros(1),
+        sense="min",
+    )
+    sol = GurobiSolver().solve_batch(p)
+    assert sol.statuses == ("SAT",), f"expected SAT, got {sol.statuses}"
+    assert sol.x.shape == (1, nvars)
+    assert float(sol.x[0, 0]) < 0.01, f"expected x[0]~0, got {sol.x[0,0]}"
+
+
+def _test_solve_batch_n1_infeasible():
+    if not _HAS_GUROBI:
+        print("SKIP  _test_solve_batch_n1_infeasible (no gurobipy)")
+        return
+    import torch
+    from act.back_end.solver.solver_base import BatchLPProblem
+
+    nvars = 1
+    A_le_vals = torch.tensor([-1.0])
+    A_le_idx = torch.tensor([[0], [0]], dtype=torch.long)
+    A_le_sp = torch.sparse_coo_tensor(A_le_idx, A_le_vals, (1, 1))
+
+    def _empty(N, m, nv):
+        return torch.sparse_coo_tensor(
+            torch.zeros((2, 0), dtype=torch.long),
+            torch.zeros(0),
+            (N * m, N * nv),
+        )
+
+    p = BatchLPProblem(
+        nvars=nvars, m_eq=0, m_le=1,
+        lb=torch.tensor([[0.0]]),
+        ub=torch.tensor([[1.0]]),
+        A_eq_blockdiag=_empty(1, 0, nvars),
+        b_eq=torch.zeros(1, 0),
+        A_le_blockdiag=A_le_sp,
+        b_le=torch.tensor([[-3.0]]),
+        obj_c=torch.zeros(1, nvars),
+        obj_const=torch.zeros(1),
+    )
+    sol = GurobiSolver().solve_batch(p)
+    assert sol.statuses == ("UNSAT",), f"expected UNSAT, got {sol.statuses}"
+
+
+def _test_solve_batch_n_greater_than_1_raises():
+    if not _HAS_GUROBI:
+        print("SKIP  _test_solve_batch_n_greater_than_1_raises (no gurobipy)")
+        return
+    import torch
+    from act.back_end.solver.solver_base import BatchLPProblem
+
+    def _empty(N, m, nv):
+        return torch.sparse_coo_tensor(
+            torch.zeros((2, 0), dtype=torch.long),
+            torch.zeros(0),
+            (N * m, N * nv),
+        )
+
+    N, nvars = 2, 3
+    p = BatchLPProblem(
+        nvars=nvars, m_eq=0, m_le=0,
+        lb=torch.zeros(N, nvars),
+        ub=torch.ones(N, nvars),
+        A_eq_blockdiag=_empty(N, 0, nvars),
+        b_eq=torch.zeros(N, 0),
+        A_le_blockdiag=_empty(N, 0, nvars),
+        b_le=torch.zeros(N, 0),
+        obj_c=torch.zeros(N, nvars),
+        obj_const=torch.zeros(N),
+    )
+    try:
+        GurobiSolver().solve_batch(p)
+        raise AssertionError("expected NotImplementedError for N=2")
+    except NotImplementedError as e:
+        msg = str(e)
+        assert "N=2" in msg, f"diagnostic message missing N=2: {msg}"
+        assert "TorchLPSolver" in msg, f"diagnostic message missing TorchLPSolver: {msg}"
+
+
+if __name__ == "__main__":
+    import sys
+
+    tests = [
+        _test_solve_batch_n1_sat,
+        _test_solve_batch_n1_infeasible,
+        _test_solve_batch_n_greater_than_1_raises,
+    ]
+    failed = 0
+    for t in tests:
+        try:
+            t()
+            name = t.__name__
+            if not _HAS_GUROBI:
+                pass
+            else:
+                print(f"PASS  {name}")
+        except Exception as e:
+            print(f"FAIL  {t.__name__}: {e}")
+            failed += 1
+    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    sys.exit(failed)

@@ -104,8 +104,6 @@ __all__ = [
     "analyze",
     "initialize_tf_mode",
     # Export
-    "export_to_solver",
-    "to_numpy",
     # Solvers
     "Solver",
     "SolverCaps",
@@ -131,7 +129,6 @@ __all__ = [
     "split_subproblems",
     "BaBConfig",
     "verify_bab",
-    "check_violation_at_point",
     "BranchingStrategy",
     "Scheduler",
 ]

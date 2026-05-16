@@ -9,6 +9,7 @@ on:
 
 env:
   PYTHONPATH: ${{ github.workspace }}
+  ACT_NETS_DIR: act/back_end/examples/nets
   ACT_CI_MODE: "true"
   ACT_SOLVER: "torch"
   ACT_DEVICE: "cpu"
@@ -28,7 +29,7 @@ jobs:
 
       - name: Clean pip cache
         run: |
-          pip cache purge || true
+          pip cache purge
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,50 +37,58 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.9"
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install coverage torch torchvision onnx onnx2torch tensorflow pandas numpy pyyaml tqdm pytest psutil transformers scikit-learn
+          pip install coverage torch onnx onnx2torch pandas numpy pyyaml tqdm psutil
 
       - name: Run BaB module tests
         run: |
           cd ${{ github.workspace }}
           coverage run -p --source=act -m act.back_end.bab.bab
 
+      - name: Cache generated networks
+        id: nets-cache
+        uses: actions/cache@v4
+        with:
+          path: act/back_end/examples/nets
+          key: act-nets-${{ hashFiles('act/back_end/examples/config_gen_act_net.yaml', 'act/back_end/net_factory.py', 'act/back_end/config.yaml') }}
+          restore-keys: |
+            act-nets-
+
       - name: Generate example networks
+        if: steps.nets-cache.outputs.cache-hit != 'true'
         run: |
           cd ${{ github.workspace }}
           coverage run -p --source=act -m act.back_end --generate
 
-      - name: Run BaB verification (float64) over all generated nets
+      - name: Run broad verification (float64) over all generated nets
         run: |
           cd ${{ github.workspace }}
-          NETS_DIR=act/back_end/examples/nets
-          # Iterate every *.json under nets/ (skip _meta/manifest.json).
-          # All settings from act/back_end/config.yaml + ACT_* env vars above.
-          # '|| true' on each invocation: BaB / MILP export may not yet
-          # support every layer kind (e.g. CONVTRANSPOSE2D / CONV1D
-          # cons_exportor entries are not yet wired); we still want the
-          # successful nets' coverage signal uploaded.
-          for net in "$NETS_DIR"/*.json; do
-            [ -f "$net" ] || continue
-            echo "=== BaB verify: $(basename "$net") ==="
-            coverage run -p --source=act -m act.back_end --verify --network "$net" || true
+          coverage run -p --source=act -m act.back_end --verify-all "$ACT_NETS_DIR" --no-bab
+
+      - name: Run BaB integration on representative nets
+        run: |
+          cd ${{ github.workspace }}
+          for net in layer_testing_bab_deep layer_testing_lrelu mlp_block_4x16_32x1_1568868034; do
+            coverage run -p --source=act -m act.back_end --verify \
+              --network "$ACT_NETS_DIR/$net.json" --bab \
+              --timeout 30 --bab-max-depth 8 --bab-max-subproblems 300
           done
 
       - name: Combine coverage data
         if: always()
         run: |
           cd ${{ github.workspace }}
-          coverage combine || true
-          coverage xml -o coverage.xml || true
-          coverage report || true
+          coverage combine
+          coverage xml -o coverage.xml
+          coverage report
 
       - name: Upload coverage to Codecov
         if: always()
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           files: ./coverage.xml
           flags: bab

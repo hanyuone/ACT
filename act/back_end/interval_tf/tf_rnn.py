@@ -323,9 +323,21 @@ def _get_shape_param(L: Layer, key: str) -> tuple[int, ...]:
     return tuple(int(dim) for dim in L.get_tuple(key))
 
 def _reshape_sequence_bounds(Bin: Bounds, input_shape, batch_first: bool) -> Bounds:
-    """Reshape sequence inputs and normalize to [B, T, F] for the time loop."""
-    seq_lb = Bin.lb.reshape(input_shape)
-    seq_ub = Bin.ub.reshape(input_shape)
+    """Reshape sequence inputs and normalize to [B, T, F] for the time loop.
+
+    ``input_shape`` records the JSON's native batch dim (typically B=1); the
+    actual bounds may have been batchified to B>1 by validate_verifier or
+    test fixtures. We infer the runtime B from the bounds' numel and the
+    per-batch shape recorded in ``input_shape``.
+    """
+    shape = tuple(int(d) for d in input_shape)
+    t_dim = shape[1] if batch_first else shape[0]
+    f_dim = shape[2]
+    per_batch_numel = t_dim * f_dim
+    B_runtime = Bin.lb.numel() // per_batch_numel
+    target = (B_runtime, t_dim, f_dim) if batch_first else (t_dim, B_runtime, f_dim)
+    seq_lb = Bin.lb.reshape(target)
+    seq_ub = Bin.ub.reshape(target)
     if not batch_first:
         seq_lb = seq_lb.permute(1, 0, 2).contiguous()
         seq_ub = seq_ub.permute(1, 0, 2).contiguous()

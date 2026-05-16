@@ -132,14 +132,14 @@ def split_subproblems(
     new_depths = batch.depths + 1
 
     left = SubproblemBatch(
-        lb=batch.lb.clone(),
+        lb=batch.lb,
         ub=left_ub,
-        depths=new_depths.clone(),
+        depths=new_depths,
     )
     right = SubproblemBatch(
         lb=right_lb,
-        ub=batch.ub.clone(),
-        depths=new_depths.clone(),
+        ub=batch.ub,
+        depths=new_depths,
     )
     return left, right
 

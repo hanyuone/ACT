@@ -273,9 +273,24 @@ def _read_rnn_config(L: Layer, *, op_name: str) -> dict:
 
 
 def _seq_view(Bin: Bounds, cfg: dict):
-    """Reshape Bin from flat (numel,) to (B, T, F) regardless of layout."""
-    seq_lb = Bin.lb.reshape(cfg["input_shape"])
-    seq_ub = Bin.ub.reshape(cfg["input_shape"])
+    """Reshape Bin from flat (numel,) or [B,T,F] to (B, T, F) regardless of layout.
+
+    ``cfg["input_shape"]`` records the JSON's native batch dim (typically B=1);
+    the actual bounds may have been batchified to B>1. We infer the runtime
+    B from numel and update ``cfg["batch"]`` in place so downstream code
+    (cell state init, output stacking) sees the correct batch size.
+    """
+    shape = tuple(int(d) for d in cfg["input_shape"])
+    t_dim = shape[1] if cfg["batch_first"] else shape[0]
+    f_dim = shape[2]
+    per_batch_numel = t_dim * f_dim
+    B_runtime = Bin.lb.numel() // per_batch_numel
+    cfg["batch"] = B_runtime
+    target = (
+        (B_runtime, t_dim, f_dim) if cfg["batch_first"] else (t_dim, B_runtime, f_dim)
+    )
+    seq_lb = Bin.lb.reshape(target)
+    seq_ub = Bin.ub.reshape(target)
     if not cfg["batch_first"]:
         seq_lb = seq_lb.permute(1, 0, 2).contiguous()
         seq_ub = seq_ub.permute(1, 0, 2).contiguous()

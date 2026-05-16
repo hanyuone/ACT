@@ -114,6 +114,8 @@ def _activation_to_neuron_matrix(activation: torch.Tensor) -> torch.Tensor:
         return activation  # (N, neurons)
     if activation.dim() == 4:
         return activation.abs().amax(dim=(2, 3))  # (N, C)
+    if activation.dim() == 1:
+        return activation.unsqueeze(1)  # (N, 1)
     return activation.flatten(start_dim=1)  # (N, K)
 
 

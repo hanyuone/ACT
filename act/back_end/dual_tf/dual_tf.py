@@ -33,19 +33,30 @@ class DualTF(TransferFunction):
         LayerKind.DENSE.value: "_backward_dense",
         LayerKind.RELU.value: "_backward_relu",
         LayerKind.CONV2D.value: "_backward_conv2d",
-        "BIAS": "_backward_bias", "SCALE": "_backward_scale", "BN": "_backward_bn",
-        "LRELU": "_backward_relu",  # TODO: proper leaky ReLU
+        LayerKind.BIAS.value: "_backward_bias",
+        LayerKind.SCALE.value: "_backward_scale",
+        LayerKind.BN.value: "_backward_bn",
+        LayerKind.LRELU.value: "_backward_relu",  # TODO: proper leaky ReLU
         # Identity-like
         LayerKind.INPUT.value: "_backward_identity",
         LayerKind.INPUT_SPEC.value: "_backward_identity",
         LayerKind.ASSERT.value: "_backward_identity",
-        "FLATTEN": "_backward_identity", "RESHAPE": "_backward_identity",
-        "TRANSPOSE": "_backward_identity", "SQUEEZE": "_backward_identity",
-        "UNSQUEEZE": "_backward_identity",
+        LayerKind.FLATTEN.value: "_backward_identity",
+        LayerKind.RESHAPE.value: "_backward_identity",
+        LayerKind.TRANSPOSE.value: "_backward_identity",
+        LayerKind.SQUEEZE.value: "_backward_identity",
+        LayerKind.UNSQUEEZE.value: "_backward_identity",
+        # SLICE / GATHER intentionally absent: their backward operation is a
+        # scatter (inverse indexing), not identity. Adding them as identity
+        # here would produce unsound dual bounds. They are correctly handled
+        # in interval_tf / hybridz_tf modes (sound forward bounds via
+        # tf_slice / tf_gather), and validate_verifier --tf-modes=dual will
+        # SKIP nets containing these kinds rather than silently misbehave.
         # Smooth activations (S-shaped with tangent relaxation)
-        "SIGMOID": "_backward_sigmoid", "TANH": "_backward_tanh",
+        LayerKind.SIGMOID.value: "_backward_sigmoid",
+        LayerKind.TANH.value: "_backward_tanh",
         # Multi-input operations (residual connections)
-        "ADD": "_backward_add",
+        LayerKind.ADD.value: "_backward_add",
         LayerKind.CONSTANT.value: "_backward_identity",
         LayerKind.SIGN.value: "_backward_identity",
         LayerKind.REDUCE_SUM.value: "_backward_identity",
