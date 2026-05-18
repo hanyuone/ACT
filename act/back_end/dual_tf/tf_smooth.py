@@ -1,115 +1,160 @@
 #===- act/back_end/dual_tf/tf_smooth.py - Smooth Activation Dual TF -----====#
 # ACT: Abstract Constraint Transformer
-# Copyright (C) 2025– ACT Team
-#
-# Licensed under the GNU Affero General Public License v3.0 or later (AGPLv3+).
-# Distributed without any warranty; see <http://www.gnu.org/licenses/>.
+# Copyright (C) 2025- ACT Team
+# Licensed under AGPLv3+; distributed without warranty.
 #===---------------------------------------------------------------------===#
-#
-# Purpose:
-#   Smooth activation dual backward (Sigmoid, Tanh). Tangent-line relaxation.
-#   Unified dual_smooth_backward() works for any S-shaped function given f, f'.
-#     - v >= 0: use lower bound (tangent/chord), contrib = v * b_lower
-#     - v < 0: use upper bound (chord/tangent), contrib = v * b_upper
-#
+# Batch-aware smooth (S-shaped) activation backward.
+# nu: [B, *shape] -> v_out: [B, *shape], contrib: [B].
 #===---------------------------------------------------------------------===#
+
+# Note: Gradient enablement for dual backward helpers is governed by the
+# caller's torch.set_grad_enabled() context (see DualSolver.evaluate_spec).
+# @torch.no_grad() decorators on these helpers were removed to allow
+# gradient flow during robust training; verify_once / verify_bab paths
+# remain under no_grad via their own outer guards.
 
 import torch
-from typing import Tuple, Callable
+from typing import Tuple, Callable, Dict, Any, List
 from act.back_end.core import Bounds
+from .tf_mlp import _batch_flatten_bounds
+from .tf_forward import LinearBound, Frame, _reset_forward_box
 
-# -------- Activation Functions --------
+
+# ---- Shared primitives ----
+
 def sigmoid(x: torch.Tensor) -> torch.Tensor:
-    """Sigmoid: f(x) = 1 / (1 + exp(-x))"""
     return torch.sigmoid(x)
 
 def dsigmoid(x: torch.Tensor) -> torch.Tensor:
-    """Sigmoid derivative: f'(x) = f(x) * (1 - f(x))"""
     s = torch.sigmoid(x); return s * (1 - s)
 
 def tanh(x: torch.Tensor) -> torch.Tensor:
-    """Tanh: f(x) = (exp(x) - exp(-x)) / (exp(x) + exp(-x))"""
     return torch.tanh(x)
 
 def dtanh(x: torch.Tensor) -> torch.Tensor:
-    """Tanh derivative: f'(x) = 1 - tanh(x)^2"""
     return 1 - torch.tanh(x) ** 2
 
-# -------- Linear Relaxation --------
-@torch.no_grad()
+
 def compute_smooth_relaxation(
     l: torch.Tensor, u: torch.Tensor,
     func: Callable[[torch.Tensor], torch.Tensor],
     dfunc: Callable[[torch.Tensor], torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Linear relaxation (k_lo, b_lo, k_hi, b_hi) for S-shaped f on [l, u].
+
+    Works element-wise on any broadcastable shape (including batched [B, n]).
     """
-    Compute linear relaxation for S-shaped f(x) on [l, u].
-    Returns (k_lower, b_lower, k_upper, b_upper) for y = k*x + b bounds.
-    
-    S-shaped (convex x<0, concave x>0): l>=0 lower=tangent@l, u<=0 upper=tangent@u.
-    """
-    assert (l <= u).all(), f"Invalid bounds: l > u at {(l > u).nonzero().flatten().tolist()[:5]}"
-    
+    assert (l <= u).all(), "Invalid bounds: l > u"
     f_l, f_u = func(l), func(u)
-    
-    # Chord slope
     denom = (u - l).clamp(min=1e-12)
     k_chord = (f_u - f_l) / denom
-    
-    # Initialize with chord (always sound)
     k_lower, k_upper = k_chord.clone(), k_chord.clone()
     b_lower = f_l - k_lower * l
     b_upper = f_l - k_upper * l
-    
-    # l >= 0 (concave): tangent at l for lower bound
+
     mask_pos = l >= 0
     if mask_pos.any():
         k_tan = dfunc(l)
-        k_lower[mask_pos] = k_tan[mask_pos]
-        b_lower[mask_pos] = f_l[mask_pos] - k_tan[mask_pos] * l[mask_pos]
-    
-    # u <= 0 (convex): tangent at u for upper bound
+        k_lower = torch.where(mask_pos, k_tan, k_lower)
+        b_lower = torch.where(mask_pos, f_l - k_tan * l, b_lower)
+
     mask_neg = u <= 0
     if mask_neg.any():
         k_tan = dfunc(u)
-        k_upper[mask_neg] = k_tan[mask_neg]
-        b_upper[mask_neg] = f_u[mask_neg] - k_tan[mask_neg] * u[mask_neg]
-    
+        k_upper = torch.where(mask_neg, k_tan, k_upper)
+        b_upper = torch.where(mask_neg, f_u - k_tan * u, b_upper)
+
     return k_lower, b_lower, k_upper, b_upper
 
-# -------- Smooth Backward --------
-@torch.no_grad()
+
 def dual_smooth_backward(
     nu: torch.Tensor, bounds: Bounds,
     func: Callable[[torch.Tensor], torch.Tensor],
     dfunc: Callable[[torch.Tensor], torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Smooth activation backward: v_out = v*k, contrib = sum(v*b). Adaptive bound selection."""
-    l, u = bounds.lb.flatten(), bounds.ub.flatten()
-    v = nu.flatten()
-    
-    # Align sizes if needed
-    n = min(v.numel(), l.numel())
-    if v.numel() != l.numel(): l, u, v = l[:n], u[:n], v[:n]
-    
-    # Compute relaxation and select bound based on sign of v
+    """Batched smooth activation backward with sign-adaptive bound selection."""
+    B = nu.shape[0]
+    l, u = _batch_flatten_bounds(bounds, B)
+    v = nu.flatten(start_dim=1)
+    n = min(v.shape[-1], l.shape[-1])
+    if v.shape[-1] != l.shape[-1]:
+        l, u, v = l[..., :n], u[..., :n], v[..., :n]
+
     k_lower, b_lower, k_upper, b_upper = compute_smooth_relaxation(l, u, func, dfunc)
     v_pos = v >= 0
     k = torch.where(v_pos, k_lower, k_upper)
     b = torch.where(v_pos, b_lower, b_upper)
-    
-    v_out = v * k
-    contrib = (v * b).sum()
-    
+
+    v_out = v * k                                                 # [B, n]
+    contrib = (v * b).sum(dim=-1)                                 # [B]
     return v_out, contrib
 
-# -------- Sigmoid / Tanh --------
-@torch.no_grad()
-def dual_sigmoid_backward(nu: torch.Tensor, bounds: Bounds) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Sigmoid backward: tangent-line relaxation for f(x) = 1/(1+exp(-x))."""
-    return dual_smooth_backward(nu, bounds, sigmoid, dsigmoid)
+
+# ---- SIGMOID ----
 
 @torch.no_grad()
-def dual_tanh_backward(nu: torch.Tensor, bounds: Bounds) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Tanh backward: tangent-line relaxation for f(x) = tanh(x)."""
+def forward_sigmoid(
+    L: Any, parent_boxes: List[Bounds], parent_lins: List[LinearBound],
+    parent_frames: List[Frame], preds: List[int], post_activation: bool,
+    device: torch.device, dtype: torch.dtype,
+) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
+    """Forward pass for SIGMOID activation.
+
+    Body copied from tf_forward.py lines 426-430 (SIGMOID branch).
+    Returns (stored, out, lin, frame).
+    """
+    parent_box = parent_boxes[0]
+    pre_lb, pre_ub = parent_box.lb, parent_box.ub
+    out = Bounds(torch.sigmoid(pre_lb), torch.sigmoid(pre_ub))
+    stored = out if post_activation else Bounds(pre_lb, pre_ub)
+    lin, frame = _reset_forward_box(out.lb, out.ub, device, dtype)
+    return stored, out, lin, frame
+
+
+def backward_sigmoid(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
+                     preds: List[int]) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    bounds = bounds_dict.get(L.id)
+    if bounds is None:
+        raise ValueError(f"backward_sigmoid: layer {L.id} missing bounds in bounds_dict")
+    nu_out, contrib = dual_sigmoid_backward(nu, bounds)
+    assert len(preds) == 1, f"SIGMOID expects 1 predecessor, got {len(preds)}"
+    return [nu_out], contrib
+
+
+def dual_sigmoid_backward(nu: torch.Tensor, bounds: Bounds):
+    return dual_smooth_backward(nu, bounds, sigmoid, dsigmoid)
+
+
+# ---- TANH ----
+
+@torch.no_grad()
+def forward_tanh(
+    L: Any, parent_boxes: List[Bounds], parent_lins: List[LinearBound],
+    parent_frames: List[Frame], preds: List[int], post_activation: bool,
+    device: torch.device, dtype: torch.dtype,
+) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
+    """Forward pass for TANH activation.
+
+    Body copied from tf_forward.py lines 432-436 (TANH branch).
+    Returns (stored, out, lin, frame).
+    """
+    parent_box = parent_boxes[0]
+    pre_lb, pre_ub = parent_box.lb, parent_box.ub
+    out = Bounds(torch.tanh(pre_lb), torch.tanh(pre_ub))
+    stored = out if post_activation else Bounds(pre_lb, pre_ub)
+    lin, frame = _reset_forward_box(out.lb, out.ub, device, dtype)
+    return stored, out, lin, frame
+
+
+def backward_tanh(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
+                  preds: List[int]) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    bounds = bounds_dict.get(L.id)
+    if bounds is None:
+        raise ValueError(f"backward_tanh: layer {L.id} missing bounds in bounds_dict")
+    nu_out, contrib = dual_tanh_backward(nu, bounds)
+    assert len(preds) == 1, f"TANH expects 1 predecessor, got {len(preds)}"
+    return [nu_out], contrib
+
+
+def dual_tanh_backward(nu: torch.Tensor, bounds: Bounds):
     return dual_smooth_backward(nu, bounds, tanh, dtanh)

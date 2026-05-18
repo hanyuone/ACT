@@ -23,10 +23,11 @@ class SolveStatus:
     UNKNOWN = "UNKNOWN"      # Inconclusive (timeout/spurious/error)
 
 class SolverCaps:
-    def __init__(self, supports_gpu: bool = False, supports_csp: bool = True, supports_hz: bool = False):
+    def __init__(self, supports_gpu: bool = False, supports_csp: bool = True, supports_hz: bool = False, supports_dual: bool = False):
         self.supports_gpu = supports_gpu
         self.supports_csp = supports_csp
         self.supports_hz = supports_hz
+        self.supports_dual = supports_dual
 
 class Solver:
     """Abstract solver interface used by the exporter and verification pipeline."""

@@ -80,6 +80,79 @@ class VerifyResult:
         return self.status == VerifyStatus.CERTIFIED
 
 
+@dataclass(frozen=True)
+class SpecBatchResult:
+    """Batched per-spec verification result — solver-agnostic.
+
+    Vectorized counterpart of ``VerifyResult``: carries ``[B, M]`` margins
+    and slack tensors plus a ``[B]`` certification bool. Produced by any
+    solver path that evaluates B samples against M specs in one pass
+    (currently DualSolver; interval/hz paths could adopt this contract for
+    consistency). Use ``to_verify_results()`` to lower into the per-sample
+    ``List[VerifyResult]`` API.
+
+    Attributes:
+        margins:     [B, M] - margin per (sample, spec) cell (interpretation
+                              depends on the solver's certification form;
+                              see ``source`` metadata in to_verify_results).
+        slack:       [B, M] - margin - threshold, with `slack >= 0` denoting
+                              certified cells.
+        active_mask: [B, M] bool - which cells participated in certification.
+        certified:   [B] bool - True iff every active cell has `slack >= 0`.
+    """
+    margins: torch.Tensor
+    slack: torch.Tensor
+    active_mask: torch.Tensor
+    certified: torch.Tensor
+
+    def __post_init__(self) -> None:
+        assert self.margins.dim() == 2, f"margins must be [B, M], got {self.margins.shape}"
+        assert self.slack.shape == self.margins.shape
+        assert self.active_mask.shape == self.margins.shape
+        assert self.active_mask.dtype == torch.bool
+        assert self.certified.shape == (self.margins.shape[0],)
+        assert self.certified.dtype == torch.bool
+
+    @property
+    def min_slack(self) -> torch.Tensor:
+        """[B] - min slack over active cells, +inf for all-inactive samples."""
+        inf_fill = torch.full_like(self.slack, float("inf"))
+        masked = torch.where(self.active_mask, self.slack, inf_fill)
+        return masked.min(dim=-1).values
+
+    @property
+    def worst_violation(self) -> torch.Tensor:
+        """[B] - min of clamp(slack, max=0) over active cells. Zero if all pass."""
+        inf_fill = torch.full_like(self.slack, float("inf"))
+        masked = torch.where(self.active_mask, self.slack, inf_fill)
+        return masked.clamp(max=0.0).min(dim=-1).values
+
+    def to_verify_results(self, *, source: str = "dual_bound") -> List["VerifyResult"]:
+        """Convert per-sample to ``List[VerifyResult]``.
+
+        Maps ``certified[b] -> CERTIFIED``, else ``UNKNOWN``. Counterexample
+        is None for all (batched solver paths do not extract concrete CEs;
+        FALSIFIED requires inline concrete-falsification in the caller).
+        """
+        results: List[VerifyResult] = []
+        min_slack_vals = self.min_slack
+        B = self.margins.shape[0]
+        for b in range(B):
+            status = (VerifyStatus.CERTIFIED if bool(self.certified[b].item())
+                      else VerifyStatus.UNKNOWN)
+            results.append(VerifyResult(
+                status=status,
+                counterexample=None,
+                metadata={
+                    "margins": self.margins[b].detach().cpu().tolist(),
+                    "slack": self.slack[b].detach().cpu().tolist(),
+                    "min_slack": float(min_slack_vals[b].item()),
+                    "source": source,
+                },
+            ))
+        return results
+
+
 # =============================================================================
 # Statistics and Logging Utilities
 # =============================================================================

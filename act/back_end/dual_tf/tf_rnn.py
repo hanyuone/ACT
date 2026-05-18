@@ -7,9 +7,8 @@
 #===---------------------------------------------------------------------===#
 #
 # Purpose:
-#   RNN dual backward functions (LSTM, GRU). Requires unrolling through time
-#   and handling gates with interval bounds.
-#   Forward bounds handled by IntervalTF (see tf_forward.py).
+#   RNN dual forward/backward handlers (LSTM, GRU). Registry-contract stubs
+#   — bodies pending real implementations. See plan §6.5 / §5.
 #
 #===---------------------------------------------------------------------===#
 
@@ -17,24 +16,35 @@ import torch
 from typing import Tuple, Optional, Dict
 from act.back_end.core import Bounds
 
-# -------- LSTM --------
-@torch.no_grad()
-def dual_lstm_backward(
-    nu: torch.Tensor, weight_ih: torch.Tensor, weight_hh: torch.Tensor,
-    bias_ih: Optional[torch.Tensor] = None, bias_hh: Optional[torch.Tensor] = None,
-    bounds_dict: Optional[Dict[str, Bounds]] = None, seq_len: int = 1,
-    hidden_size: Optional[int] = None
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """LSTM backward through time. Requires gate bounds from forward pass. (Pending)"""
-    raise NotImplementedError("dual_lstm_backward: pending")
 
-# -------- GRU --------
-@torch.no_grad()
-def dual_gru_backward(
-    nu: torch.Tensor, weight_ih: torch.Tensor, weight_hh: torch.Tensor,
-    bias_ih: Optional[torch.Tensor] = None, bias_hh: Optional[torch.Tensor] = None,
-    bounds_dict: Optional[Dict[str, Bounds]] = None, seq_len: int = 1,
-    hidden_size: Optional[int] = None
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """GRU backward through time. Requires gate bounds from forward pass. (Pending)"""
-    raise NotImplementedError("dual_gru_backward: pending")
+def forward_lstm(L, parent_boxes, parent_lins, parent_frames, preds,
+                 post_activation, device, dtype):
+    """LSTM forward bounds via linear relaxation through time. (Pending)
+    Will require: gate bounds per timestep, weight_ih/weight_hh, seq_len,
+    hidden_size. See auto_LiRPA forward_bound.py for reference impl.
+    """
+    raise NotImplementedError("forward for LSTM not implemented in dual_tf")
+
+
+def backward_lstm(L, nu, bounds_dict, preds):
+    """LSTM backward through time. (Pending)
+    Will require: gate bounds from forward pass, per-timestep weight matrices
+    (weight_ih, weight_hh), seq_len, hidden_size.
+    """
+    raise NotImplementedError("backward for LSTM not implemented in dual_tf")
+
+
+def forward_gru(L, parent_boxes, parent_lins, parent_frames, preds,
+                post_activation, device, dtype):
+    """GRU forward bounds via linear relaxation through time. (Pending)
+    Will require: gate bounds per timestep, weight_ih/weight_hh, seq_len,
+    hidden_size.
+    """
+    raise NotImplementedError("forward for GRU not implemented in dual_tf")
+
+
+def backward_gru(L, nu, bounds_dict, preds):
+    """GRU backward through time. (Pending)
+    Will require: gate bounds from forward pass, per-timestep weight matrices.
+    """
+    raise NotImplementedError("backward for GRU not implemented in dual_tf")

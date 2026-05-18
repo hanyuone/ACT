@@ -44,7 +44,7 @@
 #     certification; they are preserved for the batch-native solver path.
 
 from __future__ import annotations
-from typing import Optional, List, Callable, Dict, Any, TYPE_CHECKING
+from typing import Optional, List, Callable, Dict, Any, TYPE_CHECKING, cast
 
 import torch
 import copy
@@ -468,6 +468,7 @@ def verify_once(
         for FALSIFIED lanes.
     """
     from act.back_end.analyze import analyze
+    from act.back_end.transfer_functions import get_transfer_function
 
     # 1. Extract structure and seed.
     entry_id = find_entry_layer_id(net)
@@ -485,6 +486,47 @@ def verify_once(
             f"expand INPUT_SPEC lb/ub to [B, ...] before calling verify_once."
         )
     B = seed_bounds.lb.shape[0]
+
+    # Dual standalone mode: when tf_mode='dual', route through
+    # DualSolver.evaluate_spec instead of analyze() + interval cert.
+    # LP/Gurobi path remains authoritative for interval/hybridz modes.
+    try:
+        active_tf = get_transfer_function()
+        is_dual_mode = active_tf.name == "DualTF"
+    except Exception:
+        is_dual_mode = False
+
+    if is_dual_mode:
+        from act.back_end.dual_tf.dual_tf import DualTF
+        from act.back_end.dual_tf.tf_forward import compute_forward_bounds
+        from act.back_end.solver.solver_dual import DualSolver
+        from act.front_end.specs import OutputSpec
+
+        def _unbatch(val: Any) -> Any:
+            # ASSERT params are pre-batchified ([B, ...]) by FE; OutputSpec
+            # constructor expects unbroadcasted scalar/1-D form. Single-property
+            # batch verification: all rows share the same spec, so row 0 is the
+            # canonical form. Per-sample-varying spec support is a future task.
+            if isinstance(val, torch.Tensor) and val.dim() >= 1 and val.shape[0] == B:
+                return val[0]
+            return val
+
+        bounds_dict = compute_forward_bounds(
+            net, seed_bounds.lb, seed_bounds.ub, post_activation=False,
+        )
+        out_spec = OutputSpec(
+            kind=assert_layer.params.get("kind"),
+            c=_unbatch(assert_layer.params.get("c")),
+            d=_unbatch(assert_layer.params.get("d")),
+            y_true=assert_layer.params.get("y_true"),
+            margin=_unbatch(assert_layer.params.get("margin")),
+            lb=_unbatch(assert_layer.params.get("lb")),
+            ub=_unbatch(assert_layer.params.get("ub")),
+        )
+        num_classes = len(output_ids)
+        solver = DualSolver(tf=cast("DualTF", active_tf))
+        result = solver.evaluate_spec(net, bounds_dict, out_spec, num_classes=num_classes)
+        return result.to_verify_results()
 
     # 2. Build entry_fact (with all INPUT_SPEC constraints) and analyze.
     entry_fact = Fact(bounds=seed_bounds, cons=ConSet())
