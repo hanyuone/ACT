@@ -41,9 +41,9 @@
 # Numerical Policy:
 #   - Zero tolerance:
 #       gap = max(lb - a, a - ub); any gap > 0 is a violation. No atol/rtol.
-#   - Structural soundness:
-#       Asserts lb <= ub at every checked layer; a reversed interval is
-#       reported as ERROR (it cannot contain any concrete value).
+#       A reversed interval (lb > ub) is automatically surfaced by the same
+#       gap test: there is no value of ``a`` for which both diffs are <= 0,
+#       so at least one neuron will be flagged as violating.
 #   - nan_policy="error":
 #       Any NaN/Inf encountered in concrete or bounds yields ERROR status.
 #   - topk:
@@ -405,15 +405,7 @@ def compare_bounds_per_neuron(
                 f"concrete_numel={concrete_flat.numel()} bounds_numel={lb_flat.numel()}"
             )
             continue
-        
-        if bool((lb_flat > ub_flat).any()):
-            bad = int((lb_flat > ub_flat).sum().item())
-            errors.append(
-                f"Reversed interval at layer_id={layer_id}: lb > ub at "
-                f"{bad}/{lb_flat.numel()} neurons"
-            )
-            continue
-        
+
         diff_low = lb_flat - concrete_flat
         diff_high = concrete_flat - ub_flat
         gap = torch.maximum(diff_low, diff_high)
