@@ -13,7 +13,7 @@ License: AGPLv3+
 import argparse
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 import sys
 
 from act.util.cli_utils import add_device_args, initialize_from_args
@@ -34,76 +34,9 @@ from act.pipeline.verification.per_neuron_bounds import PerNeuronCheckConfig
 # -----------------------------------------------------------------------------
 # Per-neuron bounds validation settings (Level 2)
 #
-# Compares each concrete activation a against its abstract interval [lb, ub]
-# with a tolerance band:
-#   tol = atol + rtol * |a|
-#   violation if a < lb - tol or a > ub + tol
-#
-# Parameters:
-#   - atol: absolute tolerance (constant slack for numeric noise)
-#   - rtol: relative tolerance (scale-dependent slack proportional to |a|)
-#   - topk: report at most top-K largest gaps (ranked by gap to bounds)
-#
-# Formats:
-#   - preset: {default|strict|loose}
-#   - triplet: "ATOL,RTOL,TOPK" (e.g., "1e-6,0.0,10")
-#
-# Presets:
-#   - default: balanced for day-to-day validation.
-#              Moderate atol/rtol to tolerate typical FP/back-end differences,
-#              with a medium topk for actionable debugging output.
-#
-#   - strict:  tighter numeric guardrails.
-#              Smaller atol/rtol to surface subtle bound unsoundness or drift
-#              (may increase false positives from benign numeric noise); larger
-#              topk to expose more failing neurons when investigating.
-#
-#   - loose:   coarse triage / CI-friendly mode.
-#              Larger atol/rtol to suppress tiny numerical mismatches, and
-#              smaller topk to keep logs short; may hide small-but-real issues,
-#              so use mainly for quick smoke checks.
+# Zero-tolerance check: any concrete activation outside [lb, ub] is reported as
+# unsoundness. 
 # -----------------------------------------------------------------------------
-class PerNeuronConfigAction(argparse.Action):
-    """
-    Parse --per-neuron-config into a PerNeuronCheckConfig object.
-
-    Accepted formats:
-      - preset name: default|strict|loose
-      - triplet: ATOL,RTOL,TOPK (e.g., 1e-6,0.0,10)
-    """
-
-    PRESETS: Dict[str, PerNeuronCheckConfig] = {
-        "default": PerNeuronCheckConfig(atol=1e-6, rtol=0.0, topk=10),
-        "strict": PerNeuronCheckConfig(atol=1e-8, rtol=0.0, topk=20),
-        "loose": PerNeuronCheckConfig(atol=1e-4, rtol=1e-5, topk=5),
-    }
-    DEFAULT_NAME = "default"
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        raw = str(values).strip()
-        if raw in self.PRESETS:
-            setattr(namespace, self.dest, self.PRESETS[raw])
-            return
-        parts = [p.strip() for p in raw.split(",")]
-        if len(parts) != 3:
-            raise argparse.ArgumentError(
-                self,
-                "Invalid --per-neuron-config. Use preset {default|strict|loose} "
-                "or triplet 'ATOL,RTOL,TOPK' (e.g., 1e-6,0.0,10).",
-            )
-        try:
-            cfg = PerNeuronCheckConfig(
-                atol=float(parts[0]),
-                rtol=float(parts[1]),
-                topk=int(parts[2]),
-            )
-        except ValueError as exc:
-            raise argparse.ArgumentError(
-                self,
-                "Invalid --per-neuron-config values. Expected 'ATOL,RTOL,TOPK' "
-                "(e.g., 1e-6,0.0,10).",
-            ) from exc
-        setattr(namespace, self.dest, cfg)
 
 
 def print_header():
@@ -673,7 +606,7 @@ def cmd_validate_verifier(args):
         solvers: list of solvers to use (default: gurobi torchlp)
         tf_modes: list of transfer function modes to use (default: interval)
         samples: number of samples to use (default: 10)
-        per_neuron_config: per-neuron configuration (default: default)
+        per_neuron_topk: number of worst per-neuron violations to report
     """
     import torch
     from act.pipeline.verification.validate_verifier import VerificationValidator
@@ -690,7 +623,7 @@ def cmd_validate_verifier(args):
     networks = args.networks.split(",") if args.networks else None
 
     try:
-        per_neuron_config = args.per_neuron_config
+        per_neuron_config = PerNeuronCheckConfig(topk=int(args.per_neuron_topk))
         batch_sizes = _resolve_batch_sizes(getattr(args, "batch_sizes", None))
         if args.mode == "counterexample":
             summary = validator.validate_counterexamples(
@@ -783,8 +716,7 @@ Examples:
   python -m act.pipeline --validate-verifier --device cpu --dtype float64
   python -m act.pipeline --validate-verifier --mode counterexample
   python -m act.pipeline --validate-verifier --mode bounds --input-samples 20
-  python -m act.pipeline --validate-verifier --mode bounds --per-neuron-config strict
-  python -m act.pipeline --validate-verifier --mode bounds --per-neuron-config 1e-6,0.0,15
+  python -m act.pipeline --validate-verifier --mode bounds --per-neuron-topk 20
         """,
     )
 
@@ -967,11 +899,13 @@ Examples:
         help="Number of input samples for Level 2 bounds validation (default: 10)",
     )
     validation_group.add_argument(
-        "--per-neuron-config",
-        action=PerNeuronConfigAction,
-        default=PerNeuronConfigAction.PRESETS[PerNeuronConfigAction.DEFAULT_NAME],
-        metavar="PRESET|ATOL,RTOL,TOPK",
-        help="Per-neuron bounds preset (default|strict|loose) or triplet 'ATOL,RTOL,TOPK'.",
+        "--per-neuron-topk",
+        type=int,
+        default=10,
+        metavar="K",
+        help="Number of worst per-neuron violations to report (default: 10). "
+        "The bounds check itself is zero-tolerance — any deviation outside "
+        "[lb, ub] is flagged as unsound.",
     )
     validation_group.add_argument(
         "--batch-sizes",

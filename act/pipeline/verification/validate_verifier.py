@@ -1061,8 +1061,6 @@ class VerificationValidator:
                 "total_checks": total_checks,
                 "violations": violations,
                 "per_neuron_config": {
-                    "atol": per_neuron_config.atol,
-                    "rtol": per_neuron_config.rtol,
                     "topk": per_neuron_config.topk,
                 },
             }
@@ -1078,8 +1076,6 @@ class VerificationValidator:
                 "total_checks": total_checks,
                 "violations": [],
                 "per_neuron_config": {
-                    "atol": per_neuron_config.atol,
-                    "rtol": per_neuron_config.rtol,
                     "topk": per_neuron_config.topk,
                 },
             }
