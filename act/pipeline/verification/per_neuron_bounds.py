@@ -21,9 +21,12 @@
 #   - Built-in alignment to ACT layer IDs:
 #       Aligns hook events to ACT layers using a strict hookable-order strategy
 #       (with optional shape sanity checks from ACT layer params).
-#   - Per-neuron violation detection:
-#       A neuron is flagged only if it exceeds [lb, ub] beyond tolerance:
-#           tol = atol + rtol * |a|   (a = concrete activation)
+#   - Per-neuron violation detection (zero tolerance):
+#       A neuron is flagged whenever the concrete activation falls strictly
+#       outside [lb, ub]. There is no tolerance band — any deviation is
+#       reported as unsound. Compensating for floating-point noise is the
+#       responsibility of the abstract transfer functions (outward rounding),
+#       NOT this check.
 #   - Debug-oriented reporting:
 #       Computes per-layer statistics and returns the top-K worst violations
 #       (largest gaps) for fast bug localization.
@@ -36,8 +39,11 @@
 #     → run_per_neuron_bounds_check()          : single entry point
 #
 # Numerical Policy:
-#   - Tolerance: tol = atol + rtol * |a|
-#       Mitigates false positives due to floating-point roundoff.
+#   - Zero tolerance:
+#       gap = max(lb - a, a - ub); any gap > 0 is a violation. No atol/rtol.
+#       A reversed interval (lb > ub) is automatically surfaced by the same
+#       gap test: there is no value of ``a`` for which both diffs are <= 0,
+#       so at least one neuron will be flagged as violating.
 #   - nan_policy="error":
 #       Any NaN/Inf encountered in concrete or bounds yields ERROR status.
 #   - topk:
@@ -60,7 +66,7 @@
 #       input_tensor=x,
 #       entry_fact=entry_fact,
 #       tf_mode="interval",
-#       config=PerNeuronCheckConfig(atol=1e-6, rtol=0.0, topk=10),
+#       config=PerNeuronCheckConfig(topk=10),
 #   )
 #
 # Design Notes:
@@ -348,13 +354,12 @@ def compare_bounds_per_neuron(
     bounds_by_layer: Dict[int, Bounds],
     concrete_by_layer: Dict[int, torch.Tensor],
     layer_by_id: Dict[int, Layer],
-    atol: float = 1e-6,
-    rtol: float = 0.0,
     topk: int = 10,
     nan_policy: str = "error",
 ) -> Dict[str, Any]:
     """
-    Compare per-neuron concrete activations against abstract bounds.
+    Compare per-neuron concrete activations against abstract bounds with
+    zero tolerance: any concrete value outside [lb, ub] is a violation.
     """
     errors: List[str] = []
     warnings: List[str] = []
@@ -400,10 +405,9 @@ def compare_bounds_per_neuron(
                 f"concrete_numel={concrete_flat.numel()} bounds_numel={lb_flat.numel()}"
             )
             continue
-        tol = atol + rtol * concrete_flat.abs()
 
-        diff_low = (lb_flat - tol) - concrete_flat
-        diff_high = concrete_flat - (ub_flat + tol)
+        diff_low = lb_flat - concrete_flat
+        diff_high = concrete_flat - ub_flat
         gap = torch.maximum(diff_low, diff_high)
         gap = torch.clamp(gap, min=0.0)
 
@@ -482,20 +486,20 @@ def compare_bounds_per_neuron(
     }
 
 """
-A standard absolute-plus-relative tolerance used in numerical computing to 
-avoid flagging floating-point roundoff as “unsoundness”; 
+Zero-tolerance per-neuron config.
 
-A neuron as violating only if:
-    it falls outside [lb, ub] by more than atol + rtol*|a|.
+There is no atol/rtol: any concrete activation outside [lb, ub] is treated as
+unsoundness. Floating-point noise must be absorbed by the abstract transfer
+functions themselves (outward rounding), not by relaxing the check.
 
-topk: 
-    When violations occur, topk returns the K most severe violation cases, 
-    making it easier to quickly pinpoint the bug.
+topk:
+    When violations occur, topk returns the K most severe violation cases,
+    ranked by gap, to simplify debugging.
+nan_policy:
+    "error" => NaN/Inf in concrete or bounds yields ERROR status.
 """
 @dataclass(frozen=True)
 class PerNeuronCheckConfig:
-    atol: float = 1e-6
-    rtol: float = 0.0
     topk: int = 10
     nan_policy: str = "error"
 
@@ -565,8 +569,6 @@ def run_per_neuron_bounds_check(
         bounds_by_layer=bounds_for_compare,
         concrete_by_layer=concrete_by_layer,
         layer_by_id=getattr(act_net, "by_id", {}),
-        atol=config.atol,
-        rtol=config.rtol,
         topk=config.topk,
         nan_policy=config.nan_policy,
     )
