@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
@@ -48,67 +48,66 @@ jobs:
       - name: Download CIFAR-100 benchmark
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --download cifar100_2024
+          coverage run -p -m act.pipeline --download cifar100_2024
 
       - name: List downloaded data-model pairs
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --list-downloaded
+          coverage run -p -m act.pipeline --list-downloaded
 
       - name: Get benchmark info
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --info cifar100_2024
+          coverage run -p -m act.pipeline --info cifar100_2024
 
       - name: Run fuzzing with --dataset flag (short timeout for CI)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --fuzz --dataset cifar100_2024 --max-instances 2 --timeout 30 --iterations 500
+          coverage run -p -m act.pipeline --fuzz --dataset cifar100_2024 --max-instances 2 --timeout 30 --iterations 500
 
       - name: Run fuzzing with --category flag (short timeout for CI)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --fuzz --category cifar100_2024 --max-instances 2 --timeout 30 --iterations 500
+          coverage run -p -m act.pipeline --fuzz --category cifar100_2024 --max-instances 2 --timeout 30 --iterations 500
 
       - name: Test list command
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --list
+          coverage run -p -m act.pipeline --list
 
       - name: Test search command
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --search cifar
+          coverage run -p -m act.pipeline --search cifar
 
       - name: Verify act2torch round-trip on example nets
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --verify act2torch --device cpu --dtype float64
+          coverage run -p -m act.pipeline --verify act2torch --device cpu --dtype float64
 
       - name: Validate verifier counterexample mode
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float64
+          coverage run -p -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float64
 
       - name: Validate verifier bounds mode (interval)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float64 --tf-modes interval
+          coverage run -p -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float64 --tf-modes interval
 
       - name: Validate verifier bounds mode (hybridz)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float64 --tf-modes hybridz
+          coverage run -p -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float64 --tf-modes hybridz
 
-      - name: Validate verifier bounds mode (dual)
-        run: |
-          cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float64 --tf-modes dual
+      # Dual coverage lives in act-backend-{float64,float32}.yml (which run
+      # --generate before --validate-verifier --mode counterexample --solvers
+      # dual); this workflow has no --generate.
 
       - name: VNNLIB real-instance coverage (tiny test fixtures) + execution tracing
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --fuzz --category test --max-instances 5 --timeout 10 --iterations 50 --trace-level 1 --trace-sample 5
+          coverage run -p -m act.pipeline --fuzz --category test --max-instances 5 --timeout 10 --iterations 50 --trace-level 1 --trace-sample 5
           # Exercise trace_reader.py on the freshest trace file produced above.
           # Default CLI output is Path("fuzzing_results") which is CWD-relative; the
           # YAML-loaded normalization only applies when the value enters as a string,
@@ -116,7 +115,7 @@ jobs:
           # also check the YAML-normalized path for robustness.
           TRACE_FILE=$(ls -1 fuzzing_results/traces_*.json act/pipeline/log/fuzzing_results/traces_*.json 2>/dev/null | head -1)
           if [ -n "$TRACE_FILE" ]; then
-            coverage run -p --source=act -m act.pipeline.fuzzing.trace_reader "$TRACE_FILE" --summary
+            coverage run -p -m act.pipeline.fuzzing.trace_reader "$TRACE_FILE" --summary
           fi
 
       - name: Combine coverage data

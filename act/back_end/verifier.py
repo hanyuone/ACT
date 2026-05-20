@@ -487,18 +487,16 @@ def verify_once(
         )
     B = seed_bounds.lb.shape[0]
 
-    # Dual standalone mode: when tf_mode='dual', route through
-    # DualSolver.evaluate_spec instead of analyze() + interval cert.
-    # LP/Gurobi path remains authoritative for interval/hybridz modes.
-    try:
-        active_tf = get_transfer_function()
-        is_dual_mode = active_tf.name == "DualTF"
-    except Exception:
-        is_dual_mode = False
+    # Dual standalone dispatch: when ``--solver dual`` is set (β refactor moved
+    # dual from the --tf-mode axis to the --solver axis), route through
+    # DualSolver.evaluate_spec instead of analyze() + interval cert. LP/Gurobi
+    # path remains authoritative for the LP-feeding TFs (interval/hybridz).
+    # ``ensure_active_tf`` still self-heals the TF default for interval/hybridz
+    # callers; ``is_dual_solver_active`` reads the orthogonal solver-mode global.
+    from act.back_end.transfer_functions import ensure_active_tf, is_dual_solver_active
+    active_tf = ensure_active_tf("interval")
 
-    if is_dual_mode:
-        from act.back_end.dual_tf.dual_tf import DualTF
-        from act.back_end.dual_tf.tf_forward import compute_forward_bounds
+    if is_dual_solver_active():
         from act.back_end.solver.solver_dual import DualSolver
         from act.front_end.specs import OutputSpec
 
@@ -511,9 +509,6 @@ def verify_once(
                 return val[0]
             return val
 
-        bounds_dict = compute_forward_bounds(
-            net, seed_bounds.lb, seed_bounds.ub, post_activation=False,
-        )
         out_spec = OutputSpec(
             kind=assert_layer.params.get("kind"),
             c=_unbatch(assert_layer.params.get("c")),
@@ -524,8 +519,9 @@ def verify_once(
             ub=_unbatch(assert_layer.params.get("ub")),
         )
         num_classes = len(output_ids)
-        solver = DualSolver(tf=cast("DualTF", active_tf))
-        result = solver.evaluate_spec(net, bounds_dict, out_spec, num_classes=num_classes)
+        # DualSolver is now self-contained: no tf parameter, evaluate_spec
+        # computes its own forward bounds internally from the net.
+        result = DualSolver().evaluate_spec(net, out_spec, num_classes=num_classes)
         return result.to_verify_results()
 
     # 2. Build entry_fact (with all INPUT_SPEC constraints) and analyze.
@@ -853,7 +849,7 @@ def _make_dense_net_box_test(  # pragma: no cover
 
 
 def _test_setup_and_solve_batch_b1_smoke() -> None:  # pragma: no cover
-    from act.back_end.solver.solver_interval import TorchLPSolver
+    from act.back_end.solver.solver_torchlp import TorchLPSolver
     from act.util.device_manager import get_default_device, get_default_dtype
 
     device = get_default_device()
@@ -883,7 +879,7 @@ def _test_setup_and_solve_batch_b1_smoke() -> None:  # pragma: no cover
 
 
 def _test_setup_and_solve_batch_b_greater_than_1() -> None:  # pragma: no cover
-    from act.back_end.solver.solver_interval import TorchLPSolver
+    from act.back_end.solver.solver_torchlp import TorchLPSolver
     from act.util.device_manager import get_default_device, get_default_dtype
 
     device = get_default_device()
@@ -1032,7 +1028,7 @@ def _test_verify_once_b8_mixed_outcomes() -> None:  # pragma: no cover
 
 def _test_verify_lp_batched_multi_b1() -> None:  # pragma: no cover
     from act.back_end.serialization.serialization import load_net_from_file
-    from act.back_end.solver.solver_interval import TorchLPSolver
+    from act.back_end.solver.solver_torchlp import TorchLPSolver
     from act.util.stats import VerifyStatus
 
     net = load_net_from_file(
@@ -1046,7 +1042,7 @@ def _test_verify_lp_batched_multi_b1() -> None:  # pragma: no cover
 
 
 def _test_verify_lp_batched_batch_b4() -> None:  # pragma: no cover
-    from act.back_end.solver.solver_interval import TorchLPSolver
+    from act.back_end.solver.solver_torchlp import TorchLPSolver
     from act.util.device_manager import get_default_device, get_default_dtype
     from act.util.stats import VerifyStatus
 

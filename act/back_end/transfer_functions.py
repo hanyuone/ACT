@@ -113,11 +113,29 @@ def get_transfer_function() -> TransferFunction:
     return _current_tf
 
 
+def ensure_active_tf(default_mode: str = "interval") -> TransferFunction:
+    """Return the active TF, self-healing to ``default_mode`` if unset.
+
+    Consolidates the self-heal pattern shared by analyze.py / cli.py /
+    verifier.py. Catches only ``RuntimeError`` (the documented
+    "not initialised" case); any other exception from a broken TF subclass
+    bubbles up so the bug surfaces rather than silently demoting to interval.
+    """
+    try:
+        return get_transfer_function()
+    except RuntimeError:
+        set_transfer_function_mode(default_mode)
+        return get_transfer_function()
+
+
 def set_transfer_function_mode(mode: str = "interval") -> None:
     """Set transfer function implementation by mode name.
-    
+
     Args:
-        mode: "interval" for IntervalTF, "hybridz" for HybridzTF, "dual" for DualTF
+        mode: "interval" for IntervalTF, "hybridz" for HybridzTF.
+              "dual" is NOT a valid TF mode — dual is a Solver choice
+              (``--solver dual``), not a forward-bound TF. See
+              ``act.back_end.solver_mode.set_solver_mode``.
     """
     if mode == "interval":
         from act.back_end.interval_tf import IntervalTF
@@ -125,11 +143,32 @@ def set_transfer_function_mode(mode: str = "interval") -> None:
     elif mode == "hybridz":
         from act.back_end.hybridz_tf import HybridzTF
         set_transfer_function(HybridzTF())
-    elif mode == "dual":
-        from act.back_end.dual_tf import DualTF
-        set_transfer_function(DualTF())
     else:
-        raise ValueError(f"Unknown transfer function mode: {mode}. Use 'interval', 'hybridz', or 'dual'.")
+        raise ValueError(
+            f"Unknown transfer function mode: {mode!r}. Use 'interval' or "
+            f"'hybridz'. ('dual' is a Solver choice — use --solver dual.)"
+        )
+
+
+# Global solver-mode dispatch ---------------------------------------------
+# Mirrors the active-TF pattern above: CLI sets the mode once from ``--solver``;
+# verifier.py / cli.py read ``is_dual_solver_active()`` to dispatch verify_once
+# through DualSolver.evaluate_spec instead of the LP cascade. Decoupled from
+# TF mode because dual is a backward-only solver, not a forward TF.
+_current_solver_mode: "Optional[str]" = None
+
+
+def set_solver_mode(mode: "Optional[str]") -> None:
+    global _current_solver_mode
+    _current_solver_mode = mode
+
+
+def get_solver_mode() -> "Optional[str]":
+    return _current_solver_mode
+
+
+def is_dual_solver_active() -> bool:
+    return _current_solver_mode == "dual"
 
 
 

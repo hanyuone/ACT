@@ -86,33 +86,34 @@ class DualSolver(Solver):
         "ADD",
     }
 
-    def __init__(self, tf: "DualTF", n_iters: int = 0):
-        self.tf = tf
+    def __init__(self, n_iters: int = 0):
+        # DualTF is now a backward-registry holder (not a TransferFunction);
+        # instantiate internally so callers don't need to know about it.
+        # β refactor moved dual from the --tf-mode axis to the --solver axis,
+        # making DualSolver fully self-contained — no external TF coupling.
+        from act.back_end.dual_tf.dual_tf import DualTF
+        self.tf = DualTF()
         self.n_iters = n_iters
         self._last_bounds: Optional[Bounds] = None
 
     def capabilities(self) -> SolverCaps:
         return SolverCaps(supports_gpu=True, supports_csp=False, supports_dual=True)
 
-    def compute_bound(self, net: Net, bounds_dict: Dict[int, Bounds],
-                      c: torch.Tensor, return_sce: bool = False,
-                      enable_grad: bool = False
-                      ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    def compute_certified_bound(
+        self, net: Net, bounds_dict: Dict[int, Bounds],
+        c: torch.Tensor, return_sce: bool = False,
+        enable_grad: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """Batched certified lower bound on c^T @ output (DAG-aware).
 
-        ν is propagated backward through a per-layer accumulator:
+        Implements ``Solver.compute_certified_bound``; see base for the
+        full contract. DualSolver realises this via reverse-topological
+        backward propagation of a per-layer accumulator:
           nu_accum[lid] = sum over all successors s of ν routed by s's handler to lid.
 
         Each handler returns per-pred νs; the outer loop distributes them to preds.
 
         Unknown layer kind raises ValueError (no silent identity fallback for soundness).
-        Args:
-            c: Tensor[B, num_classes] — REQUIRED batched. Raises ValueError if 1-D.
-            return_sce: if True, also return per-sample concrete input extremum.
-            enable_grad: if True, allow gradients to flow through the computation
-                         (for robust training). Default False (inference/verification).
-        Returns:
-            Tensor[B] or (Tensor[B], Tensor[B, *in_shape]) when return_sce=True.
         """
         if c.dim() != 2:
             raise ValueError(
@@ -135,12 +136,12 @@ class DualSolver(Solver):
                     assert_layer = layer
                     break
             if assert_layer is None:
-                raise ValueError("DualSolver.compute_bound: net has no ASSERT layer")
+                raise ValueError("DualSolver.compute_certified_bound: net has no ASSERT layer")
 
             assert_preds = net.preds.get(assert_layer.id, [])
             if len(assert_preds) != 1:
                 raise ValueError(
-                    f"DualSolver.compute_bound: ASSERT layer {assert_layer.id} must have "
+                    f"DualSolver.compute_certified_bound: ASSERT layer {assert_layer.id} must have "
                     f"exactly 1 predecessor, got {len(assert_preds)}"
                 )
 
@@ -165,7 +166,7 @@ class DualSolver(Solver):
                 handler = registry.get(k)
                 if handler is None:
                     raise ValueError(
-                        f"DualSolver.compute_bound: unknown layer kind '{k}' at layer {lid}; "
+                        f"DualSolver.compute_certified_bound: unknown layer kind '{k}' at layer {lid}; "
                         f"soundness requires explicit backward handler. "
                         f"Supported kinds: {sorted(registry.keys())}"
                     )
@@ -214,42 +215,46 @@ class DualSolver(Solver):
             return (obj, sce) if return_sce else obj
 
     def evaluate_spec(
-        self, net: Net, bounds_dict: Dict[int, Bounds],
+        self, net: Net,
         out_spec: OutputSpec,
+        bounds_dict: Optional[Dict[int, Bounds]] = None,
         num_classes: Optional[int] = None,
         chunk_size: Optional[int] = None,
         enable_grad: bool = False,
     ) -> SpecBatchResult:
-        """Dual bound evaluation for any OutputSpec, using
-        ``OutputSpec.encode_linear`` as the single source of truth.
+        """Dual bound evaluation for any OutputSpec — self-contained entry point.
 
-        Strategy: ``encode_linear`` produces (C, thresholds) in UB-cert
-        form (CERTIFIED iff ``UB(C @ y) < threshold``). DualSolver returns
-        LB(C @ y) from ``compute_bound``. Equivalence via sign flip: pass
-        ``-C`` to compute_bound and compare against ``-threshold``; slack
+        After β refactor: ``bounds_dict`` is optional. When omitted (the typical
+        case), the solver gathers the net's INPUT_SPEC seed bounds and computes
+        per-layer forward bounds internally via ``compute_forward_bounds``.
+        Callers who already have a bounds_dict (e.g. BaB refinement loops) may
+        pass it explicitly to skip the recomputation.
+
+        Strategy: ``encode_linear`` produces (C, thresholds) in UB-cert form
+        (CERTIFIED iff ``UB(C @ y) < threshold``). DualSolver returns LB(C @ y)
+        from ``compute_certified_bound``. Equivalence via sign flip: pass ``-C``
+        to compute_certified_bound and compare against ``-threshold``; slack
         ``>= 0`` means certified.
-
-        Args:
-            net: ACT Net with ASSERT layer.
-            bounds_dict: layer bounds from forward analysis. MUST contain
-                batched bounds for all relevant layers including the ASSERT
-                predecessor.
-            out_spec: the property to evaluate. For TOP1/MARGIN robust kinds,
-                out_spec.y_true must be populated by the caller.
-            num_classes: K; required for TOP1_ROBUST / MARGIN_ROBUST.
-            chunk_size: if set and M > chunk_size, process specs in chunks of
-                chunk_size at a time (memory-saving for large K).
-            enable_grad: if True, allow gradient flow (e.g. for Adam).
-
-        Returns:
-            SpecBatchResult with margins/slack/active_mask/certified tensors.
 
         Raises:
             ValueError: if net lacks ASSERT layer, ASSERT has != 1 predecessor,
-                or the output layer's bounds are missing / unbatched.
+                or (when bounds_dict is supplied) the output layer's bounds are
+                missing / unbatched.
             NotImplementedError: if out_spec.kind == UNSAFE_LINEAR (EXISTS
                 quantifier not supported by sound dual certificate).
         """
+        if bounds_dict is None:
+            from act.back_end.dual_tf.tf_forward import compute_forward_bounds
+            from act.back_end.verifier import (
+                gather_input_spec_layers,
+                seed_from_input_specs,
+            )
+            spec_layers = gather_input_spec_layers(net)
+            seed_bounds = seed_from_input_specs(spec_layers)
+            bounds_dict = compute_forward_bounds(
+                net, seed_bounds.lb, seed_bounds.ub, post_activation=False,
+            )
+
         sample = next(iter(bounds_dict.values()))
         device = sample.lb.device
         dtype = sample.lb.dtype
@@ -303,7 +308,7 @@ class DualSolver(Solver):
         with torch.set_grad_enabled(enable_grad):
             if chunk_size is None or M <= chunk_size:
                 bounds_k = expand_bounds_dict(bounds_dict, M)
-                margins_flat = self.compute_bound(
+                margins_flat = self.compute_certified_bound(
                     net, bounds_k, C_neg, enable_grad=enable_grad,
                 )
             else:
@@ -343,7 +348,7 @@ class DualSolver(Solver):
             m_chunk = end - start
             C_chunk = C_view[:, start:end, :].reshape(B * m_chunk, n_out).contiguous()
             bounds_chunk = expand_bounds_dict(bounds_dict, m_chunk)
-            margins_chunk = self.compute_bound(
+            margins_chunk = self.compute_certified_bound(
                 net, bounds_chunk, C_chunk, enable_grad=enable_grad,
             )
             if isinstance(margins_chunk, tuple):

@@ -23,16 +23,19 @@
 
 Unified dispatcher over all supported OutputSpec kinds (LINEAR_LE, UNSAFE_LINEAR,
 TOP1_ROBUST, MARGIN_ROBUST, RANGE). Encodes any spec as a batched `SpecBatch`
-(B*M linear forms) and runs a single backward pass via `compute_bound`.
+(B*M linear forms) and runs a single backward pass via `compute_certified_bound`.
 
 ```python
 from act.back_end.solver import DualSolver
 from act.util.stats import SpecBatchResult
 from act.front_end.specs import OutputSpec, OutKind
 
-solver = DualSolver(tf=DualTF())
+# β refactor: DualSolver is now self-contained — no tf parameter, and
+# bounds_dict is optional (auto-computed from the net's INPUT_SPEC seeds
+# via compute_forward_bounds when omitted).
+solver = DualSolver()
 result: SpecBatchResult = solver.evaluate_spec(
-    net, bounds_dict,
+    net,
     OutputSpec(kind=OutKind.TOP1_ROBUST, y_true=y_true),
     num_classes=10,
 )
@@ -61,7 +64,7 @@ may reflect relaxation gap rather than a true violation).
 
 ## Gradient Flow (Robust Training)
 
-All dual backward handlers and `compute_bound` / `evaluate_spec` /
+All dual backward handlers and `compute_certified_bound` / `evaluate_spec` /
 `compute_robust_bound` honor the caller's gradient context via the
 `enable_grad: bool = False` parameter (default off for verification).
 
@@ -103,12 +106,12 @@ All tensors at module boundaries follow the `[B, *layer_shape]` convention:
 - `nu` (dual variable): `[B, *layer_shape]`
 - `c` (objective coefficient): `[B, num_classes]`
 - `contrib` (per-handler): `[B]`
-- `compute_bound` return: `Tensor[B]` or `(Tensor[B], Tensor[B, *in_shape])`
+- `compute_certified_bound` return: `Tensor[B]` or `(Tensor[B], Tensor[B, *in_shape])`
 - `compute_robust_bound` return: `(Tensor[B], Tensor[B] bool)` — NOT Python bool
 
 ### Input contract (deliberately asymmetric)
 
-- `DualSolver.compute_bound` and `DualSolver.compute_robust_bound` are STRICT:
+- `DualSolver.compute_certified_bound` and `DualSolver.compute_robust_bound` are STRICT:
   they REQUIRE batched input `c: [B, num_classes]` and raise `ValueError` on
   1-D. For a single instance, use `.unsqueeze(0)` before calling and
   `.squeeze(0)` / `.item()` on results.

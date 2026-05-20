@@ -21,20 +21,45 @@ import statistics
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, NamedTuple, Optional, Union, cast
 
+from act.back_end.config import _VALID_SOLVERS
+from act.back_end.layer_schema import LayerKind
+from act.front_end.specs import OutKind
 from act.util.cli_utils import add_device_args, initialize_from_args
 
 
+_TF_MODES: tuple[str, ...] = ("interval", "hybridz")
+_SOLVERS: tuple[str, ...] = tuple(sorted(_VALID_SOLVERS))
+
+
+class _SkipUnsupported(NamedTuple):
+    """Tagged-union result for nets the active TF cannot verify.
+
+    Replaces an earlier ``"SKIP_UNSUPPORTED: ..."`` string-sentinel encoding
+    that risked false-negative skips if any unrelated ``load_net_from_file``
+    exception happened to start with the same prefix. ``isinstance(err,
+    _SkipUnsupported)`` is unambiguous.
+    """
+    tf_name: str
+    kinds: tuple[str, ...]
+
+
 def _make_solver(solver_name: str):
-    """Instantiate a solver backend by name."""
-    from act.back_end.solver.solver_interval import TorchLPSolver
+    """Instantiate a solver backend by name.
+
+    ``dual`` is excluded here: DualSolver is the backward CROWN solver and
+    does NOT implement ``solve_batch`` (the LP-cascade contract). It is
+    routed via the ``is_dual_solver_active`` global in verify_once, not
+    through the LP-tier ``_make_solver`` factory.
+    """
+    from act.back_end.solver.solver_torchlp import TorchLPSolver
 
     if solver_name == "gurobi":
         from act.back_end.solver.solver_gurobi import GurobiSolver
 
         return GurobiSolver()
-    if solver_name == "torch":
+    if solver_name == "torchlp":
         return TorchLPSolver()
     # "auto": try Gurobi, fall back to TorchLP
     try:
@@ -45,20 +70,30 @@ def _make_solver(solver_name: str):
         return TorchLPSolver()
 
 
-def _verify_one_net(net_path: str, backend_cfg) -> tuple[list, Optional[str], Optional[int]]:
-    """[BATCHED-API] Verify *net_path* via 3-tier cascade; returns (results, error_or_None, n_layers_or_None).
+def _verify_one_net(
+    net_path: str, backend_cfg
+) -> tuple[list, Optional[Union[_SkipUnsupported, str]], Optional[int]]:
+    """[BATCHED-API] Verify *net_path* via 3-tier cascade.
+
+    Returns ``(results, err, n_layers)`` where ``err`` is one of:
+      * ``None`` on success
+      * ``_SkipUnsupported(tf_name, kinds)`` when the active TF cannot handle
+        the net (unsupported layer kinds and/or unsupported ASSERT spec).
+        Treated as a clean skip by callers, NOT as a verifier bug.
+      * ``str`` for any other exception (genuine error).
 
     Tier 1 — interval (verify_once): always runs; certifies or falsifies via
               pure-tensor bounds propagation.
     Tier 2 — LP-batched (verify_lp_batched): runs on UNKNOWN lanes when
-              backend_cfg.lp_enabled is True.  Skipped for solver='gurobi'
-              (N=1 restriction; caught at BackendConfig construction time).
+              backend_cfg.lp_enabled is True AND active TF propagates LP
+              constraints. Skipped under DualTF (see soundness note below).
     Tier 3 — BaB (verify_bab_batched): runs on remaining UNKNOWN lanes when
-              backend_cfg.bab_enabled is True.  bab_max_batch_size=1 disables
-              K-batching inside BaB (falls back to sequential sub-problems).
+              backend_cfg.bab_enabled is True AND active TF propagates LP
+              constraints. bab_max_batch_size=1 disables K-batching.
     """
     from act.back_end.bab.bab import clear_violation_check_module_cache
     from act.back_end.serialization.serialization import load_net_from_file
+    from act.back_end.transfer_functions import ensure_active_tf, is_dual_solver_active
     from act.back_end.verifier import verify_once, verify_lp_batched
     from act.util.stats import VerifyStatus
 
@@ -66,42 +101,105 @@ def _verify_one_net(net_path: str, backend_cfg) -> tuple[list, Optional[str], Op
 
     try:
         net = load_net_from_file(net_path, target_device=backend_cfg.device)
-        results: List[Any] = list(verify_once(net=net))
         n_layers = len(net.layers)
+
+        active_tf = ensure_active_tf("interval")
+        is_dual = is_dual_solver_active()
+
+        # Pre-filter helper: DualTF is the registry holder for dual backward
+        # kernels; under --solver dual the kind-support check must go through
+        # DualTF, not active_tf (which is still IntervalTF for forward bounds).
+        # Under non-dual modes the active TF is the authority.
+        if is_dual:
+            from act.back_end.dual_tf.dual_tf import DualTF
+            kind_authority = DualTF()
+            authority_name = "DualSolver"
+        else:
+            kind_authority = active_tf
+            authority_name = active_tf.name
+
+        unsupported_kinds = sorted(
+            {L.kind for L in net.layers if not kind_authority.supports_layer(L.kind)}
+        )
+        # DualSolver rejects UNSAFE_LINEAR (EXISTS quantifier not representable
+        # by sound dual lower bounds — see solver_dual.evaluate_spec). Detect
+        # this distinct skip reason in parallel with the layer-kind check so
+        # users see ALL skip reasons in one pass, not sequentially.
+        unsupported_specs: List[str] = []
+        if is_dual:
+            for L in net.layers:
+                if (
+                    L.kind == LayerKind.ASSERT.value
+                    and L.params.get("kind") == OutKind.UNSAFE_LINEAR
+                ):
+                    unsupported_specs.append(f"{LayerKind.ASSERT.value}:{OutKind.UNSAFE_LINEAR}")
+                    break
+
+        blocking = tuple(unsupported_kinds + unsupported_specs)
+        if blocking:
+            return [], _SkipUnsupported(tf_name=authority_name, kinds=blocking), n_layers
+
+        results: List[Any] = list(verify_once(net=net))
 
         any_unknown = any(r.status == VerifyStatus.UNKNOWN for r in results)
 
-        if any_unknown and backend_cfg.lp_enabled:
-            lp_results = verify_lp_batched(
-                net,
-                solver_factory=lambda: _make_solver(backend_cfg.solver),
-                timelimit=backend_cfg.timeout,
-            )
-            results = [
-                lp_results[i] if results[i].status == VerifyStatus.UNKNOWN else results[i]
-                for i in range(len(results))
-            ]
-            any_unknown = any(r.status == VerifyStatus.UNKNOWN for r in results)
+        # SOUNDNESS-CRITICAL: under --solver dual, verify_once already ran
+        # DualSolver.evaluate_spec (CROWN backward) — Tier-2 LP and Tier-3 BaB
+        # would build under-constrained LPs (DualSolver does not produce LP-feed
+        # ConSet entries; the forward analyze() pipeline is bypassed) and emit
+        # spurious FALSIFIED. Do not remove this gate without first switching
+        # back to an LP-feeding forward TF (interval / hybridz).
+        if any_unknown and backend_cfg.lp_enabled and not is_dual:
+            try:
+                lp_results = verify_lp_batched(
+                    net,
+                    solver_factory=lambda: _make_solver(backend_cfg.solver),
+                    timelimit=backend_cfg.timeout,
+                )
+                results = [
+                    lp_results[i] if results[i].status == VerifyStatus.UNKNOWN else results[i]
+                    for i in range(len(results))
+                ]
+                any_unknown = any(r.status == VerifyStatus.UNKNOWN for r in results)
+            except NotImplementedError as e:
+                # cons_exportor.export_to_batch_problem lacks an LP encoding
+                # for one of this net's layer kinds (AVGPOOL2D / MAXPOOL2D /
+                # GELU / explicit-reject tags like max:/min:/div:/clip:).
+                # Graceful degradation: keep the Tier-1 UNKNOWN result rather
+                # than fail the net — LP is a refinement, its absence does
+                # not invalidate prior tiers. Reraise unrelated NIE so real
+                # missing-implementation bugs still surface as ERROR.
+                if "export_to_batch_problem" not in str(e):
+                    raise
 
-        if any_unknown and backend_cfg.bab_enabled:
+        if any_unknown and backend_cfg.bab_enabled and not is_dual:
             # verify_bab_batched operates on a single-instance (B=1) net and
             # returns one VerifyResult. For multi-sample nets we slice per-lane
             # and dispatch one BaB call per still-UNKNOWN sample.
             from act.back_end.bab.bab import verify_bab_batched as _vbb
             from act.back_end.verifier import slice_net_to_sample
 
-            results = [
-                _vbb(
-                    slice_net_to_sample(net, i),
-                    solver_factory=lambda: _make_solver(backend_cfg.solver),
-                    config=backend_cfg.bab,
-                    max_batch_size=backend_cfg.bab_max_batch_size,
-                    time_budget_s=backend_cfg.timeout,
-                )
-                if results[i].status == VerifyStatus.UNKNOWN
-                else results[i]
-                for i in range(len(results))
-            ]
+            try:
+                results = [
+                    _vbb(
+                        slice_net_to_sample(net, i),
+                        solver_factory=lambda: _make_solver(backend_cfg.solver),
+                        config=backend_cfg.bab,
+                        max_batch_size=backend_cfg.bab_max_batch_size,
+                        time_budget_s=backend_cfg.timeout,
+                    )
+                    if results[i].status == VerifyStatus.UNKNOWN
+                    else results[i]
+                    for i in range(len(results))
+                ]
+            except NotImplementedError as e:
+                # Same graceful-degradation contract as the Tier-2 LP gate:
+                # BaB also runs through cons_exportor (via setup_and_solve_batch
+                # in bab.py) and hits the same "unsupported tag" failure on
+                # AVGPOOL2D / MAXPOOL2D / GELU / etc. Keep Tier-1 results;
+                # reraise unrelated NIE so genuine bugs surface as ERROR.
+                if "export_to_batch_problem" not in str(e):
+                    raise
 
         return results, None, n_layers
     except Exception as e:  # noqa: BLE001 — surface per-net error, keep iterating
@@ -114,6 +212,12 @@ def run_verification(args, backend_cfg):
 
     results, err, n_layers = _verify_one_net(args.network, backend_cfg)
     if err is not None:
+        if isinstance(err, _SkipUnsupported):
+            print(
+                f"⏭️  {args.network}: {err.tf_name} cannot handle: "
+                f"{','.join(err.kinds)}"
+            )
+            return 0
         print(f"❌ {args.network}: {err}")
         return 1
     print(f"Loaded {n_layers}-layer net; solver={backend_cfg.solver}")
@@ -132,71 +236,6 @@ def run_verification(args, backend_cfg):
             for k, v in result.metadata.items():
                 print(f"  {k}: {v}")
     return 0 if all(r.status in valid_outcomes for r in results) else 1
-
-
-def run_verify_all(args, backend_cfg):
-    """Verify every .json net under a directory in one Python process."""
-    from act.util.stats import VerifyStatus
-
-    nets_dir = args.verify_all
-    if not os.path.isdir(nets_dir):
-        print(f"❌ --verify-all: directory not found: {nets_dir}")
-        return 1
-
-    paths = sorted(
-        p for p in glob.glob(os.path.join(nets_dir, "*.json"))
-        if "_meta" not in os.path.basename(p) and "manifest" not in os.path.basename(p)
-    )
-    if not paths:
-        print(f"❌ --verify-all: no .json nets under {nets_dir}")
-        return 1
-
-    print(f"\n{'=' * 80}")
-    print(f"ACT VERIFY-ALL  ({len(paths)} nets, solver={backend_cfg.solver}, "
-          f"bab={'on' if backend_cfg.bab_enabled else 'off'})")
-    print(f"{'=' * 80}\n")
-
-    total = len(paths)
-    failures: list = []
-    errors: list = []
-
-    for idx, net_path in enumerate(paths, 1):
-        name = os.path.basename(net_path)
-        results, err, _ = _verify_one_net(net_path, backend_cfg)
-        if err is not None:
-            print(f"[{idx:>3}/{total}] {name}: ❌ ERROR — {err}")
-            errors.append((name, err))
-            continue
-        statuses = [r.status for r in results]
-        tag = "  ".join(s.name for s in statuses)
-        print(f"[{idx:>3}/{total}] {name}: {tag}")
-        # Valid verifier outcomes: CERTIFIED (proof of safety), FALSIFIED
-        # (validated counterexample), UNKNOWN (could not prove), TIMEOUT
-        # (budget exhausted). Only VERIFIER_ERROR / MODEL_INFER_FAILURE are
-        # actual verifier bugs that should fail CI.
-        valid_outcomes = (
-            VerifyStatus.CERTIFIED,
-            VerifyStatus.FALSIFIED,
-            VerifyStatus.UNKNOWN,
-            VerifyStatus.TIMEOUT,
-        )
-        for r in results:
-            if r.status not in valid_outcomes:
-                failures.append((name, r.status))
-
-    print(f"\n{'=' * 80}")
-    print(f"verify-all summary:  total={total}  failures={len(failures)}  errors={len(errors)}")
-    if failures:
-        print("  Failures (verifier bugs only):")
-        for n, s in failures[:20]:
-            print(f"    - {n}: {s.name}")
-    if errors:
-        print("  Errors:")
-        for n, e in errors[:20]:
-            print(f"    - {n}: {e[:120]}")
-    print(f"{'=' * 80}\n")
-
-    return 1 if (failures or errors) else 0
 
 
 def run_network_factory(args, backend_cfg):
@@ -735,17 +774,6 @@ Examples:
         dest="diff_nets",
         help="Load two ACT Net JSON files and print a layer-level diff summary",
     )
-    cmd_group.add_argument(
-        "--verify-all",
-        type=str,
-        metavar="NETS_DIR",
-        dest="verify_all",
-        help=(
-            "Verify every .json net under NETS_DIR in ONE Python process "
-            "(amortizes ~5s of import startup per net; replaces per-net shell loops in CI)."
-        ),
-    )
-
     # Bench options
     bench_group = parser.add_argument_group("Bench Options")
     bench_group.add_argument(
@@ -790,7 +818,7 @@ Examples:
         type=str,
         nargs="+",
         dest="tf_targets",
-        choices=["interval", "hybridz", "dual"],
+        choices=_TF_MODES,
         help="Target TFs for layer filtering (generate mode)",
     )
     factory_group.add_argument(
@@ -811,9 +839,20 @@ Examples:
         "--solver",
         "-s",
         type=str,
-        choices=["auto", "gurobi", "torch"],
+        choices=_SOLVERS,
         default=None,
-        help="Solver backend (default: from config.yaml / $ACT_SOLVER / 'auto')",
+        dest="solver",
+        help=(
+            "Solver backend.  Three alternative families:\n"
+            "  'gurobi'  — commercial MILP/LP (license required).  LP cascade.\n"
+            "  'torchlp' — PyTorch-tensor LP (Adam + penalty + box projection,\n"
+            "              GPU-capable).  LP cascade.\n"
+            "  'dual'    — DualSolver, CROWN/Wong-Kolter certified bounds via\n"
+            "              backward propagation.  No LP cascade (DualSolver is\n"
+            "              its own verification pipeline).\n"
+            "  'auto'    — try gurobi, fall back to torchlp.\n"
+            "Default: from config.yaml / $ACT_SOLVER / 'auto'."
+        ),
     )
     verify_group.add_argument(
         "--timeout",
@@ -821,6 +860,20 @@ Examples:
         type=float,
         default=None,
         help="Verification timeout in seconds (default: from config.yaml)",
+    )
+    verify_group.add_argument(
+        "--tf-mode",
+        type=str,
+        choices=_TF_MODES,
+        default=None,
+        dest="tf_mode",
+        help=(
+            "Forward-bounds transfer function: 'interval' or 'hybridz'.  Selects "
+            "the abstract interpretation used during analyze() to seed bounds "
+            "for the LP cascade.  Default: configured default (typically "
+            "'interval').  For dual certified bounds, use --solver dual instead "
+            "(dual is a solver, not a TF — see --solver help)."
+        ),
     )
 
     # BaB mode: --bab enables, --no-bab disables, absent = from config.yaml
@@ -918,14 +971,24 @@ Examples:
         _ap.Namespace(device=backend_cfg.device, dtype=backend_cfg.dtype)
     )
 
+    if args.tf_mode is not None:
+        from act.back_end.analyze import initialize_tf_mode
+
+        initialize_tf_mode(args.tf_mode)
+
+    # Set the solver-mode global so verify_once / _verify_one_net can dispatch
+    # dual ↔ LP-cascade without consulting the TF mode (β refactor decoupled
+    # dual from the --tf-mode axis). Always set, so a previous process state
+    # cannot leak across invocations.
+    from act.back_end.transfer_functions import set_solver_mode
+    set_solver_mode(backend_cfg.solver)
+
     # Execute command
     try:
         if args.generate:
             return run_network_factory(args, backend_cfg)
         elif args.verify:
             return run_verification(args, backend_cfg)
-        elif args.verify_all:
-            return run_verify_all(args, backend_cfg)
         elif args.info:
             return run_network_info(args)
         elif args.list_examples:
@@ -1061,7 +1124,7 @@ def _run_cli_cascade_smoke() -> int:
         assert results[0].status in (VerifyStatus.CERTIFIED, VerifyStatus.UNKNOWN, VerifyStatus.FALSIFIED)
 
     def _t_cascade_default_config():
-        cfg = BackendConfig(solver="torch", lp_enabled=True, bab_enabled=False)
+        cfg = BackendConfig(solver="torchlp", lp_enabled=True, bab_enabled=False)
         net = _build_tiny_net()
         from act.back_end.verifier import verify_once, verify_lp_batched
         results = list(verify_once(net=net))
@@ -1078,7 +1141,7 @@ def _run_cli_cascade_smoke() -> int:
             )
 
     def _t_lp_disabled_skips_tier2():
-        cfg = BackendConfig(solver="torch", lp_enabled=False, bab_enabled=False)
+        cfg = BackendConfig(solver="torchlp", lp_enabled=False, bab_enabled=False)
         assert not cfg.lp_enabled
 
     def _t_bab_max_batch_size_default():

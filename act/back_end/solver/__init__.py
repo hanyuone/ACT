@@ -13,7 +13,7 @@
 #===---------------------------------------------------------------------===#
 
 from .solver_base import Solver, SolverCaps, SolveStatus
-from .solver_interval import TorchLPSolver
+from .solver_torchlp import TorchLPSolver
 from .solver_gurobi import GurobiSolver
 from .solver_hz import HZSolver, HZono, hz_compute_bounds
 from .solver_dual import DualSolver, expand_bounds_dict

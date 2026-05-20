@@ -56,12 +56,8 @@ def analyze(
     Returns:
         Tuple of (before, after, globalC) containing propagated facts and global constraints
     """
-    # Auto-initialize transfer function mode if not set
-    try:
-        from act.back_end.transfer_functions import get_transfer_function
-        _ = get_transfer_function()  # Check if already initialized
-    except RuntimeError:
-        initialize_tf_mode("interval")  # Default to interval mode
+    from act.back_end.transfer_functions import ensure_active_tf
+    ensure_active_tf("interval")
 
     if cache is None:
         before: Dict[int, Fact] = {}

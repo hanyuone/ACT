@@ -629,6 +629,7 @@ def cmd_validate_verifier(args):
             summary = validator.validate_counterexamples(
                 networks=networks,
                 solvers=args.solvers,
+                tf_modes=args.tf_modes,
                 batch_sizes=batch_sizes,
             )
             exit_code = (

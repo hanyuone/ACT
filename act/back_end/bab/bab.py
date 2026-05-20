@@ -826,7 +826,7 @@ def _test_bab_kbatch_status_parity():  # pragma: no cover
     if net is None:
         print("  SKIP _test_bab_kbatch_status_parity: layer_testing_bab_deep.json absent")
         return
-    from act.back_end.solver.solver_interval import TorchLPSolver
+    from act.back_end.solver.solver_torchlp import TorchLPSolver
 
     config = BaBConfig(max_depth=6, max_nodes=32, verbose=False)
     statuses_by_k: dict[int, VerifyStatus] = {}

@@ -1,19 +1,18 @@
-#===- act/back_end/dual_tf/dual_tf.py - Dual Transfer Function Class ----====#
+#===- act/back_end/dual_tf/dual_tf.py - Dual Backward Registry Holder ---====#
 # ACT: Abstract Constraint Transformer
 # Copyright (C) 2025- ACT Team
 # Licensed under AGPLv3+; distributed without warranty.
 #===---------------------------------------------------------------------===#
-# DualTF: forward-only TransferFunction for dual mode. Holds alpha parameters.
-# All backward kernels live as module-level dispatch functions; the actual
-# certified-bound solver is act.back_end.solver.solver_dual.DualSolver.
+# DualTF: backward-kernel registry holder. Not a TransferFunction (β refactor
+# moved dual from --tf-mode to --solver). Instantiated internally by
+# act.back_end.solver.solver_dual.DualSolver.
 #===---------------------------------------------------------------------===#
 
 
 import torch
 from typing import Dict, List, Optional, Tuple
-from act.back_end.core import Bounds, Fact, Layer, Net, ConSet
+from act.back_end.core import Bounds, Layer, Net
 from act.back_end.layer_schema import LayerKind
-from act.back_end.transfer_functions import TransferFunction
 from .tf_mlp import (
     backward_dense, backward_relu, backward_bias, backward_scale,
     backward_bn, backward_identity,
@@ -154,20 +153,28 @@ def backward_concat(L, nu, bounds_dict, preds):
     raise NotImplementedError("backward for CONCAT not implemented in dual_tf")
 
 
-class DualTF(TransferFunction):
-    """Forward-only TF for dual mode. Backward kernels are module-level dispatch
-    functions; the actual solver lives at act.back_end.solver.DualSolver.
+class DualTF:
+    """Backward-kernel registry holder for the dual solver.
 
-    `_BACKWARD_REGISTRY` maps layer-kind strings to callable dispatch functions
-    with DAG-aware per-predecessor ν routing:
+    Previously a ``TransferFunction`` activated by ``--tf-mode dual``; that
+    framing was misleading because ``apply()`` returned an empty ConSet by
+    design (dual semantics live in DualSolver's backward pass, not in
+    propagated LP constraints). β refactor demotes this to a plain holder
+    of three registries:
 
-        (L: Layer, nu: Tensor[B, *shape], bounds_dict: Dict[int, Bounds],
-         preds: List[int]) -> (pred_nus: List[Tensor], contrib: Tensor[B])
+      * ``_FORWARD_REGISTRY`` — per-kind forward dispatch consumed by
+        ``compute_forward_bounds`` (still a real forward computation, but
+        invoked internally by ``DualSolver.evaluate_spec`` rather than via
+        the analyze()/TF pipeline).
+      * ``_BACKWARD_REGISTRY`` — per-kind backward dispatch consumed by
+        ``DualSolver.compute_certified_bound``. Each entry has signature
+        ``(L, nu, bounds_dict, preds) -> (pred_nus, contrib)``.
+      * ``_UNIMPLEMENTED_KINDS`` — kinds whose backward is a stub
+        (raises ``NotImplementedError``); ``supports_layer`` filters them
+        so dual-incompatible nets get cleanly SKIPPED.
 
-    Each ``pred_nus[i]`` is the ν routed to predecessor ``preds[i]``. Unary
-    layers return ``[nu_out]``; ADD returns ``[nu] * len(preds)`` (identity
-    skip, same ν to every predecessor). net_factory.py reads only ``.keys()``
-    so callable values are fine.
+    DualSolver instantiates this internally; external code uses ``--solver
+    dual`` rather than touching DualTF directly.
     """
 
     _FORWARD_REGISTRY = {
@@ -248,52 +255,19 @@ class DualTF(TransferFunction):
         LayerKind.MHA_SPLIT.value,
         LayerKind.MHA_JOIN.value,
         LayerKind.MASK_ADD.value,
+        # Backward kernels for these are stubs that raise NotImplementedError
+        # at runtime (see tf_cnn.backward_maxpool2d / backward_avgpool2d and
+        # dual_tf.backward_concat). Exclude them here so supports_layer ==
+        # False and upstream callers (validate_verifier, --verify-all) skip
+        # affected nets cleanly instead of surfacing runtime ERROR.
+        LayerKind.MAXPOOL2D.value,
+        LayerKind.AVGPOOL2D.value,
+        LayerKind.CONCAT.value,
     })
 
-    def __init__(self):
-        self._forward_bounds_cache: Dict[int, Bounds] = {}
-        self._cache_net_id: Optional[int] = None
-
-    @property
-    def name(self) -> str: return "DualTF"
-
     def supports_layer(self, layer_kind: str) -> bool:
-        # Registry entries for LSTM/GRU/GELU/LAYERNORM/attention-family are
-        # placeholder stubs (raise NotImplementedError at runtime). Exclude
-        # them here so validate_verifier and BaB skip these nets cleanly
-        # rather than surfacing as runtime ERROR.
         k = layer_kind.upper()
         return k in self._BACKWARD_REGISTRY and k not in self._UNIMPLEMENTED_KINDS
-
-    def apply(self, L: Layer, input_bounds: Bounds, net: Net,
-              before: Dict[int, Fact], after: Dict[int, Fact]) -> Fact:
-        """Return unbatched Bounds Fact for analyze()/BaB integration."""
-        net_id = id(net)
-        if self._cache_net_id != net_id or not self._forward_bounds_cache:
-            input_lb, input_ub = None, None
-            for layer in net.layers:
-                if layer.kind.upper() in (LayerKind.INPUT.value, LayerKind.INPUT_SPEC.value):
-                    if layer.id in before:
-                        input_lb = before[layer.id].bounds.lb
-                        input_ub = before[layer.id].bounds.ub
-                        break
-                    elif "lb" in layer.params and "ub" in layer.params:
-                        input_lb = layer.params["lb"]
-                        input_ub = layer.params["ub"]
-                        break
-            if input_lb is None or input_ub is None:
-                input_lb, input_ub = input_bounds.lb, input_bounds.ub
-            self._forward_bounds_cache = compute_forward_bounds(
-                net, input_lb, input_ub, post_activation=True)
-            self._cache_net_id = net_id
-
-        if L.id in self._forward_bounds_cache:
-            return Fact(bounds=self._forward_bounds_cache[L.id], cons=ConSet())
-        return Fact(bounds=input_bounds, cons=ConSet())
-
-    def clear_cache(self):
-        self._forward_bounds_cache.clear()
-        self._cache_net_id = None
 
 
 # Explicit stub registry: any handler whose semantics are "raise NotImplementedError"
@@ -310,9 +284,23 @@ _BACKWARD_STUBS = frozenset({
     backward_layernorm, backward_gelu,
 })
 
-# --- registry invariant (fires once at module import) ---
+# --- registry invariants (fire once at module import) ---
 assert set(DualTF._FORWARD_REGISTRY.keys()) == set(DualTF._BACKWARD_REGISTRY.keys()), (
     f"DualTF registry keyset mismatch: "
     f"forward-only={set(DualTF._FORWARD_REGISTRY) - set(DualTF._BACKWARD_REGISTRY)}, "
     f"backward-only={set(DualTF._BACKWARD_REGISTRY) - set(DualTF._FORWARD_REGISTRY)}"
+)
+
+# _UNIMPLEMENTED_KINDS must exactly equal the set of layer kinds whose backward
+# handler is a stub (raises NotImplementedError). Drift between these two sets
+# is a real risk: implementing a stub without updating _UNIMPLEMENTED_KINDS
+# would silently keep skipping a now-working kind; the reverse causes runtime
+# NotImplementedError on a kind that supports_layer claims to support.
+_stub_kinds_from_registry = frozenset(
+    k for k, fn in DualTF._BACKWARD_REGISTRY.items() if fn in _BACKWARD_STUBS
+)
+assert DualTF._UNIMPLEMENTED_KINDS == _stub_kinds_from_registry, (
+    f"DualTF _UNIMPLEMENTED_KINDS drift: "
+    f"declared={sorted(DualTF._UNIMPLEMENTED_KINDS)}, "
+    f"stub-derived={sorted(_stub_kinds_from_registry)}"
 )

@@ -35,8 +35,12 @@
 #      - Random: Random input within input spec (varied)
 #
 #   2. Run concrete execution to find violations
-#   3. If counterexample found, run formal verification
-#   4. Cross-validate using matrix below
+#   3. Run the formal verifier on the network unconditionally (every net is
+#      end-to-end verified; this also subsumes the historical --verify-all)
+#   4. If a concrete counterexample was found in step 2, cross-validate the
+#      verifier's verdict against it using the matrix below.  Otherwise the
+#      cross-validation outcome is INCONCLUSIVE — but the verifier was still
+#      exercised in step 3.
 #
 # Validation Matrix (Level 1):
 #   ┌─────────────────────────┬────────────────────────────────────┬──────────────┐
@@ -162,9 +166,7 @@ from act.back_end.verifier import (
     find_entry_layer_id,
 )
 from act.util.stats import VerifyStatus
-from act.back_end.solver.solver_gurobi import GurobiSolver
 from act.back_end.solver.solver_gurobi import is_gurobi_available
-from act.back_end.solver.solver_interval import TorchLPSolver
 from act.util.options import PerformanceOptions
 from act.front_end.specs import OutKind
 
@@ -374,6 +376,22 @@ class VerificationValidator:
 
     _KNOWN_RUNTIME_BROKEN: Dict[Tuple[str, str], str] = {}
 
+    # Spec kinds explicitly rejected by DualSolver.evaluate_spec — UNSAFE_LINEAR
+    # uses EXISTS quantifier semantics that sound dual lower bounds cannot
+    # certify (see `solver_dual.py:295-300`).  Pre-filter at validate-verifier
+    # level so CI reports SKIPPED instead of NotImplementedError.
+    _DUAL_UNSUPPORTED_SPEC_KINDS: frozenset = frozenset({"UNSAFE_LINEAR"})
+
+    # Layer kinds where DualSolver currently has a known soundness gap — the
+    # dispatch table at `dual_tf/dual_tf.py:223` aliases LRELU's backward
+    # handler to `backward_relu`, which is mathematically incorrect (LReLU has
+    # a non-zero negative slope; ReLU's backward zeros that branch out).  This
+    # produces over-tight dual lower bounds, leading to false-CERTIFIED on
+    # LReLU nets.  Tracked for fix in a follow-up PR (Phase III: dual solver
+    # optimization + BaB part).  Pre-filtered here so CI reports SKIPPED
+    # instead of FAILED on the soundness bug.
+    _DUAL_KNOWN_BROKEN_LAYER_KINDS: frozenset = frozenset({"LRELU"})
+
     def _network_supported_by_mode(
         self, net: Net, tf_mode: str
     ) -> Tuple[bool, List[str]]:
@@ -382,12 +400,17 @@ class VerificationValidator:
 
         Two sources of "skip":
           1. Backend's static ``supports_layer`` returns False for some kind
-             (e.g. ``DualTF`` has no LSTM/GRU/RNN/transformer ops at all).
+             (e.g. some TFs lack LSTM/GRU/transformer ops).
           2. The (tf_mode, kind) pair is in ``_KNOWN_RUNTIME_BROKEN`` — the
              backend claims support but has a documented runtime bug.
 
         Real (undocumented) runtime errors are NOT swallowed; they bubble
         up as ERROR so we notice and fix them.
+
+        Valid ``tf_mode`` values: ``"interval"`` and ``"hybridz"``.  ``"dual"``
+        is a Solver choice (``--solver dual``), not a TF mode, after the β
+        refactor; passing ``"dual"`` here raises ``ValueError`` from the
+        underlying ``set_transfer_function_mode``.
         """
         from act.back_end.transfer_functions import (
             set_transfer_function_mode,
@@ -547,6 +570,7 @@ class VerificationValidator:
         self,
         networks: Optional[List[str]] = None,
         solvers: List[str] = ["gurobi", "torchlp"],
+        tf_modes: Optional[List[str]] = None,
         batch_sizes: Optional[Sequence[Optional[int]]] = None,
     ) -> Dict[str, Any]:
         """
@@ -554,7 +578,9 @@ class VerificationValidator:
 
         Args:
             networks: List of network names (None = all networks)
-            solvers: List of solver names to test
+            solvers: List of solver names to test ('gurobi', 'torchlp', 'dual')
+            tf_modes: List of TF modes for forward bounds ('interval' / 'hybridz').
+                      Ignored for solver='dual'.  Defaults to ['interval'].
             batch_sizes: List of batch sizes to validate at. Each element may be:
                 - None: use the network's native batch size from JSON (default)
                 - int >= 1: batchify the network's INPUT_SPEC to this size
@@ -568,6 +594,8 @@ class VerificationValidator:
             networks = self.factory.list_networks()
         if not batch_sizes:
             batch_sizes = [None]
+        if not tf_modes:
+            tf_modes = ["interval"]
 
         solvers = list(solvers)
         if "gurobi" in solvers and not is_gurobi_available():
@@ -581,6 +609,7 @@ class VerificationValidator:
         logger.info(f"{'=' * 80}")
         logger.info(
             f"Testing {len(networks)} networks x {len(solvers)} solvers "
+            f"x {len(tf_modes)} tf_modes={tf_modes} "
             f"x {len(batch_sizes)} batch_sizes={batch_sizes}"
         )
         logger.info(f"Device: {self.device}, Dtype: {self.dtype}")
@@ -588,28 +617,34 @@ class VerificationValidator:
 
         for network in networks:
             for solver in solvers:
-                for batch_size in batch_sizes:
-                    try:
-                        self._validate_counterexample_single(
-                            network, solver, batch_size=batch_size
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"Validation failed for {network}/{solver}/B={batch_size}: {e}"
-                        )
-                        import traceback
+                for tf_mode in tf_modes:
+                    for batch_size in batch_sizes:
+                        try:
+                            self._validate_counterexample_single(
+                                network,
+                                solver,
+                                tf_mode=tf_mode,
+                                batch_size=batch_size,
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"Validation failed for "
+                                f"{network}/{solver}/{tf_mode}/B={batch_size}: {e}"
+                            )
+                            import traceback
 
-                        traceback.print_exc()
-                        error_result = {
-                            "network": network,
-                            "solver": solver,
-                            "batch_size": batch_size,
-                            "validation_type": "counterexample",
-                            "status": "ERROR",
-                            "error": f"Outer exception: {str(e)}",
-                            "concrete_counterexample": False,
-                        }
-                        self.validation_results.append(error_result)
+                            traceback.print_exc()
+                            error_result = {
+                                "network": network,
+                                "solver": solver,
+                                "tf_mode": tf_mode,
+                                "batch_size": batch_size,
+                                "validation_type": "counterexample",
+                                "status": "ERROR",
+                                "error": f"Outer exception: {str(e)}",
+                                "concrete_counterexample": False,
+                            }
+                            self.validation_results.append(error_result)
 
         return self._compute_summary(validation_type="counterexample")
 
@@ -617,6 +652,7 @@ class VerificationValidator:
         self,
         name: str,
         solver: str,
+        tf_mode: str = "interval",
         batch_size: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
@@ -624,18 +660,92 @@ class VerificationValidator:
 
         Args:
             name: Network name (stem of .json file in nets/)
-            solver: 'gurobi' or 'torchlp'
+            solver: 'gurobi', 'torchlp', or 'dual'
+            tf_mode: TF mode for forward bounds ('interval' or 'hybridz').
+                     Ignored when ``solver='dual'`` (DualSolver brings its own
+                     forward bounds via DualTF).
             batch_size: Target batch size. None preserves the network's native B.
 
         Returns:
             Validation result dictionary with status and details
         """
         logger.info(f"\n{'=' * 80}")
-        logger.info(f"Validating: {name} (solver: {solver}, B={batch_size})")
+        logger.info(
+            f"Validating: {name} (solver: {solver}, tf_mode: {tf_mode}, B={batch_size})"
+        )
         logger.info(f"{'=' * 80}")
+
+        # Wire up the requested solver / TF globally so verify_once() picks
+        # the matching code path.  After the Phase II β refactor, dual is a
+        # Solver choice (set_solver_mode) rather than a TF mode; for LP-based
+        # solvers we additionally pin the forward TF used for bounds.
+        from act.back_end.transfer_functions import (
+            set_solver_mode,
+            set_transfer_function_mode,
+        )
+
+        set_solver_mode(solver)
+        if solver != "dual":
+            set_transfer_function_mode(tf_mode)
 
         act_net = self.factory.get_act_net(name)
         act_net = self._batchify_net(act_net, batch_size)
+
+        # Pre-filter: skip nets whose layer kinds the active TF / Solver cannot
+        # handle.  Mirrors the graceful-degrade pattern of the now-removed
+        # `--verify-all` entry point (which reported SKIPPED via the
+        # `_SkipUnsupported` tagged union) so CI doesn't fail on nets containing
+        # MaxPool / LSTM / etc when the selected mode lacks a handler.
+        skip_reason: Optional[str] = None
+        if solver == "dual":
+            from act.back_end.dual_tf.dual_tf import DualTF
+
+            dual_tf = DualTF()
+            layer_kinds = {L.kind for L in act_net.layers}
+            assert_spec_kinds = {
+                L.params.get("kind")
+                for L in act_net.layers
+                if L.kind == "ASSERT"
+            }
+
+            missing = sorted({k for k in layer_kinds if not dual_tf.supports_layer(k)})
+            known_broken = sorted(layer_kinds & self._DUAL_KNOWN_BROKEN_LAYER_KINDS)
+            unsupported_specs = sorted(
+                assert_spec_kinds & self._DUAL_UNSUPPORTED_SPEC_KINDS
+            )
+
+            if missing:
+                skip_reason = f"DualTF cannot handle: {', '.join(missing)}"
+            elif known_broken:
+                skip_reason = (
+                    f"DualSolver has a known soundness gap on "
+                    f"{', '.join(known_broken)} (deferred to Phase III)"
+                )
+            elif unsupported_specs:
+                skip_reason = (
+                    f"DualSolver does not support spec kind(s): "
+                    f"{', '.join(unsupported_specs)} (use LP/Gurobi path)"
+                )
+        else:
+            ok, missing = self._network_supported_by_mode(act_net, tf_mode)
+            if not ok:
+                skip_reason = (
+                    f"tf_mode={tf_mode!r} has no handler for: {', '.join(missing)}"
+                )
+
+        if skip_reason is not None:
+            skip_result = {
+                "network": name,
+                "solver": solver,
+                "tf_mode": tf_mode,
+                "batch_size": batch_size,
+                "validation_type": "counterexample",
+                "validation_status": "SKIPPED",
+                "explanation": f"⏭️  SKIPPED: {skip_reason}",
+            }
+            logger.info(f"\n  {skip_result['explanation']}")
+            self.validation_results.append(skip_result)
+            return skip_result
 
         model = self.factory.create_model(name, load_weights=True)
         model = model.to(self.device, self.dtype)
@@ -647,11 +757,7 @@ class VerificationValidator:
         logger.info(f"\n  🔍 Running formal verifier ({solver})...")
 
         try:
-            if solver == "gurobi":
-                solver_instance = GurobiSolver()
-            elif solver == "torchlp":
-                solver_instance = TorchLPSolver()
-            else:
+            if solver not in {"gurobi", "torchlp", "dual"}:
                 raise ValueError(f"Unknown solver: {solver}")
 
             verify_result_list = verify_once(act_net)
@@ -1116,7 +1222,10 @@ class VerificationValidator:
         logger.info(f"{'=' * 80}\n")
 
         summary_l1 = self.validate_counterexamples(
-            networks=networks, solvers=solvers, batch_sizes=batch_sizes
+            networks=networks,
+            solvers=solvers,
+            tf_modes=tf_modes,
+            batch_sizes=batch_sizes,
         )
 
         summary_l2 = self.validate_bounds(

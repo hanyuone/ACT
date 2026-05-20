@@ -34,7 +34,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
@@ -48,53 +48,80 @@ jobs:
       - name: Generate Networks (float64)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.back_end --generate --device cpu --dtype float64
+          coverage run -p -m act.back_end --generate --device cpu --dtype float64
 
       - name: Run Serialization Tests (float64)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.back_end --test-serialization --device cpu --dtype float64
+          coverage run -p -m act.back_end --test-serialization --device cpu --dtype float64
 
       - name: Run serialization round-trip tests
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.back_end.serialization.test_serialization
+          coverage run -p -m act.back_end.serialization.test_serialization
 
       - name: Run ACT2Torch Tests (float64)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --verify act2torch --device cpu --dtype float64
+          coverage run -p -m act.pipeline --verify act2torch --device cpu --dtype float64
 
       - name: Run Verifier Self-Tests (float64)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.back_end.verifier
+          coverage run -p -m act.back_end.verifier
 
-      # Level 1: Counterexample/Soundness Validation
+      # ─────────────────────────────────────────────────────────────────
+      # Soundness check (TF-agnostic): runs once before per-solver matrix.
+      # `--validate-verifier --mode counterexample` finds concrete inputs
+      # that violate the spec, then asserts the verifier reports them as
+      # FALSIFIED (not CERTIFIED). Catches verifier soundness bugs.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Soundness — counterexample validation (float64)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float64
 
-      - name: Run Counterexample Validation (float64)
-        run: |
-          cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float64
-      # Level 2: Bounds Validation (per TF mode)
+      # ─────────────────────────────────────────────────────────────────
+      # Per-solver verification matrix (3 solvers × 2 commands each).
+      # Each solver gets a dedicated step that exercises:
+      #   (1) --validate-verifier --mode bounds: TF SOUNDNESS check —
+      #       runs concrete inputs through the PyTorch model and compares
+      #       activations against abstract bounds; catches over-/under-
+      #       approximation bugs in the forward TF. (Skipped for dual:
+      #       dual is a backward Solver, not a forward TF — see Solver 3.)
+      #   (2) --validate-verifier --mode counterexample: END-TO-END
+      #       verification + verifier soundness check — runs verify_once
+      #       on every factory net (CERTIFIED / FALSIFIED / UNKNOWN /
+      #       SKIPPED per spec) AND tries to find a concrete CEX via
+      #       random sampling to cross-validate the verifier's verdict
+      #       (catches false-CERTIFIED soundness bugs).  Subsumes the
+      #       historical --verify-all entry point.
+      # ─────────────────────────────────────────────────────────────────
 
-      - name: Run Bounds Validation (float64, interval)
+      # Solver 1: IntervalTF (forward box) + LP cascade
+      - name: Solver = interval + LP cascade (float64)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float64 --tf-modes interval
-      - name: Run Bounds Validation (float64, hybridz)
+          coverage run -p -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float64 --tf-modes interval
+          coverage run -p -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float64 --tf-modes interval --solvers torchlp
+
+      # Solver 2: HybridzTF (zonotope forward) + LP cascade
+      - name: Solver = hybridz + LP cascade (float64)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float64 --tf-modes hybridz
-      - name: Run Bounds Validation (float64, dual)
+          coverage run -p -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float64 --tf-modes hybridz
+          coverage run -p -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float64 --tf-modes hybridz --solvers torchlp
+
+      # Solver 3: DualSolver (CROWN/Wong-Kolter backward, no LP cascade)
+      - name: Solver = dual (CROWN backward, float64)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float64 --tf-modes dual
+          coverage run -p -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float64 --solvers dual
 
       - name: List example networks (back_end)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.back_end --list-examples
+          coverage run -p -m act.back_end --list-examples
 
       - name: Combine coverage data
         if: always()
