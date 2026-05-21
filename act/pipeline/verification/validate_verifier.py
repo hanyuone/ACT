@@ -376,11 +376,13 @@ class VerificationValidator:
 
     _KNOWN_RUNTIME_BROKEN: Dict[Tuple[str, str], str] = {}
 
-    # Spec kinds explicitly rejected by DualSolver.evaluate_spec — UNSAFE_LINEAR
-    # uses EXISTS quantifier semantics that sound dual lower bounds cannot
-    # certify (see `solver_dual.py:295-300`).  Pre-filter at validate-verifier
-    # level so CI reports SKIPPED instead of NotImplementedError.
-    _DUAL_UNSUPPORTED_SPEC_KINDS: frozenset = frozenset({"UNSAFE_LINEAR"})
+    # Spec kinds explicitly rejected by DualSolver.evaluate_spec.  Empty after
+    # Phase II β β': UNSAFE_LINEAR is now handled via per-row LB + ANY-escape
+    # aggregation (sound under-approximation; mirrors the interval/hybridz path
+    # at `verifier.py:574-580`).  See `solver_dual.py:evaluate_spec` for the
+    # quantifier-swap derivation.  This frozenset is retained as a pre-filter
+    # hook for any future kind that DualSolver cannot certify.
+    _DUAL_UNSUPPORTED_SPEC_KINDS: frozenset = frozenset()
 
     # Layer kinds where DualSolver currently has a known soundness gap — the
     # dispatch table at `dual_tf/dual_tf.py:223` aliases LRELU's backward

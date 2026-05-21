@@ -1,0 +1,138 @@
+name: ACT Pipeline Verify Tests
+
+# CI: front-end E2E verify via `act.pipeline --verify {vnnlib,torchvision}`.
+# One step per benchmark; each step iterates the (TF, Solver) cells it
+# supports.  Architecture / spec-kind / outcome coverage:
+#   - acasxu_2023 (VNNLIB MLP, safety): all three cells.
+#   - dist_shift_2023 (VNNLIB MNIST MLP, robustness): all three cells.
+#   - safenlp_2024 (VNNLIB NLP / transformer): all three cells — exercises
+#     OnnxConstant handler + transformer-style layer mix; hybridz and dual
+#     produce CERTIFIED on some instances (only VNNLIB benchmark here
+#     where hybridz reaches affirmative verdict).
+#   - collins_rul_cnn_2022 (VNNLIB CNN): dual only — exercises
+#     `backward_conv2d` in `act/back_end/dual_tf/tf_cnn.py`.  Forward TFs
+#     skipped due to a separate shape-propagation bug at
+#     `interval_tf/tf_cnn.py:689` (21×8 input vs 6×20 kernel).
+#   - MNIST + simple_cnn (TorchVision): interval + hybridz only.
+#     Unique value vs VNNLIB section: TorchVisionSpecCreator generates
+#     TOP1_ROBUST and MARGIN_ROBUST spec kinds (VNNLIB benchmarks always
+#     parse to UNSAFE_LINEAR), exercising fresh code paths in
+#     `act/front_end/specs.py:encode_linear`.  Dual skipped due to a
+#     scalability gap in our CROWN backward (`expand_bounds_dict` at
+#     `solver_dual.py:26` materializes [B*M, *layer_shape] bounds for ALL
+#     layers up-front; `dual_conv2d_backward` propagates dense Jacobians).
+#     auto_LiRPA reference impl uses symbolic (A, b) propagation +
+#     CROWN-Patch + sparse-unstable-only bounds to handle 224×224 on
+#     24 GB GPUs.  Fix path tracked separately — chunk_size=1 alone
+#     reduces by M× but minimum ~17 GB still exceeds CI runner memory.
+# Benchmarks restricted to those reliably downloadable from vnncomp2024;
+# categories flagged "Not in vnncomp2024" in `category_mapping.py` are
+# excluded because their fallback source is flaky on GitHub Actions.
+#
+# Factory-network verification lives in the backend CIs
+# (`act-backend-float32.yml`, `act-backend-float64.yml`, `act-bab.yml`).
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  TF_ENABLE_ONEDNN_OPTS: "0"
+  ACT_CI_MODE: "true"
+
+jobs:
+  pipeline-verify:
+    name: Pipeline Verify Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/hostedtoolcache
+          df -h
+
+      - name: Clean pip cache
+        run: |
+          pip cache purge
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install coverage torch torchvision onnx onnx2torch onnx-simplifier tensorflow pandas numpy pyyaml tqdm psutil transformers scikit-learn
+
+      - name: Download VNNLIB benchmarks
+        run: |
+          cd ${{ github.workspace }}
+          for cat in acasxu_2023 dist_shift_2023 safenlp_2024 collins_rul_cnn_2022; do
+            coverage run -p -m act.front_end --download $cat
+          done
+
+      - name: Download TorchVision MNIST
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.front_end --download MNIST
+
+      - name: Verify acasxu_2023 (interval / hybridz / dual)
+        run: |
+          cd ${{ github.workspace }}
+          for combo in "--tf-modes interval --solvers torchlp" "--tf-modes hybridz --solvers torchlp" "--solvers dual"; do
+            coverage run -p -m act.pipeline --verify vnnlib --category acasxu_2023 --max-instances 3 $combo --device cpu --dtype float64
+          done
+
+      - name: Verify dist_shift_2023 (interval / hybridz / dual)
+        run: |
+          cd ${{ github.workspace }}
+          for combo in "--tf-modes interval --solvers torchlp" "--tf-modes hybridz --solvers torchlp" "--solvers dual"; do
+            coverage run -p -m act.pipeline --verify vnnlib --category dist_shift_2023 --max-instances 3 $combo --device cpu --dtype float64
+          done
+
+      - name: Verify safenlp_2024 (interval / hybridz / dual)
+        run: |
+          cd ${{ github.workspace }}
+          for combo in "--tf-modes interval --solvers torchlp" "--tf-modes hybridz --solvers torchlp" "--solvers dual"; do
+            coverage run -p -m act.pipeline --verify vnnlib --category safenlp_2024 --max-instances 2 $combo --device cpu --dtype float64
+          done
+
+      - name: Verify collins_rul_cnn_2022 (dual only — exercises backward_conv2d)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --verify vnnlib --category collins_rul_cnn_2022 --max-instances 3 --solvers dual --device cpu --dtype float64
+
+      - name: Verify TorchVision MNIST + simple_cnn (interval / hybridz — TOP1_ROBUST + MARGIN_ROBUST spec coverage)
+        run: |
+          cd ${{ github.workspace }}
+          for combo in "--tf-modes interval --solvers torchlp" "--tf-modes hybridz --solvers torchlp"; do
+            coverage run -p -m act.pipeline --verify torchvision --dataset MNIST --model simple_cnn --num-samples 2 $combo --device cpu --dtype float64
+          done
+
+      - name: Combine coverage data
+        if: always()
+        run: |
+          cd ${{ github.workspace }}
+          coverage combine
+          coverage xml -o coverage.xml
+          coverage report
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
+          flags: pipeline-verify
+          name: pipeline-verify
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

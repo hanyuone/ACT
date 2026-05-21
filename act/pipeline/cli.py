@@ -514,11 +514,133 @@ def cmd_list_verifications():
     print(f"\n{'=' * 80}\n")
 
 
+def _run_vnnlib_verify(args) -> None:
+    """Drive ``verify_once`` over a VNNLIB benchmark end-to-end.
+
+    Bridges the front-end load → ACT-Net path that ``act.back_end --verify
+    --network`` does not provide: ``VNNLibSpecCreator`` →
+    ``synthesize_models_from_specs`` → ``TorchToACT`` → ``verify_once``.
+
+    Single-mode per invocation, matching the ``act.back_end --verify`` CLI
+    contract: uses the first element of ``--tf-modes`` (default
+    ``"interval"``) and ``--solvers`` (default ``"torchlp"``).  Multi-mode
+    sweeps are the caller's job — invoke once per (tf-mode, solver) cell.
+    Dual ignores ``--tf-modes`` because it's a backward Solver.
+    """
+    from act.front_end.vnnlib_loader.create_specs import VNNLibSpecCreator
+    from act.front_end.model_synthesis import synthesize_models_from_specs
+    from act.pipeline.verification.torch2act import TorchToACT
+    from act.back_end.verifier import verify_once
+    from act.back_end.transfer_functions import (
+        set_solver_mode,
+        set_transfer_function_mode,
+    )
+
+    if not args.category:
+        raise ValueError("--verify vnnlib requires --category (e.g. --category acasxu_2023)")
+
+    tf_mode = (args.tf_modes or ["interval"])[0]
+    solver = (args.solvers or ["torchlp"])[0]
+
+    set_solver_mode(solver)
+    if solver != "dual":
+        set_transfer_function_mode(tf_mode)
+    label = solver if solver == "dual" else f"{tf_mode}/{solver}"
+    print(f"[vnnlib] category={args.category} max_instances={args.max_instances} mode={label}")
+
+    spec_results = VNNLibSpecCreator().create_specs_for_data_model_pairs(
+        categories=[args.category], max_instances=args.max_instances,
+    )
+    if not spec_results:
+        raise RuntimeError(f"VNNLibSpecCreator produced no spec_results for category={args.category!r}")
+
+    wrapped = synthesize_models_from_specs(spec_results)
+    if not wrapped:
+        raise RuntimeError("synthesize_models_from_specs produced no VerifiableModels")
+
+    for mid, vm in wrapped.items():
+        tag = "/".join(str(p) for p in mid)
+        net = TorchToACT(vm).run()
+        results = verify_once(net)
+        statuses = [r.status.name for r in results]
+        print(f"  {tag}: {statuses}")
+
+
+def _run_torchvision_verify(args) -> None:
+    """Drive ``verify_once`` over a TorchVision dataset-model pair end-to-end.
+
+    Bridges the front-end load → ACT-Net path for TorchVision the same way
+    ``_run_vnnlib_verify`` does for VNNLIB benchmarks:
+    ``TorchVisionSpecCreator`` → ``synthesize_models_from_specs`` →
+    ``TorchToACT`` → ``verify_once``.  Single-mode per invocation, matching
+    the ``act.back_end --verify`` CLI contract.
+
+    Note on dual: TorchVision preprocessing resizes inputs to 224×224.  Our
+    CROWN backward currently materializes dense Jacobians per layer via
+    ``F.conv_transpose2d`` on [B*M, C, H, W] tensors and expands all
+    intermediate bounds up-front through ``expand_bounds_dict`` (see
+    ``act/back_end/solver/solver_dual.py:26``).  For B=16 batched samples,
+    M=9 spec rows, and a 13-layer 25M-param CNN this requests ~180 GB.
+    auto_LiRPA's reference CROWN avoids this via symbolic (A, b) coefficient
+    propagation + CROWN-Patch + sparse-unstable-only bounds.  Forward TFs
+    (interval, hybridz) work fine because they propagate only [B, *shape]
+    bounds (no M axis, no per-row Jacobian).  Until the dual backward gets
+    the auto_LiRPA-style refactor, ``--verify torchvision`` exposes interval
+    and hybridz only; use ``--verify vnnlib`` for dual coverage on small
+    inputs (see ``act/back_end/dual_tf/tf_cnn.py:91`` for the handler).
+    """
+    from act.front_end.torchvision_loader.create_specs import TorchVisionSpecCreator
+    from act.front_end.model_synthesis import synthesize_models_from_specs
+    from act.pipeline.verification.torch2act import TorchToACT
+    from act.back_end.verifier import verify_once
+    from act.back_end.transfer_functions import (
+        set_solver_mode,
+        set_transfer_function_mode,
+    )
+
+    if not args.dataset:
+        raise ValueError("--verify torchvision requires --dataset (e.g. --dataset MNIST)")
+
+    tf_mode = (args.tf_modes or ["interval"])[0]
+    solver = (args.solvers or ["torchlp"])[0]
+
+    set_solver_mode(solver)
+    if solver != "dual":
+        set_transfer_function_mode(tf_mode)
+    label = solver if solver == "dual" else f"{tf_mode}/{solver}"
+    model_label = args.model or "<all>"
+    print(
+        f"[torchvision] dataset={args.dataset} model={model_label} "
+        f"num_samples={args.num_samples} mode={label}"
+    )
+
+    spec_results = TorchVisionSpecCreator().create_specs_for_data_model_pairs(
+        dataset_names=[args.dataset],
+        model_names=[args.model] if args.model else None,
+        num_samples=args.num_samples,
+    )
+    if not spec_results:
+        raise RuntimeError(
+            f"TorchVisionSpecCreator produced no spec_results for "
+            f"dataset={args.dataset!r}, model={args.model!r}"
+        )
+
+    wrapped = synthesize_models_from_specs(spec_results)
+    if not wrapped:
+        raise RuntimeError("synthesize_models_from_specs produced no VerifiableModels")
+
+    for mid, vm in wrapped.items():
+        tag = "/".join(str(p) for p in mid)
+        net = TorchToACT(vm).run()
+        results = verify_once(net)
+        statuses = [r.status.name for r in results]
+        print(f"  {tag}: {statuses}")
+
+
 def cmd_verify(target: str, args):
     """Run verification tests from the verification submodule."""
     print_header()
 
-    # Import verification test modules
     from act.pipeline.verification import model_factory, torch2act
 
     tests_to_run = []
@@ -549,6 +671,32 @@ def cmd_verify(target: str, args):
             print(f"{'=' * 80}\n")
             try:
                 torch2act.main()
+                results[test_name] = "PASSED"
+            except Exception as e:
+                print(f"\n❌ Test failed: {e}")
+                import traceback
+
+                traceback.print_exc()
+                results[test_name] = "FAILED"
+
+        elif test_name == "vnnlib":
+            print(f"VERIFICATION TEST: VNNLIB → VerifiableModel → verify_once")
+            print(f"{'=' * 80}\n")
+            try:
+                _run_vnnlib_verify(args)
+                results[test_name] = "PASSED"
+            except Exception as e:
+                print(f"\n❌ Test failed: {e}")
+                import traceback
+
+                traceback.print_exc()
+                results[test_name] = "FAILED"
+
+        elif test_name == "torchvision":
+            print(f"VERIFICATION TEST: TorchVision → VerifiableModel → verify_once")
+            print(f"{'=' * 80}\n")
+            try:
+                _run_torchvision_verify(args)
                 results[test_name] = "PASSED"
             except Exception as e:
                 print(f"\n❌ Test failed: {e}")
@@ -712,6 +860,17 @@ Examples:
   python -m act.pipeline --verify act2torch --device cpu
   python -m act.pipeline --verify torch2act --device cpu
   python -m act.pipeline --verify all --device cpu
+
+  # Run verifier on a VNNLIB benchmark end-to-end (load → ACT → verify_once).
+  # Single (tf, solver) per invocation; matrix sweeps by repeated calls.
+  python -m act.pipeline --verify vnnlib --category acasxu_2023 --max-instances 3 --tf-modes interval --solvers torchlp
+  python -m act.pipeline --verify vnnlib --category acasxu_2023 --max-instances 3 --tf-modes hybridz --solvers torchlp
+  python -m act.pipeline --verify vnnlib --category acasxu_2023 --max-instances 3                          --solvers dual
+
+  # Run verifier on a TorchVision dataset-model pair end-to-end.
+  # (dual not supported: 224×224 inputs make CROWN backward exceed CPU memory.)
+  python -m act.pipeline --verify torchvision --dataset MNIST --model simple_cnn --num-samples 2 --tf-modes interval --solvers torchlp
+  python -m act.pipeline --verify torchvision --dataset MNIST --model simple_cnn --num-samples 2 --tf-modes hybridz  --solvers torchlp
   
   # Run verifier validation (comprehensive by default)
   python -m act.pipeline --validate-verifier --device cpu --dtype float64
@@ -749,8 +908,13 @@ Examples:
         "--verify",
         type=str,
         metavar="TARGET",
-        choices=["act2torch", "torch2act", "all"],
-        help="Run verification tests: act2torch, torch2act, or all",
+        choices=["act2torch", "torch2act", "vnnlib", "torchvision", "all"],
+        help="Run verification tests: act2torch, torch2act, vnnlib, torchvision, "
+        "or all. The 'vnnlib' target runs the verifier on a VNNLIB benchmark "
+        "end-to-end (requires --category); 'torchvision' does the same for a "
+        "TorchVision dataset-model pair (requires --dataset, optionally --model). "
+        "Both read the FIRST element of --tf-modes / --solvers (single mode per "
+        "invocation; matrix sweeps by repeated calls).",
     )
     cmd_group.add_argument(
         "--validate-verifier",

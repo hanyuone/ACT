@@ -230,18 +230,28 @@ class DualSolver(Solver):
         Callers who already have a bounds_dict (e.g. BaB refinement loops) may
         pass it explicitly to skip the recomputation.
 
-        Strategy: ``encode_linear`` produces (C, thresholds) in UB-cert form
-        (CERTIFIED iff ``UB(C @ y) < threshold``). DualSolver returns LB(C @ y)
-        from ``compute_certified_bound``. Equivalence via sign flip: pass ``-C``
-        to compute_certified_bound and compare against ``-threshold``; slack
-        ``>= 0`` means certified.
+        Strategy: dispatch on ``out_spec.kind`` into two branches that share
+        ``compute_certified_bound`` but use opposite sign conventions and
+        opposite row aggregators.
+
+        - ALL-rows kinds (LINEAR_LE, TOP1_ROBUST, MARGIN_ROBUST, RANGE):
+          ``encode_linear`` emits (C, thresholds) in UB-cert form (CERTIFIED
+          iff ``UB(C @ y) < threshold``). Pass ``-C`` / ``-thresholds`` to
+          ``compute_certified_bound`` and compare; ``slack >= 0`` means the
+          row passes. Certified iff every row passes (``.all()``).
+        - EXISTS-row kind (UNSAFE_LINEAR): the unsafe polytope is
+          ``P = {y : c_i^T y <= d_i for ALL i}``. SAFE iff for all reachable
+          y, some row i satisfies ``c_i^T y > d_i`` (escape). Sound
+          strengthening via quantifier swap (mirrors ``verifier.py:574-580``):
+          certify SAFE iff there exists a row i with ``LB_dual(c_i^T y) > d_i``.
+          ``encode_linear`` emits UNSAFE_LINEAR in LB-cert form, so pass ``+C``
+          / ``+thresholds`` directly (no sign flip). Certified iff any row
+          escapes (``.any()``).
 
         Raises:
             ValueError: if net lacks ASSERT layer, ASSERT has != 1 predecessor,
                 or (when bounds_dict is supplied) the output layer's bounds are
                 missing / unbatched.
-            NotImplementedError: if out_spec.kind == UNSAFE_LINEAR (EXISTS
-                quantifier not supported by sound dual certificate).
         """
         if bounds_dict is None:
             from act.back_end.dual_tf.tf_forward import compute_forward_bounds
@@ -293,10 +303,39 @@ class DualSolver(Solver):
         n_out = int(out_bounds.lb.flatten(start_dim=1).shape[-1])
 
         if out_spec.kind == OutKind.UNSAFE_LINEAR:
-            raise NotImplementedError(
-                "DualSolver: UNSAFE_LINEAR uses EXISTS semantics (any-row "
-                "certification) not supported by sound dual lower bounds. "
-                "Use the LP/Gurobi path for UNSAFE_LINEAR specs."
+            # EXISTS-row branch. encode_linear emits LB-cert form for
+            # UNSAFE_LINEAR (specs.py:179-201) — pass +C / +thresholds
+            # directly. Certified iff any row escapes the unsafe polytope.
+            # Slack semantics is ASYMMETRIC vs ALL-rows kinds below:
+            # here ``slack > 0`` means the row certifies; ``min_slack`` is
+            # NOT a meaningful summary (use ``slack.max(dim=-1)`` instead).
+            fe_params = out_spec.encode_linear(B=B, n_out=n_out, device=device, dtype=dtype)
+            C = fe_params["C"].contiguous()
+            thresholds = fe_params["thresholds"].contiguous()
+            N = int(fe_params["M"])
+            active_mask = torch.ones(B, N, dtype=torch.bool, device=device)
+
+            with torch.set_grad_enabled(enable_grad):
+                if chunk_size is None or N <= chunk_size:
+                    bounds_n = expand_bounds_dict(bounds_dict, N)
+                    margins_flat = self.compute_certified_bound(
+                        net, bounds_n, C, enable_grad=enable_grad,
+                    )
+                else:
+                    margins_flat = self._chunked_eval(
+                        net, bounds_dict, C, B, N, n_out, chunk_size, enable_grad,
+                    )
+                if isinstance(margins_flat, tuple):
+                    margins_flat = margins_flat[0]
+                margins = margins_flat.view(B, N)
+                slack = margins - thresholds
+                certified = ((slack > 0) & active_mask).any(dim=-1)
+
+            return SpecBatchResult(
+                margins=margins,
+                slack=slack,
+                active_mask=active_mask,
+                certified=certified,
             )
 
         fe_params = out_spec.encode_linear(B=B, n_out=n_out, device=device, dtype=dtype)

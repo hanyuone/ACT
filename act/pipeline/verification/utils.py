@@ -565,6 +565,44 @@ def _convert_OnnxReshape(self, mod: nn.Module, node: fx.Node) -> None:
     self.shape = output_shape
     self._register_node(node.name, layer_id)
 
+def _convert_OnnxConstant(self, mod: nn.Module, node: fx.Node) -> None:
+    """Emit ACT CONSTANT layer for an onnx2torch OnnxConstant module.
+
+    OnnxConstant wraps a fixed tensor that the model's forward returns at this
+    position.  Materialising it as a CONSTANT layer lets registered-var
+    consumers (Reshape's shape arg, Slice bounds, Pow exponent, MatMul second
+    operand, etc.) resolve it via ``node_outputs[node.name]``.  Lazy consumers
+    that walk the FX graph through ``_evaluate_constant_subgraph`` continue
+    to work because ``mod.forward()`` is unchanged.
+
+    Integer dtypes are preserved (shape constants must stay int); only
+    floating-point values get cast to ``self.dtype``.
+    """
+    val = getattr(mod, "value", None)
+    if val is None:
+        val = next(iter(mod.buffers()), None)
+    if val is None:
+        raise NotImplementedError(
+            f"OnnxConstant at {node.name} has no .value attribute or buffer"
+        )
+    if not isinstance(val, torch.Tensor):
+        val = torch.tensor(val)
+    val = val.detach().clone()
+    if val.is_floating_point():
+        val = val.to(self.dtype)
+    flat = val.reshape(-1)
+    shape = tuple(int(d) for d in val.shape) or (1,)
+    out_vars = self._alloc_ids(int(flat.numel()) or 1)
+    layer_id = self._add_layer(
+        LayerKind.CONSTANT.value,
+        {"value": flat, "input_shape": shape, "output_shape": shape},
+        [], out_vars,
+    )
+    self.node_outputs[node.name] = out_vars
+    self.node_shapes[node.name] = shape
+    self.node_to_layer_id[node.name] = layer_id
+
+
 def _convert_OnnxConcat(self, mod: nn.Module, node: fx.Node) -> None:
     """OnnxConcat: y = cat(*input_tensors, axis).
 
@@ -1415,6 +1453,7 @@ ONNX_HANDLERS = {
     'OnnxCast': _convert_OnnxCast,
     'OnnxCompare': _convert_OnnxCompare,
     'OnnxConcat': _convert_OnnxConcat,
+    'OnnxConstant': _convert_OnnxConstant,
     'OnnxDropoutDynamic': _convert_OnnxDropoutDynamic,
     'OnnxExpand': _convert_OnnxExpand,
     'OnnxFlatten': _convert_OnnxFlatten,
