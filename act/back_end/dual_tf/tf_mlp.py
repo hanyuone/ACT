@@ -280,35 +280,28 @@ def backward_relu(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
 
 def dual_relu_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1
                        ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Batched ReLU backward with fixed upper slope.
+    """Wong-Kolter backward for ReLU, computing LB(nu @ relu(z)).
 
-    Lazy M-broadcast: ``bounds`` is at ``[B, *shape]`` (spec-agnostic) and
-    ``nu`` is at ``[B*M, *shape]`` (M-expanded by output spec rows). The
-    slope ``d[b, m, i] = ub[b,i] / (ub[b,i] - lb[b,i])`` is independent of
-    ``m`` (forward bounds depend only on the input box, not the spec C),
-    so we view ``nu`` as ``[B, M, n]`` and broadcast bounds ``[B, 1, n]``
-    against it — bit-identical to legacy M-expanded path, zero copies of
-    the bounds tensor.
+    Relaxation (ambiguous neurons, l<0<u): slope = u/(u-l), intercept = -slope*l.
+        Lower envelope: y >= slope*z              (sound: slope*z <= relu(z))
+        Upper envelope: y <= slope*z + intercept  (line through (l,0) and (u,u))
 
-    Args:
-        nu: dual variable, shape ``[B*M, *shape]``. Sample-major packing:
-            row ``b*M+m`` carries the m-th spec row's contribution for
-            sample b.
-        bounds: layer bounds, shape ``[B, *shape]``. NOT M-expanded.
-        M: number of spec rows packed into nu's batch axis. Default 1
-            (legacy behaviour: nu and bounds share batch dim B).
+    LB(nu @ y) decomposes per neuron:
+        nu_i >= 0: bound y_i from BELOW (lower env)  -> intercept contrib = 0
+        nu_i <  0: bound y_i from ABOVE (upper env)  -> intercept contrib = nu_i * intercept
 
-    Returns:
-        v_out: ``[B*M, n]`` propagated dual var (flattened).
-        contrib: ``[B*M]`` per-row contribution from crossing penalty.
+    Both envelopes share the same slope, so d = slope for all amb regardless of
+    sign of nu — the contrib term is what differs.
+
+    Lazy M-broadcast: bounds stays at [B, *shape]; nu is [B*M, *shape].
     """
     BM = nu.shape[0]
     assert BM % M == 0, f"dual_relu_backward: nu batch {BM} not divisible by M={M}"
     B = BM // M
 
-    v_flat = nu.flatten(start_dim=1)                             # [BM, n]
-    l_B = bounds.lb.flatten(start_dim=1)                         # [B,  n]
-    u_B = bounds.ub.flatten(start_dim=1)                         # [B,  n]
+    v_flat = nu.flatten(start_dim=1)
+    l_B = bounds.lb.flatten(start_dim=1)
+    u_B = bounds.ub.flatten(start_dim=1)
     n = min(v_flat.shape[-1], l_B.shape[-1])
     if v_flat.shape[-1] != l_B.shape[-1]:
         v_flat = v_flat[..., :n]
@@ -316,25 +309,25 @@ def dual_relu_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1
         u_B = u_B[..., :n]
     assert (l_B <= u_B).all(), "Invalid bounds: l > u"
 
-    v = v_flat.view(B, M, n)                                     # view, no copy
-    l = l_B.unsqueeze(1)                                         # [B, 1, n]
-    u = u_B.unsqueeze(1)                                         # [B, 1, n]
+    v = v_flat.view(B, M, n)
+    l = l_B.unsqueeze(1)
+    u = u_B.unsqueeze(1)
 
-    on, off, amb = get_relu_masks(l, u)                          # [B, 1, n] each
-    d = torch.zeros_like(v)                                      # [B, M, n]
-    d = torch.where(on, torch.ones_like(d), d)                   # broadcast on
+    on, off, amb = get_relu_masks(l, u)
+    d = torch.zeros_like(v)
+    d = torch.where(on, torch.ones_like(d), d)
     if amb.any():
-        denom = (u - l).clamp(min=1e-12)                         # [B, 1, n]
-        d = torch.where(amb, u / denom, d)                       # broadcast amb
-
-    v_out = d * v                                                # [B, M, n]
-
-    if amb.any():
-        crossing = torch.where(amb, v_out.clamp(min=0) * l,
-                               torch.zeros_like(v_out))          # [B, M, n]
-        contrib = crossing.sum(dim=-1).view(BM)                  # [BM]
+        denom = (u - l).clamp(min=1e-12)
+        slope = u / denom
+        d = torch.where(amb, slope.expand_as(v), d)
+        intercept = -slope * l
+        contrib_per = torch.where(amb, v.clamp(max=0) * intercept,
+                                  torch.zeros_like(v))
+        contrib = contrib_per.sum(dim=-1).view(BM)
     else:
         contrib = torch.zeros(BM, dtype=nu.dtype, device=nu.device)
+
+    v_out = d * v
     return v_out.view(BM, n), contrib
 
 
