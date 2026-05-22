@@ -1,0 +1,114 @@
+name: ACT Pipeline Verify Tests
+
+# Front-end E2E verify via `act.pipeline --verify {vnnlib,torchvision}`.
+# One step per benchmark; each step iterates the (TF, Solver) combos it
+# supports. VNNLIB benchmarks (vnncomp2024 subset): acasxu_2023, dist_shift_2023,
+# safenlp_2024 run all three combos (interval/hybridz/dual); collins_rul_cnn_2022
+# runs dual only (forward TFs hit an unrelated shape bug). TorchVision MNIST +
+# simple_cnn runs all three combos, exercising TOP1_ROBUST + MARGIN_ROBUST spec
+# kinds. Factory-network verification lives in the backend CIs.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  TF_ENABLE_ONEDNN_OPTS: "0"
+  ACT_CI_MODE: "true"
+
+jobs:
+  pipeline-verify:
+    name: Pipeline Verify Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/hostedtoolcache
+          df -h
+
+      - name: Clean pip cache
+        run: |
+          pip cache purge
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install coverage torch torchvision onnx onnx2torch onnx-simplifier tensorflow pandas numpy pyyaml tqdm psutil transformers scikit-learn
+
+      - name: Download VNNLIB benchmarks
+        run: |
+          cd ${{ github.workspace }}
+          for cat in acasxu_2023 dist_shift_2023 safenlp_2024 collins_rul_cnn_2022; do
+            coverage run -p -m act.front_end --download $cat
+          done
+
+      - name: Download TorchVision MNIST
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.front_end --download MNIST
+
+      - name: Verify acasxu_2023 (interval / hybridz / dual)
+        run: |
+          cd ${{ github.workspace }}
+          for combo in "--tf-modes interval --solvers torchlp" "--tf-modes hybridz --solvers torchlp" "--solvers dual"; do
+            coverage run -p -m act.pipeline --verify vnnlib --category acasxu_2023 --max-instances 5 $combo --device cpu --dtype float64
+          done
+
+      - name: Verify dist_shift_2023 (interval / hybridz / dual)
+        run: |
+          cd ${{ github.workspace }}
+          for combo in "--tf-modes interval --solvers torchlp" "--tf-modes hybridz --solvers torchlp" "--solvers dual"; do
+            coverage run -p -m act.pipeline --verify vnnlib --category dist_shift_2023 --max-instances 5 $combo --device cpu --dtype float64
+          done
+
+      - name: Verify safenlp_2024 (interval / hybridz / dual)
+        run: |
+          cd ${{ github.workspace }}
+          for combo in "--tf-modes interval --solvers torchlp" "--tf-modes hybridz --solvers torchlp" "--solvers dual"; do
+            coverage run -p -m act.pipeline --verify vnnlib --category safenlp_2024 --max-instances 5 $combo --device cpu --dtype float64
+          done
+
+      - name: Verify collins_rul_cnn_2022 (dual only — exercises backward_conv2d)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --verify vnnlib --category collins_rul_cnn_2022 --max-instances 5 --solvers dual --device cpu --dtype float64
+
+      - name: Verify TorchVision MNIST + simple_cnn (interval / hybridz / dual — TOP1_ROBUST + MARGIN_ROBUST spec coverage)
+        run: |
+          cd ${{ github.workspace }}
+          for combo in "--tf-modes interval --solvers torchlp" "--tf-modes hybridz --solvers torchlp" "--solvers dual"; do
+            coverage run -p -m act.pipeline --verify torchvision --dataset MNIST --model simple_cnn --num-samples 2 $combo --device cpu --dtype float64
+          done
+
+      - name: Combine coverage data
+        if: always()
+        run: |
+          cd ${{ github.workspace }}
+          coverage combine
+          coverage xml -o coverage.xml
+          coverage report
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
+          flags: pipeline-verify
+          name: pipeline-verify
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

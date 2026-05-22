@@ -14,7 +14,12 @@
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
-from typing import Optional
+from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
+
+if TYPE_CHECKING:
+    import torch
+    from act.back_end.core import Bounds, Net
+
 
 class SolveStatus:
     """Solver status codes (SAT/UNSAT terminology for verification)."""
@@ -23,13 +28,34 @@ class SolveStatus:
     UNKNOWN = "UNKNOWN"      # Inconclusive (timeout/spurious/error)
 
 class SolverCaps:
-    def __init__(self, supports_gpu: bool = False, supports_csp: bool = True, supports_hz: bool = False):
+    def __init__(self, supports_gpu: bool = False, supports_csp: bool = True, supports_hz: bool = False, supports_dual: bool = False):
         self.supports_gpu = supports_gpu
         self.supports_csp = supports_csp
         self.supports_hz = supports_hz
+        self.supports_dual = supports_dual
 
 class Solver:
-    """Abstract solver interface used by the exporter and verification pipeline."""
+    """Abstract solver interface used by the exporter and verification pipeline.
+
+    Three **alternative** capability surfaces (not orthogonal axes): every
+    current subclass implements exactly one of the three primary capability
+    flags (``supports_csp`` / ``supports_hz`` / ``supports_dual``), so the
+    surfaces partition solvers into specialised families rather than
+    composing freely. Subclasses implement only the methods that match
+    their declared capability and leave the rest raising
+    ``NotImplementedError``:
+
+      * ``compute_bounds(domain_obj)`` — domain-element → box bounds.
+        Implemented by ``GurobiSolver`` and ``HZSolver``.
+      * ``solve_batch(BatchLPProblem)`` — batched LP/MILP. Implemented by
+        ``GurobiSolver``, ``TorchLPSolver``, ``HZSolver``.
+      * ``compute_certified_bound(net, bounds_dict, c)`` — Wong-Kolter
+        dual lower bound on ``c @ output``. Implemented by ``DualSolver``.
+
+    Callers dispatch by reading ``capabilities()`` rather than relying on
+    method presence; ``raise NotImplementedError`` is the contract for
+    "this solver does not support that surface".
+    """
 
     # --- Capabilities / lifecycle ---
     def capabilities(self) -> SolverCaps:  # pragma: no cover - abstract
@@ -46,6 +72,45 @@ class Solver:
         timelimit: Optional[float] = None,
     ) -> "BatchLPSolution":
         raise NotImplementedError(f"{type(self).__name__}.solve_batch")
+
+    # --- Certified backward-dual bound [DUAL-API] ---
+    def compute_certified_bound(
+        self,
+        net: "Net",
+        bounds_dict: "Dict[int, Bounds]",
+        c: "torch.Tensor",
+        M: int = 1,
+        return_sce: bool = False,
+        enable_grad: bool = False,
+    ) -> "Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]":
+        """Sound certified lower bound ``L <= min_x c @ f(x)`` for x in the
+        input region described by ``bounds_dict``, computed via backward
+        propagation through ``net``'s graph.
+
+        Args:
+            net: ACT Net (DAG-aware; reverse-topo'd internally).
+            bounds_dict: forward-pass bounds keyed by layer id, batched
+                ``[B, *shape]``.
+            c: ``Tensor[B*M, num_classes]`` linear coefficients for the
+                objective ``c @ output``. When ``M > 1`` (multi-spec-row
+                verification) rows are packed sample-major (``b*M+j``).
+            M: number of spec rows packed into ``c``'s leading axis per
+                sample. DualSolver-specific (lazy M-broadcast);
+                LP/MILP solvers ignore this. Defaults to 1.
+            return_sce: if True, also return a per-sample input witness
+                (sub/super-gradient extremum). Defaults to False.
+            enable_grad: if True, allow gradient flow through the bound
+                computation (for adversarial / robust-training loops).
+
+        Returns:
+            ``Tensor[B*M]`` lower bound per (sample, spec) row, or
+            ``(Tensor[B*M], Optional[Tensor[B*M, *input_shape]])`` when
+            ``return_sce=True``.
+
+        Subclasses with ``capabilities().supports_dual == True`` must
+        override this; LP/MILP-only solvers inherit the NotImplementedError.
+        """
+        raise NotImplementedError(f"{type(self).__name__}.compute_certified_bound")
 
 
 # --- Batched API types [BATCHED-API] ---

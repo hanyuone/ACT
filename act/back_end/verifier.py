@@ -44,7 +44,7 @@
 #     certification; they are preserved for the batch-native solver path.
 
 from __future__ import annotations
-from typing import Optional, List, Callable, Dict, Any, TYPE_CHECKING
+from typing import Optional, List, Callable, Dict, Any, TYPE_CHECKING, cast
 
 import torch
 import copy
@@ -468,6 +468,7 @@ def verify_once(
         for FALSIFIED lanes.
     """
     from act.back_end.analyze import analyze
+    from act.back_end.transfer_functions import get_transfer_function
 
     # 1. Extract structure and seed.
     entry_id = find_entry_layer_id(net)
@@ -485,6 +486,43 @@ def verify_once(
             f"expand INPUT_SPEC lb/ub to [B, ...] before calling verify_once."
         )
     B = seed_bounds.lb.shape[0]
+
+    # Dual standalone dispatch: when ``--solver dual`` is set (dual moved
+    # dual from the --tf-mode axis to the --solver axis), route through
+    # DualSolver.evaluate_spec instead of analyze() + interval cert. LP/Gurobi
+    # path remains authoritative for the LP-feeding TFs (interval/hybridz).
+    # ``ensure_active_tf`` still self-heals the TF default for interval/hybridz
+    # callers; ``is_dual_solver_active`` reads the orthogonal solver-mode global.
+    from act.back_end.transfer_functions import ensure_active_tf, is_dual_solver_active
+    active_tf = ensure_active_tf("interval")
+
+    if is_dual_solver_active():
+        from act.back_end.solver.solver_dual import DualSolver
+        from act.front_end.specs import OutputSpec
+
+        def _unbatch(val: Any) -> Any:
+            # ASSERT params are pre-batchified ([B, ...]) by FE; OutputSpec
+            # constructor expects unbroadcasted scalar/1-D form. Single-property
+            # batch verification: all rows share the same spec, so row 0 is the
+            # canonical form. Per-sample-varying spec support is a future task.
+            if isinstance(val, torch.Tensor) and val.dim() >= 1 and val.shape[0] == B:
+                return val[0]
+            return val
+
+        out_spec = OutputSpec(
+            kind=assert_layer.params.get("kind"),
+            c=_unbatch(assert_layer.params.get("c")),
+            d=_unbatch(assert_layer.params.get("d")),
+            y_true=assert_layer.params.get("y_true"),
+            margin=_unbatch(assert_layer.params.get("margin")),
+            lb=_unbatch(assert_layer.params.get("lb")),
+            ub=_unbatch(assert_layer.params.get("ub")),
+        )
+        num_classes = len(output_ids)
+        # DualSolver is now self-contained: no tf parameter, evaluate_spec
+        # computes its own forward bounds internally from the net.
+        result = DualSolver().evaluate_spec(net, out_spec, num_classes=num_classes)
+        return result.to_verify_results()
 
     # 2. Build entry_fact (with all INPUT_SPEC constraints) and analyze.
     entry_fact = Fact(bounds=seed_bounds, cons=ConSet())
@@ -811,7 +849,7 @@ def _make_dense_net_box_test(  # pragma: no cover
 
 
 def _test_setup_and_solve_batch_b1_smoke() -> None:  # pragma: no cover
-    from act.back_end.solver.solver_interval import TorchLPSolver
+    from act.back_end.solver.solver_torchlp import TorchLPSolver
     from act.util.device_manager import get_default_device, get_default_dtype
 
     device = get_default_device()
@@ -841,7 +879,7 @@ def _test_setup_and_solve_batch_b1_smoke() -> None:  # pragma: no cover
 
 
 def _test_setup_and_solve_batch_b_greater_than_1() -> None:  # pragma: no cover
-    from act.back_end.solver.solver_interval import TorchLPSolver
+    from act.back_end.solver.solver_torchlp import TorchLPSolver
     from act.util.device_manager import get_default_device, get_default_dtype
 
     device = get_default_device()
@@ -990,7 +1028,7 @@ def _test_verify_once_b8_mixed_outcomes() -> None:  # pragma: no cover
 
 def _test_verify_lp_batched_multi_b1() -> None:  # pragma: no cover
     from act.back_end.serialization.serialization import load_net_from_file
-    from act.back_end.solver.solver_interval import TorchLPSolver
+    from act.back_end.solver.solver_torchlp import TorchLPSolver
     from act.util.stats import VerifyStatus
 
     net = load_net_from_file(
@@ -1004,7 +1042,7 @@ def _test_verify_lp_batched_multi_b1() -> None:  # pragma: no cover
 
 
 def _test_verify_lp_batched_batch_b4() -> None:  # pragma: no cover
-    from act.back_end.solver.solver_interval import TorchLPSolver
+    from act.back_end.solver.solver_torchlp import TorchLPSolver
     from act.util.device_manager import get_default_device, get_default_dtype
     from act.util.stats import VerifyStatus
 

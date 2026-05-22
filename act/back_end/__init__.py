@@ -68,7 +68,7 @@ from act.util.stats import VerifyStatus, VerifyResult
 # Note: TorchLPSolver and some verification functions are available
 # via direct import to avoid circular dependencies:
 # from act.back_end.verifier import verify_once
-# from act.back_end.solver.solver_interval import TorchLPSolver
+# from act.back_end.solver.solver_torchlp import TorchLPSolver
 
 __all__ = [
     # Core

@@ -11,7 +11,7 @@ env:
   PYTHONPATH: ${{ github.workspace }}
   ACT_NETS_DIR: act/back_end/examples/nets
   ACT_CI_MODE: "true"
-  ACT_SOLVER: "torch"
+  ACT_SOLVER: "torchlp"
   ACT_DEVICE: "cpu"
   ACT_DTYPE: "float64"
 
@@ -35,19 +35,19 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install coverage torch onnx onnx2torch pandas numpy pyyaml tqdm psutil
+          pip install coverage torch onnx onnx2torch onnx-simplifier pandas numpy pyyaml tqdm psutil
 
       - name: Run BaB module tests
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.back_end.bab.bab
+          coverage run -p -m act.back_end.bab.bab
 
       - name: Cache generated networks
         id: nets-cache
@@ -62,18 +62,18 @@ jobs:
         if: steps.nets-cache.outputs.cache-hit != 'true'
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.back_end --generate
+          coverage run -p -m act.back_end --generate
 
       - name: Run broad verification (float64) over all generated nets
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.back_end --verify-all "$ACT_NETS_DIR" --no-bab
+          coverage run -p -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float64 --solvers torchlp
 
       - name: Run BaB integration on representative nets
         run: |
           cd ${{ github.workspace }}
           for net in layer_testing_bab_deep layer_testing_lrelu mlp_block_4x16_32x1_1568868034; do
-            coverage run -p --source=act -m act.back_end --verify \
+            coverage run -p -m act.back_end --verify \
               --network "$ACT_NETS_DIR/$net.json" --bab \
               --timeout 30 --bab-max-depth 8 --bab-max-subproblems 300
           done

@@ -1,9 +1,11 @@
 # Coverage.py configuration for the ACT project.
 #
 # Used by both local runs (scripts/coverage.sh) and CI workflows (act-backend-*,
-# act-bab, act-pipeline). The CI workflows invoke ``coverage run -p --source=act``
-# so this file's ``[run]`` source is informational and ``[report] exclude_lines``
-# governs what counts as "missing" when generating coverage.xml for codecov.
+# act-bab, act-pipeline, act-frontend).  ``[run] source = act`` below tells
+# coverage.py which package to record line hits for; CI no longer passes
+# ``--source=act`` on the CLI (it was a redundant override of this setting).
+# ``[report] exclude_lines`` governs what counts as "missing" when generating
+# coverage.xml for codecov.
 
 [run]
 source = act

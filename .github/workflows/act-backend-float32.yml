@@ -34,62 +34,86 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install coverage torch torchvision onnx onnx2torch tensorflow pandas numpy pyyaml tqdm psutil transformers scikit-learn
+          pip install coverage torch torchvision onnx onnx2torch onnx-simplifier tensorflow pandas numpy pyyaml tqdm psutil transformers scikit-learn
 
       # Network Generation & Basic Tests
 
       - name: Generate Networks (float32)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.back_end --generate --device cpu --dtype float32
+          coverage run -p -m act.back_end --generate --device cpu --dtype float32
 
       - name: Run Serialization Tests (float32)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.back_end --test-serialization --device cpu --dtype float32
+          coverage run -p -m act.back_end --test-serialization --device cpu --dtype float32
 
       - name: Run ACT2Torch Tests (float32)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --verify act2torch --device cpu --dtype float32
+          coverage run -p -m act.pipeline --verify act2torch --device cpu --dtype float32
 
       - name: Run Verifier Self-Tests (float32)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.back_end.verifier
+          coverage run -p -m act.back_end.verifier
 
-      # Level 1: Counterexample/Soundness Validation
+      # ─────────────────────────────────────────────────────────────────
+      # Soundness check (TF-agnostic): runs once before per-solver matrix.
+      # See act-backend-float64.yml for the full rationale.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Soundness — counterexample validation (float32)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float32
 
-      - name: Run Counterexample Validation (float32)
-        run: |
-          cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float32
-      # Level 2: Bounds Validation (per TF mode)
+      # ─────────────────────────────────────────────────────────────────
+      # Per-solver verification matrix (3 solvers × 2 commands each).
+      # Each solver: (1) --validate-verifier --mode bounds (TF soundness,
+      # skipped for dual which is a backward Solver), (2) --validate-verifier
+      # --mode counterexample (E2E verify_once on every factory net + CEX
+      # cross-validation against PyTorch model; subsumes the historical
+      # --verify-all entry point).
+      # ─────────────────────────────────────────────────────────────────
 
-      - name: Run Bounds Validation (float32, interval)
+      # Solver 1: IntervalTF (forward box) + LP cascade
+      - name: Solver = interval + LP cascade (float32)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float32 --tf-modes interval
-      - name: Run Bounds Validation (float32, hybridz)
+          coverage run -p -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float32 --tf-modes interval
+          coverage run -p -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float32 --tf-modes interval --solvers torchlp
+
+      # Solver 2: HybridzTF (zonotope forward) + LP cascade
+      - name: Solver = hybridz + LP cascade (float32)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float32 --tf-modes hybridz
-      - name: Run Bounds Validation (float32, dual)
+          coverage run -p -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float32 --tf-modes hybridz
+          coverage run -p -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float32 --tf-modes hybridz --solvers torchlp
+
+      # Solver 3: DualSolver (Wong-Kolter dual backward, no LP cascade)
+      - name: Solver = dual (Wong-Kolter dual backward, float32)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --validate-verifier --mode bounds --device cpu --dtype float32 --tf-modes dual
+          coverage run -p -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float32 --solvers dual
+
+      # Spec-kind coverage: RANGE / MARGIN_ROBUST / UNSAFE_LINEAR explicit runs.
+      - name: Spec-kind coverage (RANGE / MARGIN / UNSAFE_LINEAR via dual + LP)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float32 --tf-modes interval --solvers torchlp --networks layer_testing_range,layer_testing_margin_robust,resnet_4x3x16x16_8x2x1_1277797607
+          coverage run -p -m act.pipeline --validate-verifier --mode counterexample --device cpu --dtype float32 --solvers dual --networks layer_testing_range,layer_testing_margin_robust,layer_testing_unsafe_linear,resnet_4x3x16x16_8x2x1_1277797607
 
       - name: List example networks (back_end)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.back_end --list-examples
+          coverage run -p -m act.back_end --list-examples
 
       - name: Combine coverage data
         if: always()

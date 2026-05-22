@@ -12,9 +12,10 @@ backend:
 
   # Solver backend for LP/MILP verification.
   #   "auto"   – try Gurobi first, fall back to TorchLP
-  #   "gurobi" – exact MILP/LP via Gurobi (requires license)
-  #   "torch"  – PyTorch-based LP relaxation (GPU-capable, no license)
-  solver: "torch"
+  #   "gurobi"  – exact MILP/LP via Gurobi (requires license)
+  #   "torchlp" – PyTorch-tensor LP (Adam + penalty + box projection,
+  #               GPU-capable, no license)
+  solver: "torchlp"
 
   # Compute device.
   #   "cpu"  – run on CPU (CI default, always available)

@@ -7,7 +7,7 @@
 #===---------------------------------------------------------------------===#
 #
 # Purpose:
-#   Dual transfer functions module for Lagrangian dual bound (wong & kolter, CROWN-bounding-based style) computation .
+#   Dual transfer functions module for Lagrangian dual bound (wong & kolter-style) computation.
 #   Implements backward pass for certified bound computation.
 #   - Precision driven: computes tight bounds on the dual objective by backward Lagrangian method 
 #   - Adaptive Optimization: computes the bound via dual variables which can be on-demand optimized with gradient-based methods  
@@ -15,48 +15,77 @@
 #
 #===---------------------------------------------------------------------===#
 
-# Core DualTF class
-from .dual_tf import DualTF, compute_dual_bound, compute_robust_loss_bound
+# Disable pyright import-cycle error for this module (circular imports are intentional)
+# pyright: reportImportCycles=false
+"""Dual transfer functions: Wong-Kolter certified bounds via backward Lagrangian.
 
-# MLP backward functions
+Entry point: ``DualSolver.evaluate_spec`` (in ``act.back_end.solver.solver_dual``).
+Per-layer kernels live in ``tf_mlp`` (MLP), ``tf_cnn`` (CNN), ``tf_smooth``
+(sigmoid/tanh), ``tf_rnn`` (LSTM/GRU stubs), ``tf_transformer`` (attention
+stubs). Forward dual-track pass in ``compute_forward_bounds`` (tf_forward.py).
+
+Batch convention: all tensors are ``[B, *layer_shape]``. ``compute_certified_bound``
+requires ``c.dim() == 2``; ``compute_forward_bounds`` auto-promotes 1-D inputs.
+Backward handlers gate on ``enable_grad`` for robust-training use.
+"""
+
+# Core DualTF class + ADD/CONCAT dispatch (lives in dual_tf.py beside the class)
+from .dual_tf import DualTF, backward_add, backward_concat, forward_add, forward_concat
+
+# MLP batched kernels + dispatch (backward) and forward registry handlers
 from .tf_mlp import (
     dual_relu_backward, dual_dense_backward, get_relu_masks,
     dual_bias_backward, dual_scale_backward, dual_bn_backward, dual_identity_backward,
+    backward_dense, backward_relu, backward_bias, backward_scale,
+    backward_bn, backward_identity,
+    forward_dense, forward_relu, forward_bias, forward_scale,
+    forward_bn, forward_lrelu, forward_identity, forward_reshape,
 )
 
-# Forward bounds (via IntervalTF)
-from .tf_forward import compute_forward_bounds
+# Forward bounds
+from .tf_forward import compute_forward_bounds, Frame
 
-# CNN backward functions
-from .tf_cnn import dual_conv2d_backward, dual_maxpool2d_backward, dual_avgpool2d_backward
+from .tf_cnn import (
+    dual_conv2d_backward,
+    backward_conv2d, backward_maxpool2d, backward_avgpool2d,
+    forward_conv2d, forward_maxpool2d, forward_avgpool2d,
+)
 
-# Smooth activation backward functions (Sigmoid, Tanh)
+# Smooth activation batched kernels + dispatch (backward) and forward handlers
 from .tf_smooth import (
     dual_smooth_backward, dual_sigmoid_backward, dual_tanh_backward,
     compute_smooth_relaxation, sigmoid, dsigmoid, tanh, dtanh,
+    backward_sigmoid, backward_tanh,
+    forward_sigmoid, forward_tanh,
 )
 
-# RNN backward functions (placeholders)
-from .tf_rnn import dual_lstm_backward, dual_gru_backward
-
-# Transformer backward functions (placeholders)
-from .tf_transformer import dual_attention_backward, dual_layernorm_backward, dual_gelu_backward
+# RNN / Transformer registry-signature stubs (placeholders — not yet implemented)
+from .tf_rnn import forward_lstm, backward_lstm, forward_gru, backward_gru
+from .tf_transformer import (
+    forward_attention, backward_attention,
+    forward_layernorm, backward_layernorm,
+    forward_gelu, backward_gelu,
+)
 
 __all__ = [
-    # Core
-    'DualTF', 'compute_dual_bound', 'compute_robust_loss_bound',
-    # MLP
+    'DualTF', 'backward_add', 'backward_concat', 'forward_add', 'forward_concat',
     'dual_relu_backward', 'dual_dense_backward', 'get_relu_masks',
     'dual_bias_backward', 'dual_scale_backward', 'dual_bn_backward', 'dual_identity_backward',
-    # Forward
+    'backward_dense', 'backward_relu', 'backward_bias', 'backward_scale',
+    'backward_bn', 'backward_identity',
+    'forward_dense', 'forward_relu', 'forward_bias', 'forward_scale',
+    'forward_bn', 'forward_lrelu', 'forward_identity', 'forward_reshape',
     'compute_forward_bounds',
-    # CNN
-    'dual_conv2d_backward', 'dual_maxpool2d_backward', 'dual_avgpool2d_backward',
-    # Smooth activations (Sigmoid, Tanh)
+    'Frame',
+    'dual_conv2d_backward',
+    'backward_conv2d', 'backward_maxpool2d', 'backward_avgpool2d',
+    'forward_conv2d', 'forward_maxpool2d', 'forward_avgpool2d',
     'dual_smooth_backward', 'dual_sigmoid_backward', 'dual_tanh_backward',
     'compute_smooth_relaxation', 'sigmoid', 'dsigmoid', 'tanh', 'dtanh',
-    # RNN
-    'dual_lstm_backward', 'dual_gru_backward',
-    # Transformer
-    'dual_attention_backward', 'dual_layernorm_backward', 'dual_gelu_backward',
+    'backward_sigmoid', 'backward_tanh',
+    'forward_sigmoid', 'forward_tanh',
+    'forward_lstm', 'backward_lstm', 'forward_gru', 'backward_gru',
+    'forward_attention', 'backward_attention',
+    'forward_layernorm', 'backward_layernorm',
+    'forward_gelu', 'backward_gelu',
 ]

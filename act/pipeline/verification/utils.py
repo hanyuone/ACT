@@ -565,6 +565,44 @@ def _convert_OnnxReshape(self, mod: nn.Module, node: fx.Node) -> None:
     self.shape = output_shape
     self._register_node(node.name, layer_id)
 
+def _convert_OnnxConstant(self, mod: nn.Module, node: fx.Node) -> None:
+    """Emit ACT CONSTANT layer for an onnx2torch OnnxConstant module.
+
+    OnnxConstant wraps a fixed tensor that the model's forward returns at this
+    position.  Materialising it as a CONSTANT layer lets registered-var
+    consumers (Reshape's shape arg, Slice bounds, Pow exponent, MatMul second
+    operand, etc.) resolve it via ``node_outputs[node.name]``.  Lazy consumers
+    that walk the FX graph through ``_evaluate_constant_subgraph`` continue
+    to work because ``mod.forward()`` is unchanged.
+
+    Integer dtypes are preserved (shape constants must stay int); only
+    floating-point values get cast to ``self.dtype``.
+    """
+    val = getattr(mod, "value", None)
+    if val is None:
+        val = next(iter(mod.buffers()), None)
+    if val is None:
+        raise NotImplementedError(
+            f"OnnxConstant at {node.name} has no .value attribute or buffer"
+        )
+    if not isinstance(val, torch.Tensor):
+        val = torch.tensor(val)
+    val = val.detach().clone()
+    if val.is_floating_point():
+        val = val.to(self.dtype)
+    flat = val.reshape(-1)
+    shape = tuple(int(d) for d in val.shape) or (1,)
+    out_vars = self._alloc_ids(int(flat.numel()) or 1)
+    layer_id = self._add_layer(
+        LayerKind.CONSTANT.value,
+        {"value": flat, "input_shape": shape, "output_shape": shape},
+        [], out_vars,
+    )
+    self.node_outputs[node.name] = out_vars
+    self.node_shapes[node.name] = shape
+    self.node_to_layer_id[node.name] = layer_id
+
+
 def _convert_OnnxConcat(self, mod: nn.Module, node: fx.Node) -> None:
     """OnnxConcat: y = cat(*input_tensors, axis).
 
@@ -599,7 +637,7 @@ def _convert_OnnxReduceStaticAxes(self, mod: nn.Module, node: fx.Node) -> None:
     """OnnxReduceStaticAxes (ReduceMean / ReduceMax / ReduceMin / ReduceSum etc.).
 
     Currently only ReduceMean is mapped to LayerKind.MEAN. Other reductions
-    (Max / Min / L2-norm) need their own LayerKind mapping (Wave 10).
+    (Max / Min / L2-norm) need their own LayerKind mapping (future enhancement).
     """
     if not self._get_predecessor_state(node):
         raise ValueError(f"OnnxReduceStaticAxes: missing predecessor for {node.name}")
@@ -607,7 +645,7 @@ def _convert_OnnxReduceStaticAxes(self, mod: nn.Module, node: fx.Node) -> None:
     op_name = getattr(op_func, '__name__', '').lower() if op_func is not None else ''
     if 'mean' not in op_name:
         raise NotImplementedError(
-            f"OnnxReduceStaticAxes at {node.name}: only ReduceMean supported (got '{op_name}'; Wave 10)"
+            f"OnnxReduceStaticAxes at {node.name}: only ReduceMean supported (got '{op_name}'; future enhancement)"
         )
     # OnnxReduceStaticAxes uses public ``axes`` / ``keepdims`` (different from
     # OnnxReduceSumStaticAxes which uses private ``_axes`` / ``_keepdims``).
@@ -884,7 +922,7 @@ def _convert_OnnxPow(self, mod: nn.Module, node: fx.Node) -> None:
 
     Currently supports exponent==2 (squaring) by emitting MUL(var, var).
     Higher integer exponents would chain MULs; non-integer exponents need
-    a real POW transfer-function and are deferred (Wave 10).
+    a real POW transfer-function and are deferred (future enhancement).
     """
     if not self._get_predecessor_state(node):
         raise ValueError(f"OnnxPow: missing predecessor for {node.name}")
@@ -893,11 +931,11 @@ def _convert_OnnxPow(self, mod: nn.Module, node: fx.Node) -> None:
         raise ValueError(f"OnnxPow at {node.name}: expected 2 args")
     exp_t = self._resolve_constant_tensor(args[1].name)
     if exp_t is None:
-        raise NotImplementedError(f"OnnxPow at {node.name}: dynamic exponent (Wave 10)")
+        raise NotImplementedError(f"OnnxPow at {node.name}: dynamic exponent (future enhancement)")
     exp_val = float(exp_t.flatten().tolist()[0])
     if abs(exp_val - 2.0) > 1e-9:
         raise NotImplementedError(
-            f"OnnxPow at {node.name}: only exponent==2 supported (got {exp_val}; Wave 10)"
+            f"OnnxPow at {node.name}: only exponent==2 supported (got {exp_val}; future enhancement)"
         )
     var_vars = self.node_outputs[args[0].name]
     out_vars = self._alloc_ids(len(var_vars))
@@ -1122,7 +1160,7 @@ def _convert_OnnxBinaryMathOperation(self, mod: nn.Module, node: fx.Node) -> Non
         emit(LayerKind.SCALE, "a", c, register=True)
     else:  # 'div'
         if not var_first:
-            raise NotImplementedError(f"const/var Div at {node.name} (Wave 10)")
+            raise NotImplementedError(f"const/var Div at {node.name} (future enhancement)")
         emit(LayerKind.SCALE, "a", (1.0 / c).to(self.dtype), register=True)
 
 def _convert_OnnxExpand(self, mod: nn.Module, node: fx.Node) -> None:
@@ -1302,7 +1340,7 @@ def _convert_OnnxFunction(self, mod: nn.Module, node: fx.Node) -> None:
     kind = {'sign': LayerKind.SIGN, 'abs': LayerKind.ABS,
             'tanh': LayerKind.TANH}.get(func_name)
     if kind is None:
-        raise NotImplementedError(f"OnnxFunction({func_name}) at {node.name} (Wave 10)")
+        raise NotImplementedError(f"OnnxFunction({func_name}) at {node.name} (future enhancement)")
     if not self._get_predecessor_state(node):
         raise ValueError(f"OnnxFunction: missing predecessor for {node.name}")
     out_vars = self._same_size_forward()
@@ -1415,6 +1453,7 @@ ONNX_HANDLERS = {
     'OnnxCast': _convert_OnnxCast,
     'OnnxCompare': _convert_OnnxCompare,
     'OnnxConcat': _convert_OnnxConcat,
+    'OnnxConstant': _convert_OnnxConstant,
     'OnnxDropoutDynamic': _convert_OnnxDropoutDynamic,
     'OnnxExpand': _convert_OnnxExpand,
     'OnnxFlatten': _convert_OnnxFlatten,

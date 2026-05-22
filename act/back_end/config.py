@@ -16,7 +16,7 @@ import yaml
 
 _DEFAULT_YAML = Path(__file__).parent / "config.yaml"
 
-_VALID_SOLVERS = {"auto", "gurobi", "torch"}
+_VALID_SOLVERS = {"auto", "gurobi", "torchlp", "dual"}
 _VALID_DEVICES = {"cpu", "cuda", "gpu"}
 _VALID_DTYPES = {"float32", "float64"}
 _VALID_REGISTRY_MODES = {"intersection", "union"}
@@ -206,14 +206,14 @@ class BackendConfig:
                     "lp_enabled=True.  GurobiSolver.solve_batch raises for N>1 "
                     "(Gurobi does not expose a truly parallel multi-LP API for "
                     "varying constraint matrices; see commit af797ff).  "
-                    "Either set lp_enabled=False or switch to solver='torch'."
+                    "Either set lp_enabled=False or switch to solver='torchlp'."
                 )
             if self.bab_max_batch_size > 1:
                 raise ValueError(
                     f"BackendConfig: solver='gurobi' is incompatible with "
                     f"bab_max_batch_size={self.bab_max_batch_size} > 1.  "
                     f"GurobiSolver.solve_batch raises for N>1.  "
-                    f"Either set bab_max_batch_size=1 or switch to solver='torch'."
+                    f"Either set bab_max_batch_size=1 or switch to solver='torchlp'."
                 )
 
     # -- YAML I/O -----------------------------------------------------------
@@ -229,7 +229,7 @@ class BackendConfig:
         YAML layout::
 
             backend:
-              solver: "torch"
+              solver: "torchlp"
               ...
               bab:
                 enabled: true

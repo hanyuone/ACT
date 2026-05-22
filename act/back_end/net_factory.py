@@ -1733,6 +1733,26 @@ def _lt_spec_constant() -> Dict[str, Any]:
     ]}
 
 
+def _lt_spec_add_dual() -> Dict[str, Any]:
+    """ADD with two DENSE branches (no CONSTANT). Exercises forward_add /
+    backward_add in dual_tf for the multi-pred DAG path.
+    """
+    return {"layers": _lt_input([1, 3], -1.0, 1.0) + [
+        {"kind": LayerKind.DENSE.value,
+         "params": {"in_features": 3, "out_features": 3, "use_bias": True},
+         "preds": [1]},
+        {"kind": LayerKind.DENSE.value,
+         "params": {"in_features": 3, "out_features": 3, "use_bias": True},
+         "preds": [1]},
+        {"kind": LayerKind.ADD.value, "params": {},
+         "inputs": {"x": 2, "y": 3}, "preds": [2, 3]},
+        {"kind": LayerKind.DENSE.value,
+         "params": {"in_features": 3, "out_features": 1, "use_bias": True},
+         "preds": [4]},
+        _lt_assert_le([1.0], 100.0),
+    ]}
+
+
 def _lt_spec_sign() -> Dict[str, Any]:
     return {"layers": _lt_input([1, 4], -2.0, 2.0) + [
         {"kind": LayerKind.SIGN.value,
@@ -2335,6 +2355,7 @@ def _lt_spec_scale() -> Dict[str, Any]:
 
 LAYER_TESTING_SPECS: Dict[str, Any] = {
     f"{LAYER_TESTING_NAME_PREFIX}constant":      _lt_spec_constant,
+    f"{LAYER_TESTING_NAME_PREFIX}add_dual":      _lt_spec_add_dual,
     f"{LAYER_TESTING_NAME_PREFIX}sign":          _lt_spec_sign,
     f"{LAYER_TESTING_NAME_PREFIX}reduce_sum":    _lt_spec_reduce_sum,
     f"{LAYER_TESTING_NAME_PREFIX}compare":       _lt_spec_compare,

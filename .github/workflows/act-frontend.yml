@@ -36,66 +36,66 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install coverage torch torchvision onnx onnx2torch tensorflow pandas numpy pyyaml tqdm psutil transformers scikit-learn
+          pip install coverage torch torchvision onnx onnx2torch onnx-simplifier tensorflow pandas numpy pyyaml tqdm psutil transformers scikit-learn
 
       - name: Run VNNLIB Data-Model and Synthesis
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.front_end --download acasxu_2023
-          coverage run -p --source=act -m act.front_end --list-downloads
-          coverage run -p --source=act -m act.front_end --synthesis --creator vnnlib
+          coverage run -p -m act.front_end --download acasxu_2023
+          coverage run -p -m act.front_end --list-downloads
+          coverage run -p -m act.front_end --synthesis --creator vnnlib
 
       - name: Run TorchVision Data-Model and Synthesis
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.front_end --download MNIST
-          coverage run -p --source=act -m act.front_end --download CIFAR10
-          coverage run -p --source=act -m act.front_end --list-downloads
-          coverage run -p --source=act -m act.front_end --synthesis --creator torchvision
+          coverage run -p -m act.front_end --download MNIST
+          coverage run -p -m act.front_end --download CIFAR10
+          coverage run -p -m act.front_end --list-downloads
+          coverage run -p -m act.front_end --synthesis --creator torchvision
 
       - name: List torchvision loader datasets (CLI coverage)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.front_end.torchvision_loader --list
+          coverage run -p -m act.front_end.torchvision_loader --list
 
       - name: List vnnlib loader categories (CLI coverage)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.front_end.vnnlib_loader --list
+          coverage run -p -m act.front_end.vnnlib_loader --list
 
       - name: Run front_end CLI commands (creator registry, info)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.front_end --help
-          coverage run -p --source=act -m act.front_end --list-creators
-          coverage run -p --source=act -m act.front_end --info-creator vnnlib
+          coverage run -p -m act.front_end --help
+          coverage run -p -m act.front_end --list-creators
+          coverage run -p -m act.front_end --info-creator vnnlib
 
       - name: Generate Networks for Testing
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.back_end --generate --device cpu --dtype float64
+          coverage run -p -m act.back_end --generate --device cpu --dtype float64
 
       - name: Run ACT2Torch Pipeline Tests
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --verify act2torch --device cpu --dtype float64
+          coverage run -p -m act.pipeline --verify act2torch --device cpu --dtype float64
 
       - name: Run Torch2ACT Pipeline Tests
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --verify torch2act --device cpu --dtype float64
+          coverage run -p -m act.pipeline --verify torch2act --device cpu --dtype float64
 
       - name: Run frontend fuzzing (acasxu_2023, light smoke)
         run: |
           cd ${{ github.workspace }}
-          coverage run -p --source=act -m act.pipeline --fuzz --category acasxu_2023 --max-instances 2 --timeout 10 --iterations 50
+          coverage run -p -m act.pipeline --fuzz --category acasxu_2023 --max-instances 2 --timeout 10 --iterations 50
 
       - name: Combine coverage data
         if: always()

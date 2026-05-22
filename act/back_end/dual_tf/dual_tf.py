@@ -1,296 +1,302 @@
-#===- act/back_end/dual_tf/dual_tf.py - Dual Transfer Function Class ----====#
+#===- act/back_end/dual_tf/dual_tf.py - Dual Backward Registry Holder ---====#
 # ACT: Abstract Constraint Transformer
-# Copyright (C) 2025– ACT Team
-#
-# Licensed under the GNU Affero General Public License v3.0 or later (AGPLv3+).
-# Distributed without any warranty; see <http://www.gnu.org/licenses/>.
+# Copyright (C) 2025- ACT Team
+# Licensed under AGPLv3+; distributed without warranty.
 #===---------------------------------------------------------------------===#
-#
-# Purpose:
-#   DualTF class implementing Wong & Kolter backward pass for dual bounds.
-#   Algorithm: v=-c, backward through layers, accumulate contributions.
-#
+# DualTF: backward-kernel registry holder. Not a TransferFunction — dual is a
+# --solver choice, not a --tf-mode. Instantiated internally by
+# act.back_end.solver.solver_dual.DualSolver.
 #===---------------------------------------------------------------------===#
 
 
 import torch
-from typing import Dict, Optional, Tuple
-from act.back_end.core import Bounds, Fact, Layer, Net, ConSet
+from typing import Dict, List, Optional, Tuple
+from act.back_end.core import Bounds, Layer, Net
 from act.back_end.layer_schema import LayerKind
-from act.back_end.transfer_functions import TransferFunction
-from .tf_mlp import (dual_relu_backward, dual_dense_backward, dual_bias_backward,
-                     dual_scale_backward, dual_bn_backward, dual_identity_backward)
-from .tf_cnn import dual_conv2d_backward
-from .tf_smooth import dual_sigmoid_backward, dual_tanh_backward
-from .tf_forward import compute_forward_bounds
+from .tf_mlp import (
+    backward_dense, backward_relu, backward_bias, backward_scale,
+    backward_bn, backward_identity,
+    forward_dense, forward_relu, forward_bias, forward_scale,
+    forward_bn, forward_lrelu, forward_identity, forward_reshape,
+)
+from .tf_cnn import (
+    backward_conv2d, backward_maxpool2d, backward_avgpool2d,
+    forward_conv2d, forward_maxpool2d, forward_avgpool2d,
+)
+from .tf_smooth import (
+    backward_sigmoid, backward_tanh,
+    forward_sigmoid, forward_tanh,
+)
+from .tf_rnn import forward_lstm, backward_lstm, forward_gru, backward_gru
+from .tf_transformer import (
+    forward_attention, backward_attention,
+    forward_layernorm, backward_layernorm,
+    forward_gelu, backward_gelu,
+)
+from .tf_forward import (
+    compute_forward_bounds, LinearBound, Frame,
+    _sum_linear_bounds, _sum_interval_bounds, _concretize,
+    _reset_forward_box, _align, _int_param,
+)
 
 
-class DualTF(TransferFunction):
-    """Dual TF for Lagrangian bounds. Backward pass: v=-c, propagate, accumulate."""
-    
-    _BACKWARD_REGISTRY = {
-        # Core layers
-        LayerKind.DENSE.value: "_backward_dense",
-        LayerKind.RELU.value: "_backward_relu",
-        LayerKind.CONV2D.value: "_backward_conv2d",
-        LayerKind.BIAS.value: "_backward_bias",
-        LayerKind.SCALE.value: "_backward_scale",
-        LayerKind.BN.value: "_backward_bn",
-        LayerKind.LRELU.value: "_backward_relu",  # TODO: proper leaky ReLU
-        # Identity-like
-        LayerKind.INPUT.value: "_backward_identity",
-        LayerKind.INPUT_SPEC.value: "_backward_identity",
-        LayerKind.ASSERT.value: "_backward_identity",
-        LayerKind.FLATTEN.value: "_backward_identity",
-        LayerKind.RESHAPE.value: "_backward_identity",
-        LayerKind.TRANSPOSE.value: "_backward_identity",
-        LayerKind.SQUEEZE.value: "_backward_identity",
-        LayerKind.UNSQUEEZE.value: "_backward_identity",
-        # SLICE / GATHER intentionally absent: their backward operation is a
-        # scatter (inverse indexing), not identity. Adding them as identity
-        # here would produce unsound dual bounds. They are correctly handled
-        # in interval_tf / hybridz_tf modes (sound forward bounds via
-        # tf_slice / tf_gather), and validate_verifier --tf-modes=dual will
-        # SKIP nets containing these kinds rather than silently misbehave.
-        # Smooth activations (S-shaped with tangent relaxation)
-        LayerKind.SIGMOID.value: "_backward_sigmoid",
-        LayerKind.TANH.value: "_backward_tanh",
-        # Multi-input operations (residual connections)
-        LayerKind.ADD.value: "_backward_add",
-        LayerKind.CONSTANT.value: "_backward_identity",
-        LayerKind.SIGN.value: "_backward_identity",
-        LayerKind.REDUCE_SUM.value: "_backward_identity",
-        LayerKind.COMPARE.value: "_backward_identity",
-        LayerKind.WHERE.value: "_backward_identity",
-        LayerKind.MATMUL.value: "_backward_identity",
-        LayerKind.ARG_EXTREMUM.value: "_backward_identity",
-        LayerKind.UPSAMPLE.value: "_backward_identity",
-        LayerKind.EXPAND.value: "_backward_identity",
-        LayerKind.SCATTER_ND.value: "_backward_identity",
+# ---- ADD ----
+def forward_add(
+    L: Layer, parent_boxes: List[Bounds], parent_lins: List[LinearBound],
+    parent_frames: List[Frame], preds: List[int], post_activation: bool,
+    device: torch.device, dtype: torch.dtype,
+) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
+    """ADD multi-pred forward handler.
+
+    Source: tf_forward.py lines 287-322 (ADD branch of compute_forward_bounds).
+    Semantics preserved verbatim — when all predecessor frames share the same
+    object identity and A_lb shapes match, sum the dual-track linear bounds and
+    concretize over the common frame; otherwise fall back to summing interval
+    boxes and reset the dual-track state. Bias (if present) is added on both
+    paths via _align. Returns (stored, out, lin, frame) where stored == out.
+    """
+    assert len(parent_boxes) >= 2, "forward_add: requires >=2 predecessors"
+    can_dual = all(
+        parent_frames[i] is parent_frames[0] for i in range(1, len(parent_frames))
+    ) and all(
+        parent_lins[i].A_lb.shape == parent_lins[0].A_lb.shape
+        for i in range(1, len(parent_lins))
+    )
+    if can_dual:
+        lin = _sum_linear_bounds(parent_lins)
+        bias_param = L.params.get("bias")
+        if bias_param is not None:
+            bias_vec = _align(bias_param.flatten(), lin.b_lb.shape[1])
+            lin = LinearBound(
+                A_lb=lin.A_lb,
+                b_lb=lin.b_lb + bias_vec,
+                A_ub=lin.A_ub,
+                b_ub=lin.b_ub + bias_vec,
+            )
+        frame = parent_frames[0]
+        lb, ub = _concretize(lin, *frame)
+    else:
+        summed = _sum_interval_bounds(parent_boxes)
+        lb, ub = summed.lb, summed.ub
+        bias_param = L.params.get("bias")
+        if bias_param is not None:
+            bias_vec = _align(bias_param.flatten(), lb.shape[1])
+            lb = lb + bias_vec
+            ub = ub + bias_vec
+        lin, frame = _reset_forward_box(lb, ub, device, dtype)
+    out = Bounds(lb, ub)
+    return out, out, lin, frame
+
+
+def backward_add(L: Layer, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
+                 preds: List[int], M: int = 1
+                 ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    """ADD backward: identity skip — same ν routed to every predecessor.
+
+    Bias contrib uses negative sign to match dual_bias_backward / dual_bn_backward
+    / dual_dense_backward conventions (y = x + bias ⇒ contrib = -(ν · bias)).
+    """
+    B = nu.shape[0]
+    contrib = torch.zeros(B, dtype=nu.dtype, device=nu.device)
+    if "bias" in L.params and L.params["bias"] is not None:
+        b = L.params["bias"].flatten()
+        v = nu.flatten(start_dim=1)
+        n = min(v.shape[-1], b.numel())
+        contrib = -(v[..., :n] * b[:n]).sum(dim=-1)
+    return [nu for _ in preds], contrib
+
+
+# ---- CONCAT ----
+def forward_concat(
+    L: Layer, parent_boxes: List[Bounds], parent_lins: List[LinearBound],
+    parent_frames: List[Frame], preds: List[int], post_activation: bool,
+    device: torch.device, dtype: torch.dtype,
+) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
+    """CONCAT multi-pred forward handler.
+
+    Source: tf_forward.py lines 324-346 (CONCAT branch of compute_forward_bounds).
+    Semantics preserved verbatim — when all predecessor frames share the same
+    object identity and A_lb batch/input axes match, concatenate dual-track
+    linear bounds along dim=1 and concretize; otherwise fall back to torch.cat
+    on interval boxes along concat_dim (default 1) and reset dual-track state.
+    Returns (stored, out, lin, frame) where stored == out.
+    """
+    assert len(parent_boxes) >= 2, "forward_concat: requires >=2 predecessors"
+    concat_dim = _int_param(L.params.get("concat_dim", 1), 1)
+    can_dual = all(
+        parent_frames[i] is parent_frames[0] for i in range(1, len(parent_frames))
+    ) and all(
+        parent_lins[i].A_lb.shape[0] == parent_lins[0].A_lb.shape[0]
+        and parent_lins[i].A_lb.shape[2] == parent_lins[0].A_lb.shape[2]
+        for i in range(1, len(parent_lins))
+    )
+    if can_dual:
+        lin = LinearBound(
+            A_lb=torch.cat([lin.A_lb for lin in parent_lins], dim=1),
+            b_lb=torch.cat([lin.b_lb for lin in parent_lins], dim=1),
+            A_ub=torch.cat([lin.A_ub for lin in parent_lins], dim=1),
+            b_ub=torch.cat([lin.b_ub for lin in parent_lins], dim=1),
+        )
+        frame = parent_frames[0]
+        lb, ub = _concretize(lin, *frame)
+    else:
+        lb = torch.cat([box.lb for box in parent_boxes], dim=concat_dim)
+        ub = torch.cat([box.ub for box in parent_boxes], dim=concat_dim)
+        lin, frame = _reset_forward_box(lb, ub, device, dtype)
+    out = Bounds(lb, ub)
+    return out, out, lin, frame
+
+
+def backward_concat(L, nu, bounds_dict, preds, M: int = 1):
+    """CONCAT backward. (Pending)
+    Will require: concat_dim parameter to split nu into per-predecessor slices.
+    """
+    raise NotImplementedError("backward for CONCAT not implemented in dual_tf")
+
+
+class DualTF:
+    """Backward-kernel registry holder for the dual solver.
+
+    Holder of three registries (forward, backward, unimplemented). Dual
+    semantics live in DualSolver's backward pass, not in propagated LP
+    constraints, so this class is intentionally NOT a TransferFunction.
+
+      * ``_FORWARD_REGISTRY`` — per-kind forward dispatch consumed by
+        ``compute_forward_bounds`` (still a real forward computation, but
+        invoked internally by ``DualSolver.evaluate_spec`` rather than via
+        the analyze()/TF pipeline).
+      * ``_BACKWARD_REGISTRY`` — per-kind backward dispatch consumed by
+        ``DualSolver.compute_certified_bound``. Each entry has signature
+        ``(L, nu, bounds_dict, preds) -> (pred_nus, contrib)``.
+      * ``_UNIMPLEMENTED_KINDS`` — kinds whose backward is a stub
+        (raises ``NotImplementedError``); ``supports_layer`` filters them
+        so dual-incompatible nets get cleanly SKIPPED.
+
+    DualSolver instantiates this internally; external code uses ``--solver
+    dual`` rather than touching DualTF directly.
+    """
+
+    _FORWARD_REGISTRY = {
+        LayerKind.INPUT.value:      forward_identity,
+        LayerKind.INPUT_SPEC.value: forward_identity,
+        LayerKind.ASSERT.value:     forward_identity,
+        LayerKind.DENSE.value:      forward_dense,
+        LayerKind.BIAS.value:       forward_bias,
+        LayerKind.SCALE.value:      forward_scale,
+        LayerKind.BN.value:         forward_bn,
+        LayerKind.RELU.value:       forward_relu,
+        LayerKind.LRELU.value:      forward_lrelu,
+        "LEAKY_RELU":               forward_lrelu,   # alias (not a LayerKind member)
+        LayerKind.SIGMOID.value:    forward_sigmoid,
+        LayerKind.TANH.value:       forward_tanh,
+        LayerKind.CONV2D.value:     forward_conv2d,
+        LayerKind.MAXPOOL2D.value:  forward_maxpool2d,
+        LayerKind.AVGPOOL2D.value:  forward_avgpool2d,
+        LayerKind.FLATTEN.value:    forward_reshape,
+        LayerKind.RESHAPE.value:    forward_reshape,
+        LayerKind.TRANSPOSE.value:  forward_identity,
+        LayerKind.SQUEEZE.value:    forward_identity,
+        LayerKind.UNSQUEEZE.value:  forward_identity,
+        LayerKind.ADD.value:        forward_add,
+        LayerKind.CONCAT.value:     forward_concat,
+        LayerKind.LSTM.value:       forward_lstm,
+        LayerKind.GRU.value:        forward_gru,
+        LayerKind.ATT_SCORES.value: forward_attention,
+        LayerKind.ATT_MIX.value:    forward_attention,
+        LayerKind.MHA_SPLIT.value:  forward_attention,
+        LayerKind.MHA_JOIN.value:   forward_attention,
+        LayerKind.MASK_ADD.value:   forward_attention,
+        LayerKind.LAYERNORM.value:  forward_layernorm,
+        LayerKind.GELU.value:       forward_gelu,
     }
-    
-    def __init__(self):
-        """Initialize DualTF with empty cache for forward bounds."""
-        self._forward_bounds_cache: Dict[int, Bounds] = {}
-        self._cache_net_id: Optional[int] = None  # Track which net the cache is for
-    
-    @property
-    def name(self) -> str: return "DualTF"
-    
+
+    _BACKWARD_REGISTRY = {
+        LayerKind.INPUT.value:      backward_identity,
+        LayerKind.INPUT_SPEC.value: backward_identity,
+        LayerKind.ASSERT.value:     backward_identity,
+        LayerKind.DENSE.value:      backward_dense,
+        LayerKind.BIAS.value:       backward_bias,
+        LayerKind.SCALE.value:      backward_scale,
+        LayerKind.BN.value:         backward_bn,
+        LayerKind.RELU.value:       backward_relu,
+        LayerKind.LRELU.value:      backward_relu,
+        "LEAKY_RELU":               backward_relu,   # alias (not a LayerKind member)
+        LayerKind.SIGMOID.value:    backward_sigmoid,
+        LayerKind.TANH.value:       backward_tanh,
+        LayerKind.CONV2D.value:     backward_conv2d,
+        LayerKind.MAXPOOL2D.value:  backward_maxpool2d,
+        LayerKind.AVGPOOL2D.value:  backward_avgpool2d,
+        LayerKind.FLATTEN.value:    backward_identity,
+        LayerKind.RESHAPE.value:    backward_identity,
+        LayerKind.TRANSPOSE.value:  backward_identity,
+        LayerKind.SQUEEZE.value:    backward_identity,
+        LayerKind.UNSQUEEZE.value:  backward_identity,
+        LayerKind.ADD.value:        backward_add,
+        LayerKind.CONCAT.value:     backward_concat,
+        LayerKind.LSTM.value:       backward_lstm,
+        LayerKind.GRU.value:        backward_gru,
+        LayerKind.ATT_SCORES.value: backward_attention,
+        LayerKind.ATT_MIX.value:    backward_attention,
+        LayerKind.MHA_SPLIT.value:  backward_attention,
+        LayerKind.MHA_JOIN.value:   backward_attention,
+        LayerKind.MASK_ADD.value:   backward_attention,
+        LayerKind.LAYERNORM.value:  backward_layernorm,
+        LayerKind.GELU.value:       backward_gelu,
+    }
+
+    _UNIMPLEMENTED_KINDS = frozenset({
+        LayerKind.LSTM.value,
+        LayerKind.GRU.value,
+        LayerKind.GELU.value,
+        LayerKind.LAYERNORM.value,
+        LayerKind.ATT_SCORES.value,
+        LayerKind.ATT_MIX.value,
+        LayerKind.MHA_SPLIT.value,
+        LayerKind.MHA_JOIN.value,
+        LayerKind.MASK_ADD.value,
+        # Backward kernels for these are stubs that raise NotImplementedError
+        # at runtime. Listing them here makes supports_layer return False so
+        # upstream callers (validate_verifier) cleanly SKIP affected nets
+        # instead of surfacing runtime ERROR.
+        LayerKind.CONCAT.value,
+    })
+
     def supports_layer(self, layer_kind: str) -> bool:
-        """Check if this transfer function supports the given layer kind."""
-        return layer_kind.upper() in self._BACKWARD_REGISTRY
-    
-    # -------- TransferFunction Interface (for analyze()) --------
-    def apply(self, L: Layer, input_bounds: Bounds, net: Net,
-              before: Dict[int, Fact], after: Dict[int, Fact]) -> Fact:
-        """
-        Apply forward bounds for layer L.
-        
-        On first call, computes forward bounds for ALL layers using compute_forward_bounds()
-        and caches them. Subsequent calls return cached bounds for the requested layer.
-        """
-        # Check if we need to recompute (new net or empty cache)
-        net_id = id(net)
-        if self._cache_net_id != net_id or not self._forward_bounds_cache:
-            # Find input bounds from entry layer
-            input_lb, input_ub = None, None
-            for layer in net.layers:
-                if layer.kind.upper() in [LayerKind.INPUT.value, LayerKind.INPUT_SPEC.value, "INPUT", "INPUT_SPEC"]:
-                    if layer.id in before:
-                        input_lb = before[layer.id].bounds.lb
-                        input_ub = before[layer.id].bounds.ub
-                        break
-                    elif "lb" in layer.params and "ub" in layer.params:
-                        input_lb = layer.params["lb"]
-                        input_ub = layer.params["ub"]
-                        break
-            
-            if input_lb is None or input_ub is None:
-                # Fallback: use input_bounds directly
-                input_lb, input_ub = input_bounds.lb, input_bounds.ub
-            
-            # Compute all forward bounds at once
-            # Use post_activation=True for validation (concrete activations are POST-activation)
-            self._forward_bounds_cache = compute_forward_bounds(net, input_lb, input_ub, post_activation=True)
-            self._cache_net_id = net_id
-        
-        # Return cached bounds for this layer
-        if L.id in self._forward_bounds_cache:
-            bounds = self._forward_bounds_cache[L.id]
-            return Fact(bounds=bounds, cons=ConSet())
-        else:
-            # Fallback for layers not in cache (shouldn't happen normally)
-            return Fact(bounds=input_bounds, cons=ConSet())
-    
-    def clear_cache(self):
-        """Clear the forward bounds cache."""
-        self._forward_bounds_cache.clear()
-        self._cache_net_id = None
-    
-    @torch.no_grad()
-    def compute_bound(self, net: Net, bounds_dict: Dict[int, Bounds], c: torch.Tensor,
-                      return_sce: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Compute certified lower bound on c^T @ output."""
-        assert c.dim() == 1, f"c must be 1D, got shape {c.shape}"
-        assert len(bounds_dict) > 0, "bounds_dict cannot be empty"
-        
-        self._bounds_dict = bounds_dict
-        nu = c.clone()  # Start with c (not -c) for lower bound computation
-        obj = torch.tensor(0.0)
-        
-        for layer in reversed(list(net.layers)):
-            k = layer.kind.upper()
-            if k in [LayerKind.INPUT.value, LayerKind.INPUT_SPEC.value]: continue
-            
-            handler_name = self._BACKWARD_REGISTRY.get(k)
-            if handler_name is None:
-                raise NotImplementedError(
-                    f"DualTF.compute_bound: layer kind '{k}' (id={layer.id}) has no "
-                    f"backward handler. Add an entry to DualTF._BACKWARD_REGISTRY and "
-                    f"implement the corresponding _backward_* method, or remove the "
-                    f"layer from the network."
-                )
-            
-            nu, contrib = getattr(self, handler_name)(layer, nu)
-            obj = obj + contrib
-        
-        input_contrib, sce = self._input_contribution(net, nu, return_sce=True)
-        obj = obj + input_contrib
-        return (obj, sce) if return_sce else obj
-    
-    @torch.no_grad()
-    def compute_robust_bound(self, net: Net, bounds_dict: Dict[int, Bounds],
-                             y_true: int, num_classes: int) -> Tuple[torch.Tensor, bool]:
-        """Compute min margin: output[y_true] - output[j] for all j != y_true."""
-        sample = next(iter(bounds_dict.values()))
-        device, dtype = sample.lb.device, sample.lb.dtype
-        
-        margins = []
-        for j in range(num_classes):
-            if j == y_true: continue
-            c = torch.zeros(num_classes, dtype=dtype, device=device)
-            c[y_true], c[j] = 1.0, -1.0
-            margins.append(self.compute_bound(net, bounds_dict, c))
-        
-        margins = torch.stack(margins)
-        return margins.min(), (margins.min() > 0).item()
-    
-    # -------- Backward Handlers --------
-    def _backward_dense(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return dual_dense_backward(nu, L.params["weight"], L.params.get("bias"))
-    
-    def _backward_relu(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        bounds = self._bounds_dict.get(L.id)
-        return dual_identity_backward(nu) if bounds is None else dual_relu_backward(nu, bounds)
-    
-    def _backward_bias(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return dual_bias_backward(nu, L.params["c"])
-    
-    def _backward_scale(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return dual_scale_backward(nu, L.params["a"])
-    
-    def _backward_bn(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return dual_bn_backward(nu, L.params["A"], L.params["c"])
-    
-    def _backward_conv2d(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        stride, padding = L.params.get("stride", 1), L.params.get("padding", 0)
-        if isinstance(stride, (list, tuple)): stride = stride[0]
-        if isinstance(padding, (list, tuple)): padding = padding[0]
-        return dual_conv2d_backward(nu, L.params["weight"], L.params.get("bias"),
-                                    stride=stride, padding=padding,
-                                    input_shape=L.params.get("input_shape"),
-                                    output_shape=L.params.get("output_shape"))
-    
-    def _backward_identity(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return dual_identity_backward(nu)
-    
-    def _backward_sigmoid(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        bounds = self._bounds_dict.get(L.id)
-        return dual_identity_backward(nu) if bounds is None else dual_sigmoid_backward(nu, bounds)
-    
-    def _backward_tanh(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        bounds = self._bounds_dict.get(L.id)
-        return dual_identity_backward(nu) if bounds is None else dual_tanh_backward(nu, bounds)
-    
-    def _backward_add(self, L: Layer, nu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        ADD backward: z = x + y (+ bias)
-        
-        For z = x + y, the gradient passes through unchanged to both inputs:
-        ∂L/∂x = ∂L/∂z * ∂z/∂x = nu * 1 = nu
-        ∂L/∂y = ∂L/∂z * ∂z/∂y = nu * 1 = nu
-        
-        The contribution to the objective comes from the bias term (if present).
-        
-        Note: In networks with skip connections (ResNet), the proper handling requires
-        graph-aware gradient accumulation. This implementation passes nu through as-is,
-        which is correct for the ADD operation itself. The sequential traversal in
-        compute_bound will need enhancement for full skip connection support.
-        """
-        contrib = torch.tensor(0.0)
-        
-        # If ADD has a bias, it contributes to the objective: nu^T @ bias
-        if "bias" in L.params and L.params["bias"] is not None:
-            b = L.params["bias"].flatten()
-            n = min(nu.flatten().numel(), b.numel())
-            contrib = (nu.flatten()[:n] * b[:n]).sum()
-        
-        return nu, contrib
-    
-    # -------- Input Contribution --------
-    def _input_contribution(self, net: Net, nu: torch.Tensor,
-                            return_sce: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Input contrib: lb^T@[v]+ + ub^T@[v]- (minimization over input box)."""
-        # Find input layer
-        input_layer = None
-        for layer in net.layers:
-            if layer.kind == LayerKind.INPUT_SPEC.value:
-                input_layer = layer; break
-            elif layer.kind == LayerKind.INPUT.value:
-                input_layer = layer
-        
-        if input_layer is None:
-            return torch.tensor(0.0), None
-        
-        # Get bounds
-        bounds = self._bounds_dict.get(input_layer.id)
-        if bounds is None:
-            if "lb" in input_layer.params and "ub" in input_layer.params:
-                lb, ub = input_layer.params["lb"], input_layer.params["ub"]
-            else:
-                return torch.tensor(0.0), None
-        else:
-            lb, ub = bounds.lb, bounds.ub
-        
-        orig_shape = lb.shape
-        l, u, v = lb.flatten(), ub.flatten(), nu.flatten()
-        n = min(l.numel(), v.numel())
-        l, u, v = l[:n], u[:n], v[:n]
-        
-        assert (l <= u).all(), f"Invalid input bounds: l > u at {(l > u).nonzero().flatten().tolist()[:5]}"
-        
-        # Contribution: minimize v^T @ x s.t. l <= x <= u
-        # If v_i > 0: x_i = l_i (use lower bound)
-        # If v_i < 0: x_i = u_i (use upper bound)
-        contrib = (l @ v.clamp(min=0)) + (u @ v.clamp(max=0))
-        
-        # SCE: pick lb when v>0, ub otherwise (the minimizing assignment)
-        sce = None
-        if return_sce:
-            sce = torch.where(v > 0, l, u)
-            if sce.numel() == lb.numel(): sce = sce.view(orig_shape)
-        
-        return contrib, sce
+        k = layer_kind.upper()
+        return k in self._BACKWARD_REGISTRY and k not in self._UNIMPLEMENTED_KINDS
 
 
-# -------- Convenience Functions --------
-def compute_dual_bound(net: Net, bounds_dict: Dict[int, Bounds], c: torch.Tensor,
-                       return_sce: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Compute certified lower bound on c^T @ output."""
-    return DualTF().compute_bound(net, bounds_dict, c, return_sce=return_sce)
+# Explicit stub registry: any handler whose semantics are "raise NotImplementedError"
+# goes here. Membership is the ground truth for stub detection; net_factory filters
+# by identity against these sets.
+# To implement a stub: fill its body AND remove it from this set in the same commit.
+_FORWARD_STUBS = frozenset({
+    forward_lstm, forward_gru, forward_attention,
+    forward_layernorm, forward_gelu,
+})
+_BACKWARD_STUBS = frozenset({
+    backward_concat,
+    backward_lstm, backward_gru, backward_attention,
+    backward_layernorm, backward_gelu,
+})
 
-def compute_robust_loss_bound(net: Net, bounds_dict: Dict[int, Bounds],
-                              y_true: int, num_classes: int) -> Tuple[torch.Tensor, bool]:
-    """Compute robust classification bound (min margin, is_certified)."""
-    return DualTF().compute_robust_bound(net, bounds_dict, y_true, num_classes)
+# --- registry invariants (fire once at module import) ---
+assert set(DualTF._FORWARD_REGISTRY.keys()) == set(DualTF._BACKWARD_REGISTRY.keys()), (
+    f"DualTF registry keyset mismatch: "
+    f"forward-only={set(DualTF._FORWARD_REGISTRY) - set(DualTF._BACKWARD_REGISTRY)}, "
+    f"backward-only={set(DualTF._BACKWARD_REGISTRY) - set(DualTF._FORWARD_REGISTRY)}"
+)
+
+# _UNIMPLEMENTED_KINDS must exactly equal the set of layer kinds whose backward
+# handler is a stub (raises NotImplementedError). Drift between these two sets
+# is a real risk: implementing a stub without updating _UNIMPLEMENTED_KINDS
+# would silently keep skipping a now-working kind; the reverse causes runtime
+# NotImplementedError on a kind that supports_layer claims to support.
+_stub_kinds_from_registry = frozenset(
+    k for k, fn in DualTF._BACKWARD_REGISTRY.items() if fn in _BACKWARD_STUBS
+)
+assert DualTF._UNIMPLEMENTED_KINDS == _stub_kinds_from_registry, (
+    f"DualTF _UNIMPLEMENTED_KINDS drift: "
+    f"declared={sorted(DualTF._UNIMPLEMENTED_KINDS)}, "
+    f"stub-derived={sorted(_stub_kinds_from_registry)}"
+)
