@@ -487,7 +487,7 @@ def verify_once(
         )
     B = seed_bounds.lb.shape[0]
 
-    # Dual standalone dispatch: when ``--solver dual`` is set (β refactor moved
+    # Dual standalone dispatch: when ``--solver dual`` is set (dual moved
     # dual from the --tf-mode axis to the --solver axis), route through
     # DualSolver.evaluate_spec instead of analyze() + interval cert. LP/Gurobi
     # path remains authoritative for the LP-feeding TFs (interval/hybridz).

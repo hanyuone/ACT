@@ -8,7 +8,7 @@
 #
 # Purpose:
 #   RNN dual forward/backward handlers (LSTM, GRU). Registry-contract stubs
-#   — bodies pending real implementations. See plan §6.5 / §5.
+#   — bodies pending real implementations.
 #
 #===---------------------------------------------------------------------===#
 
@@ -26,7 +26,7 @@ def forward_lstm(L, parent_boxes, parent_lins, parent_frames, preds,
     raise NotImplementedError("forward for LSTM not implemented in dual_tf")
 
 
-def backward_lstm(L, nu, bounds_dict, preds):
+def backward_lstm(L, nu, bounds_dict, preds, M: int = 1):
     """LSTM backward through time. (Pending)
     Will require: gate bounds from forward pass, per-timestep weight matrices
     (weight_ih, weight_hh), seq_len, hidden_size.
@@ -43,7 +43,7 @@ def forward_gru(L, parent_boxes, parent_lins, parent_frames, preds,
     raise NotImplementedError("forward for GRU not implemented in dual_tf")
 
 
-def backward_gru(L, nu, bounds_dict, preds):
+def backward_gru(L, nu, bounds_dict, preds, M: int = 1):
     """GRU backward through time. (Pending)
     Will require: gate bounds from forward pass, per-timestep weight matrices.
     """

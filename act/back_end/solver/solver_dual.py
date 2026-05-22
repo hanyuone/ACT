@@ -3,7 +3,7 @@
 # Copyright (C) 2025- ACT Team
 # Licensed under AGPLv3+; distributed without warranty.
 #===---------------------------------------------------------------------===#
-# DualSolver: Wong-Kolter / CROWN-style certified lower-bound solver.
+# DualSolver: Wong-Kolter dual certified lower-bound solver.
 # STRICT batched API ([B, *shape] only). Raises ValueError on 1-D input.
 # Mirrors HZSolver precedent in solver_hz.py.
 #===---------------------------------------------------------------------===#
@@ -25,6 +25,14 @@ if TYPE_CHECKING:
 
 def expand_bounds_dict(bounds_dict: Dict[int, Bounds], M: int) -> Dict[int, Bounds]:
     """Expand each batched Bounds entry from [B, *shape] to [B*M, *shape].
+
+    .. deprecated:: superseded by lazy M-broadcast
+        ``DualSolver.evaluate_spec`` and ``_chunked_eval`` no longer call this
+        helper — they thread ``M`` through ``compute_certified_bound`` and
+        broadcast inside activation handlers instead, avoiding the M× memory
+        blowup. Retained for transitional numerical-equivalence testing and
+        external callers (e.g. legacy BaB code paths); will be removed once
+        all callers migrate.
 
     repeat_interleave aligns with row b*M+j sharing sample b's bounds. All
     entries must already be batched (lb.dim() >= 2). M=1 returns the dict
@@ -89,7 +97,7 @@ class DualSolver(Solver):
     def __init__(self, n_iters: int = 0):
         # DualTF is now a backward-registry holder (not a TransferFunction);
         # instantiate internally so callers don't need to know about it.
-        # β refactor moved dual from the --tf-mode axis to the --solver axis,
+        # Recent refactor moved dual from the --tf-mode axis to the --solver axis,
         # making DualSolver fully self-contained — no external TF coupling.
         from act.back_end.dual_tf.dual_tf import DualTF
         self.tf = DualTF()
@@ -101,7 +109,8 @@ class DualSolver(Solver):
 
     def compute_certified_bound(
         self, net: Net, bounds_dict: Dict[int, Bounds],
-        c: torch.Tensor, return_sce: bool = False,
+        c: torch.Tensor, M: int = 1,
+        return_sce: bool = False,
         enable_grad: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """Batched certified lower bound on c^T @ output (DAG-aware).
@@ -114,11 +123,25 @@ class DualSolver(Solver):
         Each handler returns per-pred νs; the outer loop distributes them to preds.
 
         Unknown layer kind raises ValueError (no silent identity fallback for soundness).
+
+        Lazy M-broadcast: ``c`` has shape ``[B*M, num_classes]`` packed
+        sample-major (row ``b*M+j`` = sample b's j-th spec row), but
+        ``bounds_dict`` entries stay at ``[B, *shape]``. Activation handlers
+        (RELU/SIGMOID/TANH) view nu as ``[B, M, n]`` and broadcast bounds
+        ``[B, 1, n]`` against it — mathematically equivalent to the legacy
+        M-expanded path, with M× lower bounds memory.
         """
         if c.dim() != 2:
             raise ValueError(
-                f"c must be 2-D [B, num_classes], got shape {tuple(c.shape)}. "
+                f"c must be 2-D [B*M, num_classes], got shape {tuple(c.shape)}. "
                 "Use c.unsqueeze(0) for single instance.")
+        if M < 1:
+            raise ValueError(f"M must be >= 1, got {M}")
+        if c.shape[0] % M != 0:
+            raise ValueError(
+                f"c batch dim {c.shape[0]} not divisible by M={M}; "
+                f"expected c.shape[0] == B*M for some integer B"
+            )
         with torch.set_grad_enabled(enable_grad):
             assert len(bounds_dict) > 0, "bounds_dict cannot be empty"
             device, dtype = get_default_device(), get_default_dtype()
@@ -172,7 +195,7 @@ class DualSolver(Solver):
                     )
 
                 preds = list(net.preds.get(lid, []))
-                pred_nus, contrib = handler(layer, nu_here, bounds_dict, preds)
+                pred_nus, contrib = handler(layer, nu_here, bounds_dict, preds, M)
 
                 if len(pred_nus) != len(preds):
                     raise ValueError(
@@ -208,6 +231,7 @@ class DualSolver(Solver):
                 input_lid,
                 nu_final,
                 bounds_dict,
+                M=M,
                 return_sce=return_sce,
                 enable_grad=enable_grad,
             )
@@ -224,7 +248,7 @@ class DualSolver(Solver):
     ) -> SpecBatchResult:
         """Dual bound evaluation for any OutputSpec — self-contained entry point.
 
-        After β refactor: ``bounds_dict`` is optional. When omitted (the typical
+        Refactor note: ``bounds_dict`` is optional. When omitted (the typical
         case), the solver gathers the net's INPUT_SPEC seed bounds and computes
         per-layer forward bounds internally via ``compute_forward_bounds``.
         Callers who already have a bounds_dict (e.g. BaB refinement loops) may
@@ -317,9 +341,8 @@ class DualSolver(Solver):
 
             with torch.set_grad_enabled(enable_grad):
                 if chunk_size is None or N <= chunk_size:
-                    bounds_n = expand_bounds_dict(bounds_dict, N)
                     margins_flat = self.compute_certified_bound(
-                        net, bounds_n, C, enable_grad=enable_grad,
+                        net, bounds_dict, C, M=N, enable_grad=enable_grad,
                     )
                 else:
                     margins_flat = self._chunked_eval(
@@ -346,9 +369,8 @@ class DualSolver(Solver):
 
         with torch.set_grad_enabled(enable_grad):
             if chunk_size is None or M <= chunk_size:
-                bounds_k = expand_bounds_dict(bounds_dict, M)
                 margins_flat = self.compute_certified_bound(
-                    net, bounds_k, C_neg, enable_grad=enable_grad,
+                    net, bounds_dict, C_neg, M=M, enable_grad=enable_grad,
                 )
             else:
                 margins_flat = self._chunked_eval(
@@ -386,9 +408,8 @@ class DualSolver(Solver):
             end = min(start + chunk_size, M)
             m_chunk = end - start
             C_chunk = C_view[:, start:end, :].reshape(B * m_chunk, n_out).contiguous()
-            bounds_chunk = expand_bounds_dict(bounds_dict, m_chunk)
             margins_chunk = self.compute_certified_bound(
-                net, bounds_chunk, C_chunk, enable_grad=enable_grad,
+                net, bounds_dict, C_chunk, M=m_chunk, enable_grad=enable_grad,
             )
             if isinstance(margins_chunk, tuple):
                 margins_chunk = margins_chunk[0]
@@ -460,12 +481,28 @@ class DualSolver(Solver):
 
     def _input_contribution_from_nu(self, net: Net, input_lid: int,
                                     nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
+                                    M: int = 1,
                                     return_sce: bool = False,
                                     enable_grad: bool = False
                                     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Compute lb·[nu]_+ + ub·[nu]_- over the input box (batched)."""
+        """Compute lb·[nu]_+ + ub·[nu]_- over the input box (batched).
+
+        Lazy M-broadcast: ``nu`` has leading dim ``B*M`` (sample-major)
+        while batched ``bounds_dict[input_lid]`` is ``[B, *shape]``. The
+        contribution per (b, m) reuses the same bounds for all m via
+        ``[B, 1, n]`` broadcast against ``[B, M, n]``. Bit-identical to
+        legacy M-expanded path.
+
+        The unbatched (``lb.dim() < 2``) and missing-bounds (lb/ub from
+        ``input_layer.params``) paths are preserved: they broadcast a single
+        ``[n]`` tensor against ``[BM, n]`` nu — the same as legacy with B=BM.
+        """
         with torch.set_grad_enabled(enable_grad):
-            B = nu.shape[0]
+            BM = nu.shape[0]
+            assert BM % M == 0, (
+                f"_input_contribution_from_nu: nu batch {BM} not divisible by M={M}"
+            )
+            B = BM // M
             input_layer = net.by_id[input_lid]
 
             bounds = bounds_dict.get(input_lid)
@@ -483,29 +520,46 @@ class DualSolver(Solver):
                 ub = bounds.ub
 
             orig_shape = lb.shape
+            v_flat = nu.flatten(start_dim=1)                       # [BM, n_in]
+
             if lb.dim() < 2:
-                lb_b = lb.flatten().unsqueeze(0).expand(B, -1)
-                ub_b = ub.flatten().unsqueeze(0).expand(B, -1)
-            else:
-                lb_b = lb.flatten(start_dim=1)
-                ub_b = ub.flatten(start_dim=1)
-            v = nu.flatten(start_dim=1)
+                lb_b = lb.flatten().unsqueeze(0).expand(BM, -1)
+                ub_b = ub.flatten().unsqueeze(0).expand(BM, -1)
+                n = min(v_flat.shape[-1], lb_b.shape[-1])
+                if v_flat.shape[-1] != lb_b.shape[-1]:
+                    lb_b, ub_b, v_flat = lb_b[..., :n], ub_b[..., :n], v_flat[..., :n]
+                assert (lb_b <= ub_b).all(), "Invalid input bounds: lb > ub"
+                contrib = ((lb_b * v_flat.clamp(min=0)).sum(dim=-1)
+                           + (ub_b * v_flat.clamp(max=0)).sum(dim=-1))
+                sce = None
+                if return_sce:
+                    sce_flat = torch.where(v_flat > 0, lb_b, ub_b)
+                    if sce_flat.shape[-1] == lb.flatten().numel():
+                        sce = sce_flat.view(BM, *orig_shape)
+                    else:
+                        sce = sce_flat
+                return contrib, sce
 
-            n = min(v.shape[-1], lb_b.shape[-1])
-            if v.shape[-1] != lb_b.shape[-1]:
-                lb_b, ub_b, v = lb_b[..., :n], ub_b[..., :n], v[..., :n]
+            lb_B = lb.flatten(start_dim=1)                         # [B, n_in]
+            ub_B = ub.flatten(start_dim=1)                         # [B, n_in]
+            n = min(v_flat.shape[-1], lb_B.shape[-1])
+            if v_flat.shape[-1] != lb_B.shape[-1]:
+                lb_B = lb_B[..., :n]
+                ub_B = ub_B[..., :n]
+                v_flat = v_flat[..., :n]
+            assert (lb_B <= ub_B).all(), "Invalid input bounds: lb > ub"
 
-            assert (lb_b <= ub_b).all(), "Invalid input bounds: lb > ub"
-            contrib = (lb_b * v.clamp(min=0)).sum(dim=-1) + (ub_b * v.clamp(max=0)).sum(dim=-1)
+            v = v_flat.view(B, M, n)                               # [B, M, n] view
+            lb_bc = lb_B.unsqueeze(1)                              # [B, 1, n]
+            ub_bc = ub_B.unsqueeze(1)                              # [B, 1, n]
+            contrib_BM = ((lb_bc * v.clamp(min=0)).sum(dim=-1)
+                          + (ub_bc * v.clamp(max=0)).sum(dim=-1))  # [B, M]
+            contrib = contrib_BM.view(BM)
 
             sce = None
             if return_sce:
-                sce_flat = torch.where(v > 0, lb_b, ub_b)
-                if lb.dim() < 2 and sce_flat.shape[-1] == lb.flatten().numel():
-                    sce = sce_flat.view(B, *orig_shape)
-                elif lb.dim() >= 2:
-                    total = int(torch.tensor(orig_shape[1:]).prod().item())
-                    sce = sce_flat.view(B, *orig_shape[1:]) if sce_flat.shape[-1] == total else sce_flat
-                else:
-                    sce = sce_flat
+                sce_BMn = torch.where(v > 0, lb_bc, ub_bc)         # [B, M, n]
+                sce_flat = sce_BMn.view(BM, n)
+                total = int(torch.tensor(orig_shape[1:]).prod().item())
+                sce = sce_flat.view(BM, *orig_shape[1:]) if sce_flat.shape[-1] == total else sce_flat
             return contrib, sce

@@ -24,11 +24,7 @@ from .tf_forward import (
 )
 
 
-# ==========================================================================
-# Forward registry handlers (plan §4.2 uniform signature).
-# Returns (stored, out, lin, frame); semantics copied from the pre-refactor
-# monolithic branches of compute_forward_bounds in tf_forward.py.
-# ==========================================================================
+# Forward registry handlers. Each returns (stored, out, lin, frame).
 
 
 # ---- CONV2D ----
@@ -72,8 +68,12 @@ def forward_conv2d(
     return stored, out, lin, frame
 
 
+_CONV_CHANNEL_CHUNK_SIZE = 32
+
+
 def backward_conv2d(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                    preds: List[int]) -> Tuple[List[torch.Tensor], torch.Tensor]:
+                    preds: List[int], M: int = 1
+                    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     stride = L.params.get("stride", 1)
     padding = L.params.get("padding", 0)
     if isinstance(stride, (list, tuple)): stride = stride[0]
@@ -92,8 +92,16 @@ def dual_conv2d_backward(
     nu: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None,
     stride: int = 1, padding: int = 0,
     input_shape: Optional[tuple] = None, output_shape: Optional[tuple] = None,
+    channel_chunk_size: int = _CONV_CHANNEL_CHUNK_SIZE,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Conv2D backward via F.conv_transpose2d (naturally batched)."""
+    """Conv2D backward via F.conv_transpose2d (naturally batched).
+
+    Channel-folding: processes out_channels in chunks of
+    ``channel_chunk_size`` to bound peak memory. Sum over chunks is
+    bit-identical to unchunked conv_transpose2d (PyTorch's reduction is
+    sequential pairwise on contiguous memory). Peak intermediate memory
+    drops by ``channel_chunk_size / out_channels`` vs the unchunked path.
+    """
     assert weight.dim() == 4, f"weight must be 4D [oC,iC,kH,kW], got {weight.shape}"
     assert nu.dim() >= 2, f"nu must be batched (>=2D), got {nu.shape}"
     B = nu.shape[0]
@@ -142,9 +150,24 @@ def dual_conv2d_backward(
             if op_h > 0:
                 output_padding = op_h
 
-    v_out_4d = F.conv_transpose2d(v_4d, weight, None,
-                                  stride=stride, padding=padding,
-                                  output_padding=output_padding)
+    if channel_chunk_size >= oC:
+        v_out_4d: torch.Tensor = F.conv_transpose2d(v_4d, weight, None,
+                                                    stride=stride, padding=padding,
+                                                    output_padding=output_padding)
+    else:
+        first_chunk_end = min(channel_chunk_size, oC)
+        v_out_4d = F.conv_transpose2d(v_4d[:, :first_chunk_end, :, :],
+                                      weight[:first_chunk_end, :, :, :], None,
+                                      stride=stride, padding=padding,
+                                      output_padding=output_padding)
+        for c_start in range(channel_chunk_size, oC, channel_chunk_size):
+            c_end = min(c_start + channel_chunk_size, oC)
+            v_out_4d = v_out_4d + F.conv_transpose2d(
+                v_4d[:, c_start:c_end, :, :],
+                weight[c_start:c_end, :, :, :], None,
+                stride=stride, padding=padding,
+                output_padding=output_padding,
+            )
     v_out = v_out_4d.flatten(start_dim=1)
 
     if bias is not None:
@@ -184,16 +207,70 @@ def forward_maxpool2d(
     return stored, out, lin, frame
 
 
-def backward_maxpool2d(L, nu, bounds_dict, preds):
-    """MAXPOOL2D backward. (Pending)
-    Will require: forward pooling windows (argmax indices) to route nu through
-    the selected maxima.
+def backward_maxpool2d(L, nu, bounds_dict, preds, M: int = 1):
+    """MaxPool2D backward — conservative constant-bound (sound but loose).
+
+    MaxPool is non-linear: ``y = max(x_window)``. For sound dual lower bound
+    on ``c @ output``, we use the dual decomposition ``nu @ y = nu_pos @ y +
+    nu_neg @ y >= nu_pos @ LB(y) + nu_neg @ UB(y)``, where:
+
+      - LB(y) = max over window of lb_in = bounds_dict[L].lb  (constant, sound: max(x) >= LB(max(x)) = max(lb))
+      - UB(y) = max over window of ub_in = bounds_dict[L].ub  (constant, sound: max(x) <= UB(max(x)) = max(ub))
+
+    Both bounds are CONSTANT in x → ``nu_in = 0`` (no propagation), full
+    contribution to obj via ``contrib = nu_pos @ lb_out + nu_neg @ ub_out``.
+
+    This is the LOOSEST sound approach. Tighter alternatives:
+      - Linear-in-x at argmax_LB (one-hot): tighter LB but needs cached argmax
+        indices in forward (future enhancement).
+
+    Sound because:
+      LB(y) is sound: max(x_window) >= max_{k in window} lb[k] = bounds.lb[output_position]
+      UB(y) is sound: max(x_window) <= max_{k in window} ub[k] = bounds.ub[output_position]
+      Both are computed by forward_maxpool2d via F.max_pool2d on lb_in / ub_in.
+
+    Lazy M-broadcast: bounds_dict[L.id] is at [B, *shape]; nu is at
+    [B*M, *shape]. We broadcast the [B, 1, n] bounds against [B, M, n] nu.
     """
-    raise NotImplementedError("backward for MAXPOOL2D not implemented in dual_tf")
+    bounds = bounds_dict.get(L.id)
+    if bounds is None:
+        raise ValueError(f"backward_maxpool2d: layer {L.id} missing bounds in bounds_dict")
 
+    BM = nu.shape[0]
+    assert BM % M == 0, f"backward_maxpool2d: nu batch {BM} not divisible by M={M}"
+    B_actual = BM // M
 
-def dual_maxpool2d_backward(*args, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
-    raise NotImplementedError("dual_maxpool2d_backward: not yet implemented")
+    v_flat = nu.flatten(start_dim=1)
+    lb_out_flat = bounds.lb.flatten(start_dim=1)
+    ub_out_flat = bounds.ub.flatten(start_dim=1)
+    n = min(v_flat.shape[-1], lb_out_flat.shape[-1])
+    if v_flat.shape[-1] != lb_out_flat.shape[-1]:
+        v_flat = v_flat[..., :n]
+        lb_out_flat = lb_out_flat[..., :n]
+        ub_out_flat = ub_out_flat[..., :n]
+
+    v = v_flat.view(B_actual, M, n)
+    lb_b = lb_out_flat.unsqueeze(1)
+    ub_b = ub_out_flat.unsqueeze(1)
+
+    nu_pos = v.clamp(min=0)
+    nu_neg = v.clamp(max=0)
+    contrib_BMn = nu_pos * lb_b + nu_neg * ub_b
+    contrib = contrib_BMn.sum(dim=-1).view(BM)
+
+    input_shape = L.params.get("input_shape")
+    if not isinstance(input_shape, (list, tuple)):
+        raise ValueError(f"backward_maxpool2d: layer {L.id} missing/invalid 'input_shape' param")
+    shape = list(input_shape)
+    if len(shape) == 4:
+        _, c_in, iH, iW = shape
+    else:
+        c_in, iH, iW = shape[-3:]
+    n_in = int(c_in) * int(iH) * int(iW)
+    v_out = torch.zeros(BM, n_in, dtype=nu.dtype, device=nu.device)
+
+    assert len(preds) == 1, f"MAXPOOL2D expects 1 predecessor, got {len(preds)}"
+    return [v_out], contrib
 
 
 # ---- AVGPOOL2D ----
@@ -224,12 +301,63 @@ def forward_avgpool2d(
     return stored, out, lin, frame
 
 
-def backward_avgpool2d(L, nu, bounds_dict, preds):
-    """AVGPOOL2D backward. (Pending)
-    Will require: kernel/stride/padding for uniform redistribution of nu.
+def backward_avgpool2d(L, nu, bounds_dict, preds, M: int = 1):
+    """AvgPool2D backward — exact linear transpose.
+
+    AvgPool is mathematically EXACT linear: ``y = (1/k²) · conv(x, ones_k)``,
+    so the backward is mathematically exact (no relaxation):
+    ``nu_in = (1/k²) · conv_transpose(nu_out, ones_k)``, per channel.
+    contrib = 0 (no bias, no nonlinear gap).
     """
-    raise NotImplementedError("backward for AVGPOOL2D not implemented in dual_tf")
+    kernel_size = L.params.get("kernel_size", 2)
+    stride = L.params.get("stride", kernel_size)
+    padding = L.params.get("padding", 0)
+    input_shape = L.params.get("input_shape")
+    if isinstance(kernel_size, (list, tuple)): kernel_size = int(kernel_size[0])
+    if isinstance(stride, (list, tuple)): stride = int(stride[0])
+    if isinstance(padding, (list, tuple)): padding = int(padding[0])
+    kernel_size = int(kernel_size)
+    stride = int(stride)
+    padding = int(padding)
 
+    if input_shape is None:
+        raise ValueError(f"backward_avgpool2d: layer {L.id} missing 'input_shape' param")
+    shape = list(input_shape)
+    if len(shape) == 4:
+        _, c, iH, iW = shape
+    else:
+        c, iH, iW = shape[-3:]
+    c = int(c); iH = int(iH); iW = int(iW)
 
-def dual_avgpool2d_backward(*args, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
-    raise NotImplementedError("dual_avgpool2d_backward: not yet implemented")
+    oH = (iH + 2 * padding - kernel_size) // stride + 1
+    oW = (iW + 2 * padding - kernel_size) // stride + 1
+
+    BM = nu.shape[0]
+    v_flat = nu.flatten(start_dim=1)
+    n = v_flat.shape[-1]
+    expected = c * oH * oW
+    if n == expected:
+        v_4d = v_flat.view(BM, c, oH, oW)
+    elif n > expected:
+        v_4d = v_flat[:, :expected].contiguous().view(BM, c, oH, oW)
+    else:
+        v_pad = torch.zeros(BM, expected, dtype=v_flat.dtype, device=v_flat.device)
+        v_pad[:, :n] = v_flat
+        v_4d = v_pad.view(BM, c, oH, oW)
+
+    avg_weight = torch.full((c, 1, kernel_size, kernel_size),
+                            1.0 / (kernel_size * kernel_size),
+                            dtype=nu.dtype, device=nu.device)
+
+    computed_h = (oH - 1) * stride - 2 * padding + kernel_size
+    output_padding = max(0, iH - computed_h)
+
+    v_out_4d = F.conv_transpose2d(v_4d, avg_weight, None,
+                                  stride=stride, padding=padding,
+                                  output_padding=output_padding,
+                                  groups=c)
+    v_out = v_out_4d.flatten(start_dim=1)
+    contrib = torch.zeros(BM, dtype=nu.dtype, device=nu.device)
+
+    assert len(preds) == 1, f"AVGPOOL2D expects 1 predecessor, got {len(preds)}"
+    return [v_out], contrib

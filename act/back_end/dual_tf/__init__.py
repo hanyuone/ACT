@@ -17,116 +17,16 @@
 
 # Disable pyright import-cycle error for this module (circular imports are intentional)
 # pyright: reportImportCycles=false
-"""Dual Transfer Function package.
+"""Dual transfer functions: Wong-Kolter certified bounds via backward Lagrangian.
 
-## Primary Entry Point: `DualSolver.evaluate_spec`
+Entry point: ``DualSolver.evaluate_spec`` (in ``act.back_end.solver.solver_dual``).
+Per-layer kernels live in ``tf_mlp`` (MLP), ``tf_cnn`` (CNN), ``tf_smooth``
+(sigmoid/tanh), ``tf_rnn`` (LSTM/GRU stubs), ``tf_transformer`` (attention
+stubs). Forward dual-track pass in ``compute_forward_bounds`` (tf_forward.py).
 
-Unified dispatcher over all supported OutputSpec kinds (LINEAR_LE, UNSAFE_LINEAR,
-TOP1_ROBUST, MARGIN_ROBUST, RANGE). Encodes any spec as a batched `SpecBatch`
-(B*M linear forms) and runs a single backward pass via `compute_certified_bound`.
-
-```python
-from act.back_end.solver import DualSolver
-from act.util.stats import SpecBatchResult
-from act.front_end.specs import OutputSpec, OutKind
-
-# β refactor: DualSolver is now self-contained — no tf parameter, and
-# bounds_dict is optional (auto-computed from the net's INPUT_SPEC seeds
-# via compute_forward_bounds when omitted).
-solver = DualSolver()
-result: SpecBatchResult = solver.evaluate_spec(
-    net,
-    OutputSpec(kind=OutKind.TOP1_ROBUST, y_true=y_true),
-    num_classes=10,
-)
-# result.margins: [B, K]  — per-class lower bounds on y_true - y_j
-# result.certified: [B] bool
-# result.min_slack: [B]  — legacy-compatible worst-case margin
-```
-
-## Result Layers (SpecBatchResult vs VerifyResult)
-
-Two result types operate at different abstraction levels:
-
-- **`SpecBatchResult`** (low-level, batched): direct numerical output from
-  dual evaluation. Carries `[B, M]` margin tensor, per-cell slack, active-cell
-  mask, and `[B]` certification bool. Used for robust training losses and
-  intermediate computations.
-
-- **`VerifyResult`** (`act.util.stats`, per-sample): high-level verification
-  verdict with `status: VerifyStatus` enum (CERTIFIED / UNKNOWN / FALSIFIED /
-  TIMEOUT / ...), optional counterexample, and metadata.
-
-Convert via `SpecBatchResult.to_verify_results() -> List[VerifyResult]`. The
-bridge maps `certified=True -> CERTIFIED`, `certified=False -> UNKNOWN`
-(never FALSIFIED: dual bounds are sound but not complete; a negative slack
-may reflect relaxation gap rather than a true violation).
-
-## Gradient Flow (Robust Training)
-
-All dual backward handlers and `compute_certified_bound` / `evaluate_spec` /
-`compute_robust_bound` honor the caller's gradient context via the
-`enable_grad: bool = False` parameter (default off for verification).
-
-```python
-# Robust training loop
-result = solver.evaluate_spec(net, bounds_dict, spec, enable_grad=True)
-loss = -result.margins.mean()
-loss.backward()  # gradients propagate through dense/conv weights
-```
-
-When `enable_grad=False` (default), execution is wrapped in
-`torch.set_grad_enabled(False)`, preserving inference-path performance.
-
-## Legacy: `compute_robust_bound`
-
-First-class shortcut for classification robustness, retained for both
-verification callers and robust training:
-
-```python
-min_slack, certified = solver.compute_robust_bound(
-    net, bounds_dict, y_true, num_classes
-)  # legacy tuple signature
-
-# Or, for training:
-result = solver.compute_robust_bound(
-    net, bounds_dict, y_true, num_classes,
-    margin=0.5, return_full=True, enable_grad=True,
-)  # returns SpecBatchResult
-```
-
-Internally delegates to `evaluate_spec` with `TOP1_ROBUST` or
-`MARGIN_ROBUST` spec kind.
-
-## Batch Convention
-
-All tensors at module boundaries follow the `[B, *layer_shape]` convention:
-
-- `Bounds.lb`, `Bounds.ub`: `[B, *layer_shape]` (e.g. `[B, 128]`, `[B, C, H, W]`)
-- `nu` (dual variable): `[B, *layer_shape]`
-- `c` (objective coefficient): `[B, num_classes]`
-- `contrib` (per-handler): `[B]`
-- `compute_certified_bound` return: `Tensor[B]` or `(Tensor[B], Tensor[B, *in_shape])`
-- `compute_robust_bound` return: `(Tensor[B], Tensor[B] bool)` — NOT Python bool
-
-### Input contract (deliberately asymmetric)
-
-- `DualSolver.compute_certified_bound` and `DualSolver.compute_robust_bound` are STRICT:
-  they REQUIRE batched input `c: [B, num_classes]` and raise `ValueError` on
-  1-D. For a single instance, use `.unsqueeze(0)` before calling and
-  `.squeeze(0)` / `.item()` on results.
-
-- `compute_forward_bounds` is LENIENT: it auto-promotes 1-D input
-  (`input_lb.dim() < 2`) to `[1, *]` via `.unsqueeze(0)`, processes through the
-  fully-batched internal path, and returns `bounds_dict` with every entry
-  shaped `[B, *layer_shape]`. This preserves compatibility with experimental
-  scripts and the notebook that pass 1-D input, without requiring call-site
-  changes.
-
-Internally, `compute_forward_bounds` has NO per-instance Python loop —
-every `_fwd_*` handler accepts and produces batched `LinearBound`
-(`A_{lb,ub}: [B, out_dim, in_dim]`, `b_{lb,ub}: [B, out_dim]`). See
-`tf_forward.py` module docstring for handler details.
+Batch convention: all tensors are ``[B, *layer_shape]``. ``compute_certified_bound``
+requires ``c.dim() == 2``; ``compute_forward_bounds`` auto-promotes 1-D inputs.
+Backward handlers gate on ``enable_grad`` for robust-training use.
 """
 
 # Core DualTF class + ADD/CONCAT dispatch (lives in dual_tf.py beside the class)
@@ -145,10 +45,8 @@ from .tf_mlp import (
 # Forward bounds
 from .tf_forward import compute_forward_bounds, Frame
 
-# CNN batched kernel + dispatch (backward) and forward registry handlers;
-# backward_maxpool2d / backward_avgpool2d are registry-signature stubs.
 from .tf_cnn import (
-    dual_conv2d_backward, dual_maxpool2d_backward, dual_avgpool2d_backward,
+    dual_conv2d_backward,
     backward_conv2d, backward_maxpool2d, backward_avgpool2d,
     forward_conv2d, forward_maxpool2d, forward_avgpool2d,
 )
@@ -179,7 +77,7 @@ __all__ = [
     'forward_bn', 'forward_lrelu', 'forward_identity', 'forward_reshape',
     'compute_forward_bounds',
     'Frame',
-    'dual_conv2d_backward', 'dual_maxpool2d_backward', 'dual_avgpool2d_backward',
+    'dual_conv2d_backward',
     'backward_conv2d', 'backward_maxpool2d', 'backward_avgpool2d',
     'forward_conv2d', 'forward_maxpool2d', 'forward_avgpool2d',
     'dual_smooth_backward', 'dual_sigmoid_backward', 'dual_tanh_backward',

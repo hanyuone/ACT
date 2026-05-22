@@ -49,9 +49,8 @@ class Solver:
         Implemented by ``GurobiSolver`` and ``HZSolver``.
       * ``solve_batch(BatchLPProblem)`` — batched LP/MILP. Implemented by
         ``GurobiSolver``, ``TorchLPSolver``, ``HZSolver``.
-      * ``compute_certified_bound(net, bounds_dict, c)`` — CROWN /
-        Wong-Kolter dual lower bound on ``c @ output``. Implemented by
-        ``DualSolver``.
+      * ``compute_certified_bound(net, bounds_dict, c)`` — Wong-Kolter
+        dual lower bound on ``c @ output``. Implemented by ``DualSolver``.
 
     Callers dispatch by reading ``capabilities()`` rather than relying on
     method presence; ``raise NotImplementedError`` is the contract for
@@ -80,6 +79,7 @@ class Solver:
         net: "Net",
         bounds_dict: "Dict[int, Bounds]",
         c: "torch.Tensor",
+        M: int = 1,
         return_sce: bool = False,
         enable_grad: bool = False,
     ) -> "Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]":
@@ -91,16 +91,20 @@ class Solver:
             net: ACT Net (DAG-aware; reverse-topo'd internally).
             bounds_dict: forward-pass bounds keyed by layer id, batched
                 ``[B, *shape]``.
-            c: ``Tensor[B, num_classes]`` linear coefficients for the
-                objective ``c @ output``.
+            c: ``Tensor[B*M, num_classes]`` linear coefficients for the
+                objective ``c @ output``. When ``M > 1`` (multi-spec-row
+                verification) rows are packed sample-major (``b*M+j``).
+            M: number of spec rows packed into ``c``'s leading axis per
+                sample. DualSolver-specific (lazy M-broadcast);
+                LP/MILP solvers ignore this. Defaults to 1.
             return_sce: if True, also return a per-sample input witness
                 (sub/super-gradient extremum). Defaults to False.
             enable_grad: if True, allow gradient flow through the bound
                 computation (for adversarial / robust-training loops).
 
         Returns:
-            ``Tensor[B]`` lower bound per sample, or
-            ``(Tensor[B], Optional[Tensor[B, *input_shape]])`` when
+            ``Tensor[B*M]`` lower bound per (sample, spec) row, or
+            ``(Tensor[B*M], Optional[Tensor[B*M, *input_shape]])`` when
             ``return_sce=True``.
 
         Subclasses with ``capabilities().supports_dual == True`` must

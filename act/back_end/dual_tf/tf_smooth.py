@@ -16,7 +16,6 @@
 import torch
 from typing import Tuple, Callable, Dict, Any, List
 from act.back_end.core import Bounds
-from .tf_mlp import _batch_flatten_bounds
 from .tf_forward import LinearBound, Frame, _reset_forward_box
 
 
@@ -71,23 +70,48 @@ def dual_smooth_backward(
     nu: torch.Tensor, bounds: Bounds,
     func: Callable[[torch.Tensor], torch.Tensor],
     dfunc: Callable[[torch.Tensor], torch.Tensor],
+    M: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Batched smooth activation backward with sign-adaptive bound selection."""
-    B = nu.shape[0]
-    l, u = _batch_flatten_bounds(bounds, B)
-    v = nu.flatten(start_dim=1)
-    n = min(v.shape[-1], l.shape[-1])
-    if v.shape[-1] != l.shape[-1]:
-        l, u, v = l[..., :n], u[..., :n], v[..., :n]
+    """Batched smooth activation backward (sigmoid/tanh) with lazy M-broadcast.
 
+    Same broadcast pattern as :func:`dual_relu_backward`: relaxation
+    coefficients ``(k_lower, b_lower, k_upper, b_upper)`` depend on the
+    bounds only (spec-agnostic) and are computed once at ``[B, 1, n]``,
+    then broadcast against ``nu`` viewed at ``[B, M, n]``.
+
+    Args:
+        nu: dual variable, shape ``[B*M, *shape]``.
+        bounds: layer bounds, shape ``[B, *shape]``. NOT M-expanded.
+        func/dfunc: activation function and its derivative.
+        M: spec-row multiplicity (default 1).
+    """
+    BM = nu.shape[0]
+    assert BM % M == 0, f"dual_smooth_backward: nu batch {BM} not divisible by M={M}"
+    B = BM // M
+
+    v_flat = nu.flatten(start_dim=1)                              # [BM, n]
+    l_B = bounds.lb.flatten(start_dim=1) if bounds.lb.dim() >= 2 \
+          else bounds.lb.flatten().unsqueeze(0).expand(B, -1)
+    u_B = bounds.ub.flatten(start_dim=1) if bounds.ub.dim() >= 2 \
+          else bounds.ub.flatten().unsqueeze(0).expand(B, -1)
+    n = min(v_flat.shape[-1], l_B.shape[-1])
+    if v_flat.shape[-1] != l_B.shape[-1]:
+        v_flat = v_flat[..., :n]
+        l_B = l_B[..., :n]
+        u_B = u_B[..., :n]
+
+    l = l_B.unsqueeze(1)                                          # [B, 1, n]
+    u = u_B.unsqueeze(1)                                          # [B, 1, n]
     k_lower, b_lower, k_upper, b_upper = compute_smooth_relaxation(l, u, func, dfunc)
-    v_pos = v >= 0
-    k = torch.where(v_pos, k_lower, k_upper)
+
+    v = v_flat.view(B, M, n)                                      # [B, M, n] view
+    v_pos = v >= 0                                                # [B, M, n]
+    k = torch.where(v_pos, k_lower, k_upper)                      # broadcast → [B, M, n]
     b = torch.where(v_pos, b_lower, b_upper)
 
-    v_out = v * k                                                 # [B, n]
-    contrib = (v * b).sum(dim=-1)                                 # [B]
-    return v_out, contrib
+    v_out = v * k                                                 # [B, M, n]
+    contrib = (v * b).sum(dim=-1).view(BM)                        # [BM]
+    return v_out.view(BM, n), contrib
 
 
 # ---- SIGMOID ----
@@ -112,17 +136,18 @@ def forward_sigmoid(
 
 
 def backward_sigmoid(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                     preds: List[int]) -> Tuple[List[torch.Tensor], torch.Tensor]:
+                     preds: List[int], M: int = 1
+                     ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     bounds = bounds_dict.get(L.id)
     if bounds is None:
         raise ValueError(f"backward_sigmoid: layer {L.id} missing bounds in bounds_dict")
-    nu_out, contrib = dual_sigmoid_backward(nu, bounds)
+    nu_out, contrib = dual_sigmoid_backward(nu, bounds, M)
     assert len(preds) == 1, f"SIGMOID expects 1 predecessor, got {len(preds)}"
     return [nu_out], contrib
 
 
-def dual_sigmoid_backward(nu: torch.Tensor, bounds: Bounds):
-    return dual_smooth_backward(nu, bounds, sigmoid, dsigmoid)
+def dual_sigmoid_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1):
+    return dual_smooth_backward(nu, bounds, sigmoid, dsigmoid, M)
 
 
 # ---- TANH ----
@@ -147,14 +172,15 @@ def forward_tanh(
 
 
 def backward_tanh(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                  preds: List[int]) -> Tuple[List[torch.Tensor], torch.Tensor]:
+                  preds: List[int], M: int = 1
+                  ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     bounds = bounds_dict.get(L.id)
     if bounds is None:
         raise ValueError(f"backward_tanh: layer {L.id} missing bounds in bounds_dict")
-    nu_out, contrib = dual_tanh_backward(nu, bounds)
+    nu_out, contrib = dual_tanh_backward(nu, bounds, M)
     assert len(preds) == 1, f"TANH expects 1 predecessor, got {len(preds)}"
     return [nu_out], contrib
 
 
-def dual_tanh_backward(nu: torch.Tensor, bounds: Bounds):
-    return dual_smooth_backward(nu, bounds, tanh, dtanh)
+def dual_tanh_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1):
+    return dual_smooth_backward(nu, bounds, tanh, dtanh, M)

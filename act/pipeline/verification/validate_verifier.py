@@ -377,7 +377,7 @@ class VerificationValidator:
     _KNOWN_RUNTIME_BROKEN: Dict[Tuple[str, str], str] = {}
 
     # Spec kinds explicitly rejected by DualSolver.evaluate_spec.  Empty after
-    # Phase II β β': UNSAFE_LINEAR is now handled via per-row LB + ANY-escape
+    # UNSAFE_LINEAR is now handled via per-row LB + ANY-escape
     # aggregation (sound under-approximation; mirrors the interval/hybridz path
     # at `verifier.py:574-580`).  See `solver_dual.py:evaluate_spec` for the
     # quantifier-swap derivation.  This frozenset is retained as a pre-filter
@@ -389,9 +389,8 @@ class VerificationValidator:
     # handler to `backward_relu`, which is mathematically incorrect (LReLU has
     # a non-zero negative slope; ReLU's backward zeros that branch out).  This
     # produces over-tight dual lower bounds, leading to false-CERTIFIED on
-    # LReLU nets.  Tracked for fix in a follow-up PR (Phase III: dual solver
-    # optimization + BaB part).  Pre-filtered here so CI reports SKIPPED
-    # instead of FAILED on the soundness bug.
+    # LReLU nets.  Tracked for fix in a follow-up PR.  Pre-filtered here so
+    # CI reports SKIPPED instead of FAILED on the soundness bug.
     _DUAL_KNOWN_BROKEN_LAYER_KINDS: frozenset = frozenset({"LRELU"})
 
     def _network_supported_by_mode(
@@ -678,7 +677,7 @@ class VerificationValidator:
         logger.info(f"{'=' * 80}")
 
         # Wire up the requested solver / TF globally so verify_once() picks
-        # the matching code path.  After the Phase II β refactor, dual is a
+        # the matching code path.  Dual is a
         # Solver choice (set_solver_mode) rather than a TF mode; for LP-based
         # solvers we additionally pin the forward TF used for bounds.
         from act.back_end.transfer_functions import (
@@ -721,7 +720,7 @@ class VerificationValidator:
             elif known_broken:
                 skip_reason = (
                     f"DualSolver has a known soundness gap on "
-                    f"{', '.join(known_broken)} (deferred to Phase III)"
+                    f"{', '.join(known_broken)} (deferred to follow-up PR)"
                 )
             elif unsupported_specs:
                 skip_reason = (

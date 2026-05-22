@@ -46,12 +46,9 @@ class _SkipUnsupported(NamedTuple):
 
 
 def _make_solver(solver_name: str):
-    """Instantiate a solver backend by name.
-
-    ``dual`` is excluded here: DualSolver is the backward CROWN solver and
-    does NOT implement ``solve_batch`` (the LP-cascade contract). It is
-    routed via the ``is_dual_solver_active`` global in verify_once, not
-    through the LP-tier ``_make_solver`` factory.
+    """LP-cascade solver factory (gurobi / torchlp / auto). Dual is routed
+    separately via ``is_dual_solver_active`` since it implements
+    ``compute_certified_bound``, not ``solve_batch``.
     """
     from act.back_end.solver.solver_torchlp import TorchLPSolver
 
@@ -144,7 +141,7 @@ def _verify_one_net(
         any_unknown = any(r.status == VerifyStatus.UNKNOWN for r in results)
 
         # SOUNDNESS-CRITICAL: under --solver dual, verify_once already ran
-        # DualSolver.evaluate_spec (CROWN backward) — Tier-2 LP and Tier-3 BaB
+        # DualSolver.evaluate_spec (Wong-Kolter dual backward) — Tier-2 LP and Tier-3 BaB
         # would build under-constrained LPs (DualSolver does not produce LP-feed
         # ConSet entries; the forward analyze() pipeline is bypassed) and emit
         # spurious FALSIFIED. Do not remove this gate without first switching
@@ -847,7 +844,7 @@ Examples:
             "  'gurobi'  — commercial MILP/LP (license required).  LP cascade.\n"
             "  'torchlp' — PyTorch-tensor LP (Adam + penalty + box projection,\n"
             "              GPU-capable).  LP cascade.\n"
-            "  'dual'    — DualSolver, CROWN/Wong-Kolter certified bounds via\n"
+            "  'dual'    — DualSolver, Wong-Kolter dual certified bounds via\n"
             "              backward propagation.  No LP cascade (DualSolver is\n"
             "              its own verification pipeline).\n"
             "  'auto'    — try gurobi, fall back to torchlp.\n"
@@ -977,7 +974,7 @@ Examples:
         initialize_tf_mode(args.tf_mode)
 
     # Set the solver-mode global so verify_once / _verify_one_net can dispatch
-    # dual ↔ LP-cascade without consulting the TF mode (β refactor decoupled
+    # dual ↔ LP-cascade without consulting the TF mode (refactor decoupled
     # dual from the --tf-mode axis). Always set, so a previous process state
     # cannot leak across invocations.
     from act.back_end.transfer_functions import set_solver_mode

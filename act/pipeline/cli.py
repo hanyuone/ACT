@@ -575,19 +575,11 @@ def _run_torchvision_verify(args) -> None:
     ``TorchToACT`` → ``verify_once``.  Single-mode per invocation, matching
     the ``act.back_end --verify`` CLI contract.
 
-    Note on dual: TorchVision preprocessing resizes inputs to 224×224.  Our
-    CROWN backward currently materializes dense Jacobians per layer via
-    ``F.conv_transpose2d`` on [B*M, C, H, W] tensors and expands all
-    intermediate bounds up-front through ``expand_bounds_dict`` (see
-    ``act/back_end/solver/solver_dual.py:26``).  For B=16 batched samples,
-    M=9 spec rows, and a 13-layer 25M-param CNN this requests ~180 GB.
-    auto_LiRPA's reference CROWN avoids this via symbolic (A, b) coefficient
-    propagation + CROWN-Patch + sparse-unstable-only bounds.  Forward TFs
-    (interval, hybridz) work fine because they propagate only [B, *shape]
-    bounds (no M axis, no per-row Jacobian).  Until the dual backward gets
-    the auto_LiRPA-style refactor, ``--verify torchvision`` exposes interval
-    and hybridz only; use ``--verify vnnlib`` for dual coverage on small
-    inputs (see ``act/back_end/dual_tf/tf_cnn.py:91`` for the handler).
+    All three solvers (interval+torchlp, hybridz+torchlp, dual) are
+    supported on TorchVision smoke (MNIST + simple_cnn at 224×224). The
+    dual track auto-falls back to interval-only at layers whose input
+    dim exceeds ``_DENSE_LIN_BOUND_MAX_DIM`` (see ``tf_forward.py``) to
+    avoid materializing the dense linear-bound matrix at high dims.
     """
     from act.front_end.torchvision_loader.create_specs import TorchVisionSpecCreator
     from act.front_end.model_synthesis import synthesize_models_from_specs
@@ -868,9 +860,9 @@ Examples:
   python -m act.pipeline --verify vnnlib --category acasxu_2023 --max-instances 3                          --solvers dual
 
   # Run verifier on a TorchVision dataset-model pair end-to-end.
-  # (dual not supported: 224×224 inputs make CROWN backward exceed CPU memory.)
   python -m act.pipeline --verify torchvision --dataset MNIST --model simple_cnn --num-samples 2 --tf-modes interval --solvers torchlp
   python -m act.pipeline --verify torchvision --dataset MNIST --model simple_cnn --num-samples 2 --tf-modes hybridz  --solvers torchlp
+  python -m act.pipeline --verify torchvision --dataset MNIST --model simple_cnn --num-samples 2                     --solvers dual
   
   # Run verifier validation (comprehensive by default)
   python -m act.pipeline --validate-verifier --device cpu --dtype float64

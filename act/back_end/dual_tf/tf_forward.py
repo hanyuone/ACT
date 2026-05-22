@@ -32,37 +32,73 @@ from act.util.device_manager import get_default_device, get_default_dtype
 
 @dataclass
 class LinearBound:
-    A_lb: torch.Tensor
+    A_lb: Optional[torch.Tensor]
     b_lb: torch.Tensor
-    A_ub: torch.Tensor
+    A_ub: Optional[torch.Tensor]
     b_ub: torch.Tensor
 
 Frame = Tuple[torch.Tensor, torch.Tensor]  # (x_L, x_U) over which lin is defined
 
 
+# Above this layer input dim, ``_fwd_X`` returns ``None`` to skip the
+# dense linear-bound A matrix; caller ``forward_X`` falls back to
+# interval-only via ``_box_X`` + ``_reset_forward_box``. Sound (interval
+# is always sound), looser bounds at the bailed layer.
+_DENSE_LIN_BOUND_MAX_DIM: int = 10_000
+
+
 def _concretize(lin: LinearBound, x_L: torch.Tensor, x_U: torch.Tensor
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Concretize dual-track affine bounds over a batched input box."""
-    A_lb_p = lin.A_lb.clamp(min=0)
-    A_lb_n = lin.A_lb.clamp(max=0)
-    A_ub_p = lin.A_ub.clamp(min=0)
-    A_ub_n = lin.A_ub.clamp(max=0)
-    lb = (
-        torch.einsum("boi,bi->bo", A_lb_p, x_L)
-        + torch.einsum("boi,bi->bo", A_lb_n, x_U)
-        + lin.b_lb
-    )
-    ub = (
-        torch.einsum("boi,bi->bo", A_ub_p, x_U)
-        + torch.einsum("boi,bi->bo", A_ub_n, x_L)
-        + lin.b_ub
-    )
+    """Concretize dual-track affine bounds over a batched input box.
+
+    Lazy identity: when ``A_lb is None`` the affine bound is the identity,
+    so ``lb = x_L + b_lb`` (and analogously for ub). This avoids materializing
+    a dense ``[B, n, n]`` eye matrix at the INPUT layer, which for 224×224×3
+    input would request 181 GB.
+    """
+    n_x = x_L.shape[1]
+    if lin.A_lb is None:
+        b_lb = lin.b_lb
+        if b_lb.shape[1] != n_x:
+            n_b = min(b_lb.shape[1], n_x)
+            lb = x_L[..., :n_b] + b_lb[..., :n_b]
+        else:
+            lb = x_L + b_lb
+    else:
+        A_lb_p = lin.A_lb.clamp(min=0)
+        A_lb_n = lin.A_lb.clamp(max=0)
+        lb = (
+            torch.einsum("boi,bi->bo", A_lb_p, x_L)
+            + torch.einsum("boi,bi->bo", A_lb_n, x_U)
+            + lin.b_lb
+        )
+    if lin.A_ub is None:
+        b_ub = lin.b_ub
+        if b_ub.shape[1] != n_x:
+            n_b = min(b_ub.shape[1], n_x)
+            ub = x_U[..., :n_b] + b_ub[..., :n_b]
+        else:
+            ub = x_U + b_ub
+    else:
+        A_ub_p = lin.A_ub.clamp(min=0)
+        A_ub_n = lin.A_ub.clamp(max=0)
+        ub = (
+            torch.einsum("boi,bi->bo", A_ub_p, x_U)
+            + torch.einsum("boi,bi->bo", A_ub_n, x_L)
+            + lin.b_ub
+        )
     return lb, ub
 
 def _identity_lin(B: int, n: int, device, dtype) -> LinearBound:
-    eye = torch.eye(n, device=device, dtype=dtype).unsqueeze(0).expand(B, n, n).contiguous()
+    """Identity ``LinearBound`` over n features.
+
+    Lazy identity: A_lb / A_ub are returned as ``None`` (sentinel for
+    identity). Materializing ``torch.eye(n)`` for 224×224×3 input = 181 GB
+    OOM-killed the verifier; the sentinel avoids it entirely. Downstream
+    ``_fwd_X`` helpers and ``_concretize`` recognise None as identity.
+    """
     zeros = torch.zeros(B, n, device=device, dtype=dtype)
-    return LinearBound(A_lb=eye, b_lb=zeros, A_ub=eye.clone(), b_ub=zeros.clone())
+    return LinearBound(A_lb=None, b_lb=zeros, A_ub=None, b_ub=zeros.clone())
 
 def _reset_lin(lb: torch.Tensor, ub: torch.Tensor, device, dtype
                ) -> Tuple[LinearBound, torch.Tensor, torch.Tensor]:
@@ -70,12 +106,38 @@ def _reset_lin(lb: torch.Tensor, ub: torch.Tensor, device, dtype
     return _identity_lin(B, n, device, dtype), lb.clone(), ub.clone()
 
 def _match_lin_input_dim(lin: LinearBound, n_in: int) -> LinearBound:
-    """Pad or truncate the current output-feature axis to size n_in."""
-    curr_out = lin.A_lb.shape[1]
+    """Pad or truncate the current output-feature axis to size n_in.
+
+    Invariant: ``A_lb`` and ``A_ub`` are paired — either both ``None``
+    (identity sentinel) or both ``Tensor``. We check both for explicit
+    type narrowing.
+    """
+    if lin.A_lb is None or lin.A_ub is None:
+        curr_out = lin.b_lb.shape[1]
+    else:
+        curr_out = lin.A_lb.shape[1]
     if curr_out == n_in:
         return lin
 
-    B, _, input_dim = lin.A_lb.shape
+    B = lin.b_lb.shape[0]
+    if lin.A_lb is None or lin.A_ub is None:
+        if curr_out < n_in:
+            pad = n_in - curr_out
+            zeros_b = torch.zeros(B, pad, device=lin.b_lb.device, dtype=lin.b_lb.dtype)
+            return LinearBound(
+                A_lb=None,
+                b_lb=torch.cat([lin.b_lb, zeros_b], dim=1),
+                A_ub=None,
+                b_ub=torch.cat([lin.b_ub, zeros_b.clone()], dim=1),
+            )
+        return LinearBound(
+            A_lb=None,
+            b_lb=lin.b_lb[:, :n_in],
+            A_ub=None,
+            b_ub=lin.b_ub[:, :n_in],
+        )
+
+    input_dim = lin.A_lb.shape[2]
     if curr_out < n_in:
         pad = n_in - curr_out
         zeros_A = torch.zeros(B, pad, input_dim, device=lin.A_lb.device, dtype=lin.A_lb.dtype)
@@ -216,11 +278,42 @@ def _sum_interval_bounds(boxes: List[Bounds]) -> Bounds:
 
 
 def _sum_linear_bounds(lins: List[LinearBound]) -> LinearBound:
-    """Sum dual-track affine bounds from multiple predecessors."""
+    """Sum dual-track affine bounds from multiple predecessors.
+
+    Lazy identity: ``A = None`` denotes identity. Summing identities is
+    a diagonal=k·I matrix; we still materialize only when at least one
+    predecessor has a non-None A (i.e. is no longer identity). If all are
+    None, result remains None (single-identity case is impossible because
+    callers only sum from >=2 predecessors).
+    """
+    A_lbs = [lin.A_lb for lin in lins]
+    A_ubs = [lin.A_ub for lin in lins]
+
+    def _materialize(A: Optional[torch.Tensor], example: torch.Tensor) -> torch.Tensor:
+        if A is not None:
+            return A
+        B, n = example.shape
+        eye = torch.eye(n, device=example.device, dtype=example.dtype)
+        return eye.unsqueeze(0).expand(B, n, n)
+
+    if all(A is None for A in A_lbs):
+        A_lb_sum = None
+    else:
+        any_real = next(A for A in A_lbs if A is not None)
+        A_lb_sum = sum((_materialize(A, lins[i].b_lb) for i, A in enumerate(A_lbs[1:], 1)),
+                       _materialize(A_lbs[0], lins[0].b_lb))
+
+    if all(A is None for A in A_ubs):
+        A_ub_sum = None
+    else:
+        any_real = next(A for A in A_ubs if A is not None)
+        A_ub_sum = sum((_materialize(A, lins[i].b_ub) for i, A in enumerate(A_ubs[1:], 1)),
+                       _materialize(A_ubs[0], lins[0].b_ub))
+
     return LinearBound(
-        A_lb=sum((lin.A_lb for lin in lins[1:]), lins[0].A_lb),
+        A_lb=A_lb_sum,
         b_lb=sum((lin.b_lb for lin in lins[1:]), lins[0].b_lb),
-        A_ub=sum((lin.A_ub for lin in lins[1:]), lins[0].A_ub),
+        A_ub=A_ub_sum,
         b_ub=sum((lin.b_ub for lin in lins[1:]), lins[0].b_ub),
     )
 
@@ -322,16 +415,38 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
     return bounds_dict
 
 
-def _fwd_dense(layer: Layer, lin: LinearBound) -> LinearBound:
-    """Compose dual-track affine bounds through a dense layer."""
+def _fwd_dense(layer: Layer, lin: LinearBound) -> Optional[LinearBound]:
+    """Compose dual-track affine bounds through a dense layer.
+
+    Lazy identity: if input ``A_lb`` is None (identity), output A would
+    be ``W`` broadcast to ``[B, out_c, in_c]``. For wide DENSE layers
+    (e.g. simple_cnn FC1 with in_c=200704), this allocates several GB
+    transiently (W_broadcast_lb, W_broadcast_ub, W_pos, W_neg). When
+    ``in_c > _DENSE_LIN_BOUND_MAX_DIM``, we return ``None`` instead, signalling
+    the caller to fall back to interval-only forward via
+    :func:`_reset_forward_box`. Same pattern as :func:`_fwd_conv2d` and
+    :func:`_fwd_relu`.
+    """
     W = layer.params["weight"]
     b = layer.params.get("bias")
     lin = _match_lin_input_dim(lin, W.shape[1])
     W_pos = W.clamp(min=0)
     W_neg = W.clamp(max=0)
+    B = lin.b_lb.shape[0]
     bias_vec = torch.zeros(W.shape[0], device=lin.b_lb.device, dtype=lin.b_lb.dtype)
     if b is not None:
         bias_vec = _align(b.flatten(), W.shape[0])
+
+    if lin.A_lb is None and lin.A_ub is None:
+        if W.shape[1] > _DENSE_LIN_BOUND_MAX_DIM:
+            return None
+        W_broadcast_lb = W.unsqueeze(0).expand(B, -1, -1).contiguous()
+        W_broadcast_ub = W.unsqueeze(0).expand(B, -1, -1).contiguous()
+        b_lb_new = torch.einsum("oc,bc->bo", W_pos, lin.b_lb) + torch.einsum("oc,bc->bo", W_neg, lin.b_ub) + bias_vec
+        b_ub_new = torch.einsum("oc,bc->bo", W_pos, lin.b_ub) + torch.einsum("oc,bc->bo", W_neg, lin.b_lb) + bias_vec
+        return LinearBound(A_lb=W_broadcast_lb, b_lb=b_lb_new,
+                           A_ub=W_broadcast_ub, b_ub=b_ub_new)
+
     return LinearBound(
         A_lb=torch.einsum("oc,bci->boi", W_pos, lin.A_lb) + torch.einsum("oc,bci->boi", W_neg, lin.A_ub),
         b_lb=torch.einsum("oc,bc->bo", W_pos, lin.b_lb) + torch.einsum("oc,bc->bo", W_neg, lin.b_ub) + bias_vec,
@@ -340,8 +455,18 @@ def _fwd_dense(layer: Layer, lin: LinearBound) -> LinearBound:
     )
 
 
-def _fwd_relu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor) -> LinearBound:
-    """Apply forward ReLU linear relaxation with per-batch alpha choice."""
+def _fwd_relu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor
+              ) -> Optional[LinearBound]:
+    """Apply forward ReLU linear relaxation with per-batch alpha choice.
+
+    Lazy identity: if input A is None (identity), output A becomes a
+    diagonal scaling matrix (alpha or up_slope on the diagonal). For high-dim
+    inputs this would materialize a sparse-on-diagonal dense tensor — we
+    return ``None`` instead, signalling the caller to fall back to
+    interval-only forward via :func:`_reset_forward_box`. ReLU after INPUT
+    is rare in practice (networks start with DENSE/CONV); the common case
+    (RELU after DENSE/CONV) hits the second branch with a materialized A_lb.
+    """
     on = lb >= 0
     off = ub <= 0
     amb = ~(on | off)
@@ -357,6 +482,21 @@ def _fwd_relu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor) -> LinearBou
         (up_slope > 0.5).to(lb.dtype),
         torch.where(on, torch.ones_like(lb), torch.zeros_like(lb)),
     )
+
+    if lin.A_lb is None or lin.A_ub is None:
+        B, n = lb.shape
+        if n > _DENSE_LIN_BOUND_MAX_DIM:
+            return None
+        eye = torch.eye(n, device=lb.device, dtype=lb.dtype).unsqueeze(0).expand(B, n, n)
+        A_lb_in = lin.A_lb if lin.A_lb is not None else eye
+        A_ub_in = lin.A_ub if lin.A_ub is not None else eye
+        return LinearBound(
+            A_lb=alpha.unsqueeze(-1) * A_lb_in,
+            b_lb=alpha * lin.b_lb,
+            A_ub=up_slope.unsqueeze(-1) * A_ub_in,
+            b_ub=up_slope * lin.b_ub + up_inter,
+        )
+
     return LinearBound(
         A_lb=alpha.unsqueeze(-1) * lin.A_lb,
         b_lb=alpha * lin.b_lb,
@@ -366,7 +506,11 @@ def _fwd_relu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor) -> LinearBou
 
 
 def _fwd_bias(layer: Layer, lin: LinearBound) -> LinearBound:
-    """Compose dual-track affine bounds through a bias layer."""
+    """Compose dual-track affine bounds through a bias layer.
+
+    Bias is purely additive on b, so A_lb / A_ub pass through unchanged —
+    including the None (identity) sentinel.
+    """
     c = _align(layer.params["c"], lin.b_lb.shape[1])
     return LinearBound(
         A_lb=lin.A_lb,
@@ -377,12 +521,29 @@ def _fwd_bias(layer: Layer, lin: LinearBound) -> LinearBound:
 
 
 def _fwd_scale(layer: Layer, lin: LinearBound) -> LinearBound:
-    """Compose dual-track affine bounds through an element-wise scale."""
+    """Compose dual-track affine bounds through an element-wise scale.
+
+    Lazy identity: SCALE following INPUT is rare; if input A is None,
+    materialize a diagonal eye·a representation. Common case (SCALE after
+    DENSE/CONV) hits the second branch with materialized A_lb.
+    """
     a = _align(layer.params["a"], lin.b_lb.shape[1])
     a_pos = a.clamp(min=0)
     a_neg = a.clamp(max=0)
     a_pos_A = a_pos.view(1, -1, 1)
     a_neg_A = a_neg.view(1, -1, 1)
+
+    if lin.A_lb is None or lin.A_ub is None:
+        B, n = lin.b_lb.shape
+        eye = torch.eye(n, device=lin.b_lb.device, dtype=lin.b_lb.dtype).unsqueeze(0).expand(B, n, n)
+        A_lb_in = lin.A_lb if lin.A_lb is not None else eye
+        A_ub_in = lin.A_ub if lin.A_ub is not None else eye
+        return LinearBound(
+            A_lb=a_pos_A * A_lb_in + a_neg_A * A_ub_in,
+            b_lb=a_pos * lin.b_lb + a_neg * lin.b_ub,
+            A_ub=a_pos_A * A_ub_in + a_neg_A * A_lb_in,
+            b_ub=a_pos * lin.b_ub + a_neg * lin.b_lb,
+        )
     return LinearBound(
         A_lb=a_pos_A * lin.A_lb + a_neg_A * lin.A_ub,
         b_lb=a_pos * lin.b_lb + a_neg * lin.b_ub,
@@ -392,13 +553,28 @@ def _fwd_scale(layer: Layer, lin: LinearBound) -> LinearBound:
 
 
 def _fwd_bn(layer: Layer, lin: LinearBound) -> LinearBound:
-    """Compose dual-track affine bounds through batch normalization."""
+    """Compose dual-track affine bounds through batch normalization.
+
+    Lazy identity: BN following INPUT (rare) materializes diagonal.
+    """
     A_bn = _align(layer.params["A"], lin.b_lb.shape[1])
     c = _align(layer.params["c"], lin.b_lb.shape[1])
     A_pos = A_bn.clamp(min=0)
     A_neg = A_bn.clamp(max=0)
     A_pos_A = A_pos.view(1, -1, 1)
     A_neg_A = A_neg.view(1, -1, 1)
+
+    if lin.A_lb is None or lin.A_ub is None:
+        B, n = lin.b_lb.shape
+        eye = torch.eye(n, device=lin.b_lb.device, dtype=lin.b_lb.dtype).unsqueeze(0).expand(B, n, n)
+        A_lb_in = lin.A_lb if lin.A_lb is not None else eye
+        A_ub_in = lin.A_ub if lin.A_ub is not None else eye
+        return LinearBound(
+            A_lb=A_pos_A * A_lb_in + A_neg_A * A_ub_in,
+            b_lb=A_pos * lin.b_lb + A_neg * lin.b_ub + c,
+            A_ub=A_pos_A * A_ub_in + A_neg_A * A_lb_in,
+            b_ub=A_pos * lin.b_ub + A_neg * lin.b_lb + c,
+        )
     return LinearBound(
         A_lb=A_pos_A * lin.A_lb + A_neg_A * lin.A_ub,
         b_lb=A_pos * lin.b_lb + A_neg * lin.b_ub + c,
@@ -408,7 +584,10 @@ def _fwd_bn(layer: Layer, lin: LinearBound) -> LinearBound:
 
 
 def _fwd_lrelu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor, alpha: float) -> LinearBound:
-    """Apply forward triangle linear relaxation for LeakyReLU."""
+    """Apply forward triangle linear relaxation for LeakyReLU.
+
+    Lazy identity: LReLU after INPUT (rare) materializes diagonal.
+    """
     on = lb >= 0
     off = ub <= 0
     amb = ~(on | off)
@@ -421,6 +600,18 @@ def _fwd_lrelu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor, alpha: floa
     )
     up_inter = torch.where(amb, alpha * lb - up_slope * lb, torch.zeros_like(lb))
     low_slope = torch.where(on, torch.ones_like(lb), alpha_tensor)
+
+    if lin.A_lb is None or lin.A_ub is None:
+        B, n = lb.shape
+        eye = torch.eye(n, device=lb.device, dtype=lb.dtype).unsqueeze(0).expand(B, n, n)
+        A_lb_in = lin.A_lb if lin.A_lb is not None else eye
+        A_ub_in = lin.A_ub if lin.A_ub is not None else eye
+        return LinearBound(
+            A_lb=low_slope.unsqueeze(-1) * A_lb_in,
+            b_lb=low_slope * lin.b_lb,
+            A_ub=up_slope.unsqueeze(-1) * A_ub_in,
+            b_ub=up_slope * lin.b_ub + up_inter,
+        )
     return LinearBound(
         A_lb=low_slope.unsqueeze(-1) * lin.A_lb,
         b_lb=low_slope * lin.b_lb,
@@ -446,6 +637,18 @@ def _fwd_conv2d(layer: Layer, lin: LinearBound) -> Optional[LinearBound]:
 
     out_c, in_c_per_g, _, _ = weight.shape
     in_c = in_c_per_g * groups
+
+    if lin.A_lb is None or lin.A_ub is None:
+        B, curr_dim = lin.b_lb.shape
+        if curr_dim > _DENSE_LIN_BOUND_MAX_DIM:
+            return None
+        device, dtype = lin.b_lb.device, lin.b_lb.dtype
+        eye = torch.eye(curr_dim, device=device, dtype=dtype).unsqueeze(0).expand(B, curr_dim, curr_dim)
+        A_lb_in = lin.A_lb if lin.A_lb is not None else eye
+        A_ub_in = lin.A_ub if lin.A_ub is not None else eye
+        lin = LinearBound(A_lb=A_lb_in, b_lb=lin.b_lb,
+                          A_ub=A_ub_in, b_ub=lin.b_ub)
+
     B, curr_dim, input_dim = lin.A_lb.shape
 
     in_h = in_w = 0

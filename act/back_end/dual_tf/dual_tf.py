@@ -3,8 +3,8 @@
 # Copyright (C) 2025- ACT Team
 # Licensed under AGPLv3+; distributed without warranty.
 #===---------------------------------------------------------------------===#
-# DualTF: backward-kernel registry holder. Not a TransferFunction (β refactor
-# moved dual from --tf-mode to --solver). Instantiated internally by
+# DualTF: backward-kernel registry holder. Not a TransferFunction — dual is a
+# --solver choice, not a --tf-mode. Instantiated internally by
 # act.back_end.solver.solver_dual.DualSolver.
 #===---------------------------------------------------------------------===#
 
@@ -89,7 +89,8 @@ def forward_add(
 
 
 def backward_add(L: Layer, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                 preds: List[int]) -> Tuple[List[torch.Tensor], torch.Tensor]:
+                 preds: List[int], M: int = 1
+                 ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     """ADD backward: identity skip — same ν routed to every predecessor.
 
     Bias contrib uses negative sign to match dual_bias_backward / dual_bn_backward
@@ -146,7 +147,7 @@ def forward_concat(
     return out, out, lin, frame
 
 
-def backward_concat(L, nu, bounds_dict, preds):
+def backward_concat(L, nu, bounds_dict, preds, M: int = 1):
     """CONCAT backward. (Pending)
     Will require: concat_dim parameter to split nu into per-predecessor slices.
     """
@@ -156,11 +157,9 @@ def backward_concat(L, nu, bounds_dict, preds):
 class DualTF:
     """Backward-kernel registry holder for the dual solver.
 
-    Previously a ``TransferFunction`` activated by ``--tf-mode dual``; that
-    framing was misleading because ``apply()`` returned an empty ConSet by
-    design (dual semantics live in DualSolver's backward pass, not in
-    propagated LP constraints). β refactor demotes this to a plain holder
-    of three registries:
+    Holder of three registries (forward, backward, unimplemented). Dual
+    semantics live in DualSolver's backward pass, not in propagated LP
+    constraints, so this class is intentionally NOT a TransferFunction.
 
       * ``_FORWARD_REGISTRY`` — per-kind forward dispatch consumed by
         ``compute_forward_bounds`` (still a real forward computation, but
@@ -256,12 +255,9 @@ class DualTF:
         LayerKind.MHA_JOIN.value,
         LayerKind.MASK_ADD.value,
         # Backward kernels for these are stubs that raise NotImplementedError
-        # at runtime (see tf_cnn.backward_maxpool2d / backward_avgpool2d and
-        # dual_tf.backward_concat). Exclude them here so supports_layer ==
-        # False and upstream callers (validate_verifier, --verify-all) skip
-        # affected nets cleanly instead of surfacing runtime ERROR.
-        LayerKind.MAXPOOL2D.value,
-        LayerKind.AVGPOOL2D.value,
+        # at runtime. Listing them here makes supports_layer return False so
+        # upstream callers (validate_verifier) cleanly SKIP affected nets
+        # instead of surfacing runtime ERROR.
         LayerKind.CONCAT.value,
     })
 
@@ -279,7 +275,7 @@ _FORWARD_STUBS = frozenset({
     forward_layernorm, forward_gelu,
 })
 _BACKWARD_STUBS = frozenset({
-    backward_maxpool2d, backward_avgpool2d, backward_concat,
+    backward_concat,
     backward_lstm, backward_gru, backward_attention,
     backward_layernorm, backward_gelu,
 })

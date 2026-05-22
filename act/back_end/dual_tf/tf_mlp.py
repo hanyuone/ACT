@@ -31,22 +31,14 @@ from .tf_forward import (
 )
 
 
-# ==========================================================================
-# Forward dispatch handlers (uniform signature per plan §4.2):
-#   (L, parent_boxes, parent_lins, parent_frames, preds,
-#    post_activation, device, dtype) -> (stored, out, lin, frame)
+# Forward handlers: (L, parent_boxes, parent_lins, parent_frames, preds,
+#   post_activation, device, dtype) -> (stored, out, lin, frame).
+#   `parent_*` are parallel lists indexed by `preds`; unary handlers read [0].
 #
-# `parent_*` are parallel lists indexed by `preds`; unary handlers read [0].
-# Function bodies are ported verbatim from the monolithic if/elif chain in
-# tf_forward.compute_forward_bounds (pre-refactor; see source line ranges in
-# each docstring). Driver still uses if/elif in Wave 2 — these are declared
-# but not yet registered (registration lands in Wave 4 / Step D).
-# ==========================================================================
-# Dispatch functions : (L, nu, bounds_dict, preds) -> (pred_nus, contrib)
-# Each pred_nus[i] is the ν routed to predecessor preds[i]. Unary layers
-# (DENSE, RELU, BIAS, SCALE, BN) return [nu_out]. backward_identity handles
-# both 0-pred (pure INPUT) and 1-pred (FLATTEN/RESHAPE/…) cases.
-# ==========================================================================
+# Backward handlers: (L, nu, bounds_dict, preds, M=1) -> (pred_nus, contrib).
+#   Each pred_nus[i] is the ν routed to predecessor preds[i]. Unary layers
+#   (DENSE, RELU, BIAS, SCALE, BN) return [nu_out]. backward_identity handles
+#   both 0-pred (pure INPUT) and 1-pred (FLATTEN/RESHAPE/…) cases.
 
 
 # ---- HELPERS ----
@@ -55,14 +47,6 @@ def _align(a: torch.Tensor, n: int) -> torch.Tensor:
     if a.numel() == n: return a.flatten()
     elif a.numel() > n: return a.flatten()[:n]
     else: return a.flatten().repeat((n + a.numel() - 1) // a.numel())[:n]
-
-
-def _batch_flatten_bounds(bounds: Bounds, B: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return lb, ub as [B, n]. If bounds are unbatched, broadcast to B."""
-    if bounds.lb.dim() >= 2:
-        return bounds.lb.flatten(start_dim=1), bounds.ub.flatten(start_dim=1)
-    return (bounds.lb.flatten().unsqueeze(0).expand(B, -1),
-            bounds.ub.flatten().unsqueeze(0).expand(B, -1))
 
 
 # ---- IDENTITY ----
@@ -89,7 +73,8 @@ def forward_identity(
 
 
 def backward_identity(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                      preds: List[int]) -> Tuple[List[torch.Tensor], torch.Tensor]:
+                      preds: List[int], M: int = 1
+                      ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     nu_out, contrib = dual_identity_backward(nu)
     # 0 preds (pure INPUT) -> []; 1 pred (FLATTEN/RESHAPE/…) -> [nu_out].
     return [nu_out] * len(preds), contrib
@@ -152,17 +137,25 @@ def forward_dense(
     parent_frame = parent_frames[0]
     x_L, x_U = parent_frame
     prev_lb, prev_ub = parent_box.lb, parent_box.ub
-    lin = _fwd_dense(L, parent_lin)
-    crown_lb, crown_ub = _concretize(lin, x_L, x_U)
+    new_lin = _fwd_dense(L, parent_lin)
     int_lb, int_ub = _box_dense(L, prev_lb, prev_ub)
-    lb, ub = _intersect_boxes(crown_lb, crown_ub, int_lb, int_ub)
+    if new_lin is None:
+        lb, ub = int_lb, int_ub
+        out = Bounds(lb, ub)
+        stored = out
+        lin, frame = _reset_forward_box(lb, ub, device, dtype)
+        return stored, out, lin, frame
+    lin = new_lin
+    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
+    lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
     out = Bounds(lb, ub)
     stored = out
     return stored, out, lin, parent_frame
 
 
 def backward_dense(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                   preds: List[int]) -> Tuple[List[torch.Tensor], torch.Tensor]:
+                   preds: List[int], M: int = 1
+                   ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     nu_out, contrib = dual_dense_backward(nu, L.params["weight"], L.params.get("bias"))
     assert len(preds) == 1, f"DENSE expects 1 predecessor, got {len(preds)}"
     return [nu_out], contrib
@@ -219,10 +212,17 @@ def forward_relu(
     parent_frame = parent_frames[0]
     x_L, x_U = parent_frame
     pre_lb, pre_ub = parent_box.lb, parent_box.ub
-    lin = _fwd_relu(parent_lin, pre_lb, pre_ub)
-    crown_lb, crown_ub = _concretize(lin, x_L, x_U)
+    new_lin = _fwd_relu(parent_lin, pre_lb, pre_ub)
     int_lb, int_ub = _box_relu(pre_lb, pre_ub)
-    lb, ub = _intersect_boxes(crown_lb, crown_ub, int_lb, int_ub)
+    if new_lin is None:
+        lb, ub = int_lb, int_ub
+        out = Bounds(lb, ub)
+        stored = out
+        lin, frame = _reset_forward_box(lb, ub, device, dtype)
+        return stored, out, lin, frame
+    lin = new_lin
+    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
+    lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
     out = Bounds(lb, ub)
     stored = out if post_activation else Bounds(pre_lb, pre_ub)
     frame = parent_frame
@@ -256,9 +256,9 @@ def forward_lrelu(
     pre_lb, pre_ub = parent_box.lb, parent_box.ub
     alpha = L.params.get("alpha", 0.01)
     lin = _fwd_lrelu(parent_lin, pre_lb, pre_ub, alpha)
-    crown_lb, crown_ub = _concretize(lin, x_L, x_U)
+    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
     int_lb, int_ub = _box_lrelu(pre_lb, pre_ub, alpha)
-    lb, ub = _intersect_boxes(crown_lb, crown_ub, int_lb, int_ub)
+    lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
     out = Bounds(lb, ub)
     stored = out if post_activation else Bounds(pre_lb, pre_ub)
     frame = parent_frame
@@ -268,43 +268,74 @@ def forward_lrelu(
 
 
 def backward_relu(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                  preds: List[int]) -> Tuple[List[torch.Tensor], torch.Tensor]:
+                  preds: List[int], M: int = 1
+                  ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     bounds = bounds_dict.get(L.id)
     if bounds is None:
         raise ValueError(f"backward_relu: layer {L.id} missing bounds in bounds_dict")
-    nu_out, contrib = dual_relu_backward(nu, bounds)
+    nu_out, contrib = dual_relu_backward(nu, bounds, M)
     assert len(preds) == 1, f"RELU expects 1 predecessor, got {len(preds)}"
     return [nu_out], contrib
 
 
-def dual_relu_backward(nu: torch.Tensor, bounds: Bounds
+def dual_relu_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1
                        ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Batched ReLU backward with fixed upper slope.
 
-    nu : [B, *shape] -> v_out: [B, *shape_or_flat], contrib: [B].
+    Lazy M-broadcast: ``bounds`` is at ``[B, *shape]`` (spec-agnostic) and
+    ``nu`` is at ``[B*M, *shape]`` (M-expanded by output spec rows). The
+    slope ``d[b, m, i] = ub[b,i] / (ub[b,i] - lb[b,i])`` is independent of
+    ``m`` (forward bounds depend only on the input box, not the spec C),
+    so we view ``nu`` as ``[B, M, n]`` and broadcast bounds ``[B, 1, n]``
+    against it — bit-identical to legacy M-expanded path, zero copies of
+    the bounds tensor.
+
+    Args:
+        nu: dual variable, shape ``[B*M, *shape]``. Sample-major packing:
+            row ``b*M+m`` carries the m-th spec row's contribution for
+            sample b.
+        bounds: layer bounds, shape ``[B, *shape]``. NOT M-expanded.
+        M: number of spec rows packed into nu's batch axis. Default 1
+            (legacy behaviour: nu and bounds share batch dim B).
+
+    Returns:
+        v_out: ``[B*M, n]`` propagated dual var (flattened).
+        contrib: ``[B*M]`` per-row contribution from crossing penalty.
     """
-    B = nu.shape[0]
-    l, u = _batch_flatten_bounds(bounds, B)
-    v = nu.flatten(start_dim=1)
-    n = min(v.shape[-1], l.shape[-1])
-    if v.shape[-1] != l.shape[-1]:
-        l, u, v = l[..., :n], u[..., :n], v[..., :n]
-    assert (l <= u).all(), "Invalid bounds: l > u"
+    BM = nu.shape[0]
+    assert BM % M == 0, f"dual_relu_backward: nu batch {BM} not divisible by M={M}"
+    B = BM // M
 
-    on, off, amb = get_relu_masks(l, u)
-    d = torch.zeros_like(l)
-    d = torch.where(on, torch.ones_like(d), d)
-    if amb.any():
-        denom = (u - l).clamp(min=1e-12)
-        d = torch.where(amb, u / denom, d)
+    v_flat = nu.flatten(start_dim=1)                             # [BM, n]
+    l_B = bounds.lb.flatten(start_dim=1)                         # [B,  n]
+    u_B = bounds.ub.flatten(start_dim=1)                         # [B,  n]
+    n = min(v_flat.shape[-1], l_B.shape[-1])
+    if v_flat.shape[-1] != l_B.shape[-1]:
+        v_flat = v_flat[..., :n]
+        l_B = l_B[..., :n]
+        u_B = u_B[..., :n]
+    assert (l_B <= u_B).all(), "Invalid bounds: l > u"
 
-    v_out = d * v                                                # [B, n]
+    v = v_flat.view(B, M, n)                                     # view, no copy
+    l = l_B.unsqueeze(1)                                         # [B, 1, n]
+    u = u_B.unsqueeze(1)                                         # [B, 1, n]
+
+    on, off, amb = get_relu_masks(l, u)                          # [B, 1, n] each
+    d = torch.zeros_like(v)                                      # [B, M, n]
+    d = torch.where(on, torch.ones_like(d), d)                   # broadcast on
     if amb.any():
-        crossing = torch.where(amb, v_out.clamp(min=0) * l, torch.zeros_like(l))
-        contrib = crossing.sum(dim=-1)                           # [B]
+        denom = (u - l).clamp(min=1e-12)                         # [B, 1, n]
+        d = torch.where(amb, u / denom, d)                       # broadcast amb
+
+    v_out = d * v                                                # [B, M, n]
+
+    if amb.any():
+        crossing = torch.where(amb, v_out.clamp(min=0) * l,
+                               torch.zeros_like(v_out))          # [B, M, n]
+        contrib = crossing.sum(dim=-1).view(BM)                  # [BM]
     else:
-        contrib = torch.zeros(B, dtype=nu.dtype, device=nu.device)
-    return v_out, contrib
+        contrib = torch.zeros(BM, dtype=nu.dtype, device=nu.device)
+    return v_out.view(BM, n), contrib
 
 
 # ---- BIAS ----
@@ -329,16 +360,17 @@ def forward_bias(
     x_L, x_U = parent_frame
     prev_lb, prev_ub = parent_box.lb, parent_box.ub
     lin = _fwd_bias(L, parent_lin)
-    crown_lb, crown_ub = _concretize(lin, x_L, x_U)
+    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
     int_lb, int_ub = _box_bias(L, prev_lb, prev_ub)
-    lb, ub = _intersect_boxes(crown_lb, crown_ub, int_lb, int_ub)
+    lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
     out = Bounds(lb, ub)
     stored = out
     return stored, out, lin, parent_frame
 
 
 def backward_bias(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                  preds: List[int]) -> Tuple[List[torch.Tensor], torch.Tensor]:
+                  preds: List[int], M: int = 1
+                  ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     nu_out, contrib = dual_bias_backward(nu, L.params["c"])
     assert len(preds) == 1, f"BIAS expects 1 predecessor, got {len(preds)}"
     return [nu_out], contrib
@@ -375,16 +407,17 @@ def forward_scale(
     x_L, x_U = parent_frame
     prev_lb, prev_ub = parent_box.lb, parent_box.ub
     lin = _fwd_scale(L, parent_lin)
-    crown_lb, crown_ub = _concretize(lin, x_L, x_U)
+    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
     int_lb, int_ub = _box_scale(L, prev_lb, prev_ub)
-    lb, ub = _intersect_boxes(crown_lb, crown_ub, int_lb, int_ub)
+    lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
     out = Bounds(lb, ub)
     stored = out
     return stored, out, lin, parent_frame
 
 
 def backward_scale(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                   preds: List[int]) -> Tuple[List[torch.Tensor], torch.Tensor]:
+                   preds: List[int], M: int = 1
+                   ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     nu_out, contrib = dual_scale_backward(nu, L.params["a"])
     assert len(preds) == 1, f"SCALE expects 1 predecessor, got {len(preds)}"
     return [nu_out], contrib
@@ -423,16 +456,17 @@ def forward_bn(
     x_L, x_U = parent_frame
     prev_lb, prev_ub = parent_box.lb, parent_box.ub
     lin = _fwd_bn(L, parent_lin)
-    crown_lb, crown_ub = _concretize(lin, x_L, x_U)
+    lin_lb, lin_ub = _concretize(lin, x_L, x_U)
     int_lb, int_ub = _box_bn(L, prev_lb, prev_ub)
-    lb, ub = _intersect_boxes(crown_lb, crown_ub, int_lb, int_ub)
+    lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
     out = Bounds(lb, ub)
     stored = out
     return stored, out, lin, parent_frame
 
 
 def backward_bn(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                preds: List[int]) -> Tuple[List[torch.Tensor], torch.Tensor]:
+                preds: List[int], M: int = 1
+                ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     nu_out, contrib = dual_bn_backward(nu, L.params["A"], L.params["c"])
     assert len(preds) == 1, f"BN expects 1 predecessor, got {len(preds)}"
     return [nu_out], contrib
