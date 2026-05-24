@@ -25,11 +25,15 @@ import torch
 
 from act.back_end.config import BaBConfig
 from act.back_end.bab.node import BabNode, SubproblemBatch, split_subproblems
-from act.back_end.bab.branching.branching import BranchingStrategy, RandomBranching
+from act.back_end.bab.branching.branching import (
+    BranchingStrategy,
+    RandomBranching,
+    _build_branching_strategy as _build_branching_strategy_impl,
+)
 from act.back_end.bab.branching.bounding import BoundingStrategy, RandomBounding
 
 from act.back_end.core import Bounds, Layer, Net, ParamValue
-from act.back_end.solver.solver_base import Solver, SolveStatus
+from act.back_end.solver.solver_base import BatchLPSolution, Solver, SolveStatus
 from act.back_end.verifier import (
     gather_input_spec_layers,
     get_assert_layer,
@@ -261,9 +265,7 @@ def check_violations_batched(net: object, x_batch: torch.Tensor, assert_layer: L
 
 
 def _build_branching_strategy(method: str) -> BranchingStrategy:
-    if method == "random":
-        return RandomBranching()
-    raise ValueError(f"Unknown branching method: {method!r}")
+    return _build_branching_strategy_impl(method)
 
 
 def _build_bounding(method: str) -> BoundingStrategy:
@@ -366,10 +368,320 @@ def verify_bab_batched(
             k_ub = batch.ub
         batched_bounds = Bounds(k_lb, k_ub)
 
-        solver = solver_factory()
-        solution = setup_and_solve_batch(
-            net, batched_bounds, solver, timelimit=None,
-        )
+        solver_tier = getattr(config, "solver_tier", "lp")
+        if solver_tier == "lp":
+            solver = solver_factory()
+            solution = setup_and_solve_batch(
+                net, batched_bounds, solver, timelimit=None,
+            )
+        elif solver_tier == "dual":
+            from act.back_end.dual_tf.tf_forward import compute_forward_bounds
+            from act.back_end.solver.solver_dual import DualSolver
+            from act.front_end.specs import OutputSpec
+
+            bounds_dict_dual = compute_forward_bounds(
+                net, batched_bounds.lb, batched_bounds.ub,
+            )
+            out_kind_raw = assert_layer.params["kind"]
+            if not isinstance(out_kind_raw, str):
+                raise TypeError(f"ASSERT kind must be str, got {type(out_kind_raw).__name__}")
+
+            def _unbatch_field(val: Any) -> Any:
+                if isinstance(val, torch.Tensor) and val.dim() >= 2 and val.shape[0] == 1:
+                    return val[0]
+                return val
+
+            out_spec_fields: dict[str, torch.Tensor] = {}
+            for key in ("y_true", "margin", "c", "d", "lb", "ub"):
+                if key in assert_layer.params and assert_layer.params[key] is not None:
+                    value = assert_layer.params[key]
+                    tensor_value = (
+                        value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+                    )
+                    out_spec_fields[key] = _unbatch_field(tensor_value)
+            out_spec = OutputSpec(
+                kind=out_kind_raw,
+                y_true=out_spec_fields.get("y_true"),
+                margin=out_spec_fields.get("margin"),
+                c=out_spec_fields.get("c"),
+                d=out_spec_fields.get("d"),
+                lb=out_spec_fields.get("lb"),
+                ub=out_spec_fields.get("ub"),
+            )
+            sample_bounds = next(iter(bounds_dict_dual.values()))
+            device = sample_bounds.lb.device
+            dtype = sample_bounds.lb.dtype
+            assert_preds = net.preds.get(assert_layer.id, [])
+            if len(assert_preds) != 1:
+                raise ValueError(
+                    f"ASSERT layer {assert_layer.id} must have exactly 1 predecessor, "
+                    f"got {len(assert_preds)}"
+                )
+            output_bounds = bounds_dict_dual[assert_preds[0]]
+            n_out = int(output_bounds.lb.flatten(start_dim=1).shape[-1])
+            encoded_spec = out_spec.encode_linear(
+                B=k_actual, n_out=n_out, device=device, dtype=dtype,
+            )
+            m_specs = int(encoded_spec["M"])
+            active_mask = torch.ones(k_actual, m_specs, dtype=torch.bool, device=device)
+            dual = DualSolver()
+
+            if out_spec.kind == OutKind.UNSAFE_LINEAR:
+                c_rows = cast(torch.Tensor, encoded_spec["C"]).contiguous()
+                thresholds = cast(torch.Tensor, encoded_spec["thresholds"]).contiguous()
+                dual_result = dual.compute_certified_bound(
+                    net, bounds_dict_dual, c_rows, M=m_specs, return_sce=True,
+                )
+                if isinstance(dual_result, tuple):
+                    margins_flat, sce = cast(
+                        tuple[torch.Tensor, Optional[torch.Tensor]], dual_result
+                    )
+                else:
+                    margins_flat, sce = cast(torch.Tensor, dual_result), None
+                margins = margins_flat.view(k_actual, m_specs)
+                slack = margins - thresholds
+                certified = ((slack > 0) & active_mask).any(dim=-1)
+                candidate_rows = torch.zeros(k_actual, dtype=torch.long, device=device)
+            else:
+                c_rows = -cast(torch.Tensor, encoded_spec["C"]).contiguous()
+                thresholds = -cast(torch.Tensor, encoded_spec["thresholds"]).contiguous()
+                dual_result = dual.compute_certified_bound(
+                    net, bounds_dict_dual, c_rows, M=m_specs, return_sce=True,
+                )
+                if isinstance(dual_result, tuple):
+                    margins_flat, sce = cast(
+                        tuple[torch.Tensor, Optional[torch.Tensor]], dual_result
+                    )
+                else:
+                    margins_flat, sce = cast(torch.Tensor, dual_result), None
+                margins = margins_flat.view(k_actual, m_specs)
+                slack = margins - thresholds
+                violations = (slack < 0) & active_mask
+                certified = ~violations.any(dim=-1)
+                candidate_rows = torch.where(
+                    violations.any(dim=1),
+                    violations.to(torch.int64).argmax(dim=1),
+                    torch.zeros(k_actual, dtype=torch.long, device=device),
+                )
+
+            statuses = tuple(
+                SolveStatus.UNSAT if bool(is_certified.item()) else SolveStatus.SAT
+                for is_certified in certified
+            )
+            nvars = max((max(layer.out_vars) for layer in net.layers if layer.out_vars), default=-1) + 1
+            x_candidate = torch.zeros(k_actual, nvars, device=device, dtype=dtype)
+            if sce is not None:
+                sce_flat = sce.flatten(start_dim=1).to(device=device)
+                row_offsets = (
+                    torch.arange(k_actual, device=device) * m_specs
+                    + candidate_rows.to(device=device)
+                )
+                chosen_sce = sce_flat.index_select(0, row_offsets)
+                input_ids = torch.tensor(get_input_ids(net), device=device, dtype=torch.long)
+                x_candidate[:, input_ids] = chosen_sce.to(device=device, dtype=dtype)
+            else:
+                # TODO B.5: richer CE-candidate plumbing for dual paths without SCE.
+                statuses = tuple(
+                    SolveStatus.UNSAT if status == SolveStatus.UNSAT else SolveStatus.UNKNOWN
+                    for status in statuses
+                )
+            solution = BatchLPSolution(
+                statuses=statuses,
+                x=x_candidate,
+                max_viol=-slack.min(dim=1).values.detach(),
+            )
+        elif solver_tier in ("dual_alpha", "dual_alpha_eta"):
+            from act.back_end.dual_tf.tf_forward import compute_forward_bounds
+            from act.back_end.solver.solver_dual import DualSolver
+            from act.front_end.specs import OutputSpec
+
+            bounds_dict_dual = compute_forward_bounds(
+                net, batched_bounds.lb, batched_bounds.ub,
+            )
+            out_kind_raw = assert_layer.params["kind"]
+            if not isinstance(out_kind_raw, str):
+                raise TypeError(f"ASSERT kind must be str, got {type(out_kind_raw).__name__}")
+
+            def _unbatch_field(val: Any) -> Any:
+                if isinstance(val, torch.Tensor) and val.dim() >= 2 and val.shape[0] == 1:
+                    return val[0]
+                return val
+
+            out_spec_fields: dict[str, torch.Tensor] = {}
+            for key in ("y_true", "margin", "c", "d", "lb", "ub"):
+                if key in assert_layer.params and assert_layer.params[key] is not None:
+                    value = assert_layer.params[key]
+                    tensor_value = (
+                        value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+                    )
+                    out_spec_fields[key] = _unbatch_field(tensor_value)
+            out_spec = OutputSpec(
+                kind=out_kind_raw,
+                y_true=out_spec_fields.get("y_true"),
+                margin=out_spec_fields.get("margin"),
+                c=out_spec_fields.get("c"),
+                d=out_spec_fields.get("d"),
+                lb=out_spec_fields.get("lb"),
+                ub=out_spec_fields.get("ub"),
+            )
+            sample_bounds = next(iter(bounds_dict_dual.values()))
+            device = sample_bounds.lb.device
+            dtype = sample_bounds.lb.dtype
+            assert_preds = net.preds.get(assert_layer.id, [])
+            if len(assert_preds) != 1:
+                raise ValueError(
+                    f"ASSERT layer {assert_layer.id} must have exactly 1 predecessor, "
+                    f"got {len(assert_preds)}"
+                )
+            output_bounds = bounds_dict_dual[assert_preds[0]]
+            n_out = int(output_bounds.lb.flatten(start_dim=1).shape[-1])
+            encoded_spec = out_spec.encode_linear(
+                B=k_actual, n_out=n_out, device=device, dtype=dtype,
+            )
+            m_specs = int(encoded_spec["M"])
+            active_mask = torch.ones(k_actual, m_specs, dtype=torch.bool, device=device)
+            dual = DualSolver()
+
+            if out_spec.kind == OutKind.UNSAFE_LINEAR:
+                c_rows = cast(torch.Tensor, encoded_spec["C"]).contiguous()
+                thresholds = cast(torch.Tensor, encoded_spec["thresholds"]).contiguous()
+                dual_result = dual.compute_certified_bound(
+                    net,
+                    bounds_dict_dual,
+                    c_rows,
+                    M=m_specs,
+                    optimize=True,
+                    n_iters=config.dual_n_iters,
+                    lr_alpha=config.lr_alpha,
+                    lr_beta=config.lr_beta,
+                    lr_decay=config.lr_decay,
+                eta=batch.warm_eta if solver_tier == "dual_alpha_eta" else None,
+                warm_alphas=batch.warm_alpha if getattr(config, "warm_start_enabled", True) else None,
+                warm_etas=(
+                    batch.warm_eta
+                    if solver_tier == "dual_alpha_eta"
+                    and getattr(config, "warm_start_enabled", True)
+                    else None
+                ),
+                    split_signs=batch.split_signs if solver_tier == "dual_alpha_eta" else None,
+                    return_optimized=True,
+                    return_sce=True,
+                    per_class_alpha=config.per_class_alpha,
+                )
+                if not isinstance(dual_result, tuple):
+                    raise TypeError(
+                        f"optimized dual result must be tuple, got {type(dual_result).__name__}"
+                    )
+                dual_tuple = cast(tuple[object, ...], dual_result)
+                if len(dual_tuple) == 4:
+                    margins_flat = cast(torch.Tensor, dual_tuple[0])
+                    sce = cast(Optional[torch.Tensor], dual_tuple[1])
+                    alpha_state = cast(dict[int, torch.Tensor], dual_tuple[2])
+                    eta_state = cast(Optional[dict[int, torch.Tensor]], dual_tuple[3])
+                elif len(dual_tuple) == 3:
+                    margins_flat = cast(torch.Tensor, dual_tuple[0])
+                    sce = cast(Optional[torch.Tensor], dual_tuple[1])
+                    alpha_state = cast(dict[int, torch.Tensor], dual_tuple[2])
+                    eta_state = None
+                else:
+                    raise ValueError(
+                        f"optimized dual result must have 3 or 4 fields, got {len(dual_tuple)}"
+                    )
+                batch.warm_alpha = alpha_state
+                if solver_tier == "dual_alpha_eta":
+                    batch.warm_eta = eta_state
+                margins = margins_flat.view(k_actual, m_specs)
+                slack = margins - thresholds
+                certified = ((slack > 0) & active_mask).any(dim=-1)
+                candidate_rows = torch.zeros(k_actual, dtype=torch.long, device=device)
+            else:
+                c_rows = -cast(torch.Tensor, encoded_spec["C"]).contiguous()
+                thresholds = -cast(torch.Tensor, encoded_spec["thresholds"]).contiguous()
+                dual_result = dual.compute_certified_bound(
+                    net,
+                    bounds_dict_dual,
+                    c_rows,
+                    M=m_specs,
+                    optimize=True,
+                    n_iters=config.dual_n_iters,
+                    lr_alpha=config.lr_alpha,
+                    lr_beta=config.lr_beta,
+                    lr_decay=config.lr_decay,
+                eta=batch.warm_eta if solver_tier == "dual_alpha_eta" else None,
+                warm_alphas=batch.warm_alpha if getattr(config, "warm_start_enabled", True) else None,
+                warm_etas=(
+                    batch.warm_eta
+                    if solver_tier == "dual_alpha_eta"
+                    and getattr(config, "warm_start_enabled", True)
+                    else None
+                ),
+                    split_signs=batch.split_signs if solver_tier == "dual_alpha_eta" else None,
+                    return_optimized=True,
+                    return_sce=True,
+                    per_class_alpha=config.per_class_alpha,
+                )
+                if not isinstance(dual_result, tuple):
+                    raise TypeError(
+                        f"optimized dual result must be tuple, got {type(dual_result).__name__}"
+                    )
+                dual_tuple = cast(tuple[object, ...], dual_result)
+                if len(dual_tuple) == 4:
+                    margins_flat = cast(torch.Tensor, dual_tuple[0])
+                    sce = cast(Optional[torch.Tensor], dual_tuple[1])
+                    alpha_state = cast(dict[int, torch.Tensor], dual_tuple[2])
+                    eta_state = cast(Optional[dict[int, torch.Tensor]], dual_tuple[3])
+                elif len(dual_tuple) == 3:
+                    margins_flat = cast(torch.Tensor, dual_tuple[0])
+                    sce = cast(Optional[torch.Tensor], dual_tuple[1])
+                    alpha_state = cast(dict[int, torch.Tensor], dual_tuple[2])
+                    eta_state = None
+                else:
+                    raise ValueError(
+                        f"optimized dual result must have 3 or 4 fields, got {len(dual_tuple)}"
+                    )
+                batch.warm_alpha = alpha_state
+                if solver_tier == "dual_alpha_eta":
+                    batch.warm_eta = eta_state
+                margins = margins_flat.view(k_actual, m_specs)
+                slack = margins - thresholds
+                violations = (slack < 0) & active_mask
+                certified = ~violations.any(dim=-1)
+                candidate_rows = torch.where(
+                    violations.any(dim=1),
+                    violations.to(torch.int64).argmax(dim=1),
+                    torch.zeros(k_actual, dtype=torch.long, device=device),
+                )
+
+            statuses = tuple(
+                SolveStatus.UNSAT if bool(is_certified.item()) else SolveStatus.SAT
+                for is_certified in certified
+            )
+            nvars = max((max(layer.out_vars) for layer in net.layers if layer.out_vars), default=-1) + 1
+            x_candidate = torch.zeros(k_actual, nvars, device=device, dtype=dtype)
+            if sce is not None:
+                sce_flat = sce.flatten(start_dim=1).to(device=device)
+                row_offsets = (
+                    torch.arange(k_actual, device=device) * m_specs
+                    + candidate_rows.to(device=device)
+                )
+                chosen_sce = sce_flat.index_select(0, row_offsets)
+                input_ids = torch.tensor(get_input_ids(net), device=device, dtype=torch.long)
+                x_candidate[:, input_ids] = chosen_sce.to(device=device, dtype=dtype)
+            else:
+                # TODO B.5: richer CE-candidate plumbing for dual paths without SCE.
+                statuses = tuple(
+                    SolveStatus.UNSAT if status == SolveStatus.UNSAT else SolveStatus.UNKNOWN
+                    for status in statuses
+                )
+            solution = BatchLPSolution(
+                statuses=statuses,
+                x=x_candidate,
+                max_viol=-slack.min(dim=1).values.detach(),
+            )
+        else:
+            raise ValueError(
+                f"Unknown solver_tier='{solver_tier}'. Valid: 'lp', 'dual', 'dual_alpha', 'dual_alpha_eta'."
+            )
 
         sat_lane_idx = [
             i for i, s in enumerate(solution.statuses) if s == SolveStatus.SAT
@@ -408,10 +720,29 @@ def verify_bab_batched(
             dtype=torch.long,
         )
         if int(unresolved_idx.numel()) > 0:
+            def _select_warm_state(
+                state: Optional[dict[int, torch.Tensor]],
+                indices: torch.Tensor,
+            ) -> Optional[dict[int, torch.Tensor]]:
+                if state is None:
+                    return None
+                return {
+                    layer_id: tensor.index_select(0, indices.to(tensor.device))
+                    for layer_id, tensor in state.items()
+                }
+
             unresolved = SubproblemBatch(
-                lb=batch.lb.index_select(0, unresolved_idx),
-                ub=batch.ub.index_select(0, unresolved_idx),
-                depths=batch.depths.index_select(0, unresolved_idx.cpu()),
+                lb=batch.lb.index_select(0, unresolved_idx.to(batch.lb.device)),
+                ub=batch.ub.index_select(0, unresolved_idx.to(batch.ub.device)),
+                depths=batch.depths.index_select(0, unresolved_idx.to(batch.depths.device)),
+                warm_alpha=_select_warm_state(batch.warm_alpha, unresolved_idx),
+                warm_eta=_select_warm_state(batch.warm_eta, unresolved_idx),
+                split_signs=_select_warm_state(batch.split_signs, unresolved_idx),
+                parent_margins=(
+                    batch.parent_margins.index_select(0, unresolved_idx.to(batch.parent_margins.device))
+                    if batch.parent_margins is not None
+                    else None
+                ),
             )
             branch_mask = unresolved.depths < int(config.max_depth)
             if bool((~branch_mask).any().item()):
@@ -422,6 +753,14 @@ def verify_bab_batched(
                     lb=unresolved.lb.index_select(0, branch_idx.to(unresolved.lb.device)),
                     ub=unresolved.ub.index_select(0, branch_idx.to(unresolved.ub.device)),
                     depths=unresolved.depths.index_select(0, branch_idx),
+                    warm_alpha=_select_warm_state(unresolved.warm_alpha, branch_idx),
+                    warm_eta=_select_warm_state(unresolved.warm_eta, branch_idx),
+                    split_signs=_select_warm_state(unresolved.split_signs, branch_idx),
+                    parent_margins=(
+                        unresolved.parent_margins.index_select(0, branch_idx)
+                        if unresolved.parent_margins is not None
+                        else None
+                    ),
                 )
                 scores = brancher.compute_scores(branch_batch, net)
                 split_dims = brancher.select(scores)
@@ -489,6 +828,12 @@ def verify_bab(
         time_budget_s if time_budget_s is not None
         else (timelimit if timelimit is not None else 300.0)
     )
+    solver_tier = getattr(config, "solver_tier", "lp")
+    valid_tiers = ("lp", "dual", "dual_alpha", "dual_alpha_eta")
+    if solver_tier not in valid_tiers:
+        raise ValueError(
+            f"Unknown solver_tier={solver_tier!r}. Valid: {valid_tiers}."
+        )
     solver_type = type(solver)
     return verify_bab_batched(
         net=net,

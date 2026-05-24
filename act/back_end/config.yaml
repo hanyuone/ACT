@@ -48,11 +48,40 @@ backend:
 
     # How to pick the next input dimension to split.
     #   "random" – uniform random selection (baseline)
+    #   "babsr"  – width-weighted score-based branching (slope-gradient scoring
+    #              is a future enhancement; currently falls back to width)
     branching_method: "random"
 
     # How to order subproblems in the work pool.
     #   "random" – random ordering (baseline)
     bounding_method: "random"
+
+    # ── Dual-tier knobs (α/η optimization for DualSolver BaB) ────────────
+    # Solver tier for BaB bound computation:
+    #   "lp"               – LP/MILP backend
+    #   "dual"             – DualSolver (linear-relaxation dual, no iterative optimization)
+    #   "dual_alpha"       – DualSolver with Lagrange-relaxed lower-slope optimization (Adam on α ∈ [0,1])
+    #   "dual_alpha_eta"   – DualSolver with joint α + η (split-constraint KKT multipliers)
+    solver_tier: "lp"
+
+    # Number of Adam iterations for α/η optimization (only used in
+    # dual_alpha / dual_alpha_eta tiers).
+    dual_n_iters: 50
+
+    # Learning rate for α (ReLU lower-bound slope, clamped to [0, 1]).
+    lr_alpha: 0.1
+
+    # Learning rate for η (split-constraint KKT multipliers, clamped ≥ 0).
+    lr_beta: 0.1
+
+    # Adam ExponentialLR decay per iteration. 1.0 = no decay.
+    lr_decay: 0.98
+
+    # Inherit optimized (α, η) from parent BaB node into children (warm-start).
+    warm_start_enabled: true
+
+    # Per-spec α (tighter bounds, M× memory) vs shared α (looser, 1× memory).
+    per_class_alpha: true
 
   # ── Network Generation (net_factory) ────────────────────────────────────
   # Controls how many networks to generate, where, and TF filtering.

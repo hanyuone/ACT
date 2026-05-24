@@ -9,7 +9,14 @@
 from act.back_end.bab.branching.branching import (
     BranchingStrategy,
     RandomBranching,
+    BaBSRBranching,
 )
 from act.back_end.bab.branching.bounding import BoundingStrategy, RandomBounding
 
-__all__ = ["BranchingStrategy", "RandomBranching", "BoundingStrategy", "RandomBounding"]
+__all__ = [
+    "BranchingStrategy",
+    "RandomBranching",
+    "BaBSRBranching",
+    "BoundingStrategy",
+    "RandomBounding",
+]

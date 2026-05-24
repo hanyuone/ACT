@@ -136,7 +136,7 @@ def forward_sigmoid(
 
 
 def backward_sigmoid(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                     preds: List[int], M: int = 1
+                     preds: List[int], M: int = 1, alpha=None
                      ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     bounds = bounds_dict.get(L.id)
     if bounds is None:
@@ -172,7 +172,7 @@ def forward_tanh(
 
 
 def backward_tanh(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                  preds: List[int], M: int = 1
+                  preds: List[int], M: int = 1, alpha=None
                   ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     bounds = bounds_dict.get(L.id)
     if bounds is None:

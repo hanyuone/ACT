@@ -45,6 +45,35 @@ class BaBConfig:
     branching_method: str = "random"
     bounding_method: str = "random"
 
+    # Dual-tier solver knobs — support solver_tier="dual_alpha_eta" with
+    # Iterative slope + Lagrange-multiplier optimization for the dual backward pass.
+    solver_tier: str = "lp"
+    """Solver tier for BaB bound computation. One of:
+
+    - ``"lp"``             (default): LP/MILP backend.
+    - ``"dual"``           : DualSolver (linear-relaxation dual bound, no iterative optimization).
+    - ``"dual_alpha"``     : DualSolver with Lagrange-relaxed lower-slope optimization (Adam on α ∈ [0, 1]).
+    - ``"dual_alpha_eta"`` : DualSolver with joint slope + split-constraint KKT-multiplier optimization (α, η).
+    """
+
+    dual_n_iters: int = 50
+    """Number of Adam iterations for α/η optimization (only used in ``dual_alpha`` / ``dual_alpha_eta`` tiers)."""
+
+    lr_alpha: float = 0.1
+    """Adam learning rate for α (slope) variables."""
+
+    lr_beta: float = 0.1
+    """Adam learning rate for η (split-constraint KKT multipliers). 0.1 default; tune per network."""
+
+    lr_decay: float = 0.98
+    """Multiplicative learning-rate decay applied each Adam iteration."""
+
+    warm_start_enabled: bool = True
+    """Reuse α/η tensors from the parent subproblem as the initial point for child optimization."""
+
+    per_class_alpha: bool = True
+    """Allocate separate α tensors per output class (tighter bounds) rather than sharing one α."""
+
     verbose: bool = False
 
     @classmethod

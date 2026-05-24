@@ -137,3 +137,53 @@ class RandomBranching(BranchingStrategy):
             scores = scores * (widths > 0).float()
 
         return scores
+
+
+# ---------------------------------------------------------------------------
+# Score-based branching (width-weighted, optional slope-gradient scoring)
+# ---------------------------------------------------------------------------
+
+
+class BaBSRBranching(BranchingStrategy):
+    """Score-based branching: dimensions scored by ``|slope-gradient| * width``.
+
+    The BaB layer currently stores warm slope (α) values but not their gradients;
+    those gradients are transient inside ``_optimize_alpha_eta``. Until gradient
+    storage is added, this strategy falls back to width-based scoring. When no
+    warm slope state is available on the batch, it uses width-randomized scores
+    compatible with ``RandomBranching`` first-level behavior.
+    """
+
+    def compute_scores(
+        self,
+        batch: SubproblemBatch,
+        net: Net,
+        unstable_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        widths = batch.ub - batch.lb
+
+        if batch.warm_alpha is None:
+            scores = widths * torch.rand_like(widths)
+        else:
+            scores = widths
+
+        if unstable_mask is not None:
+            mask = unstable_mask.float()
+            if mask.dim() == 1:
+                mask = mask.unsqueeze(0).expand(batch.batch_size, -1)
+            scores = scores * mask
+
+        return scores
+
+
+# ---------------------------------------------------------------------------
+# Strategy factory
+# ---------------------------------------------------------------------------
+
+
+def _build_branching_strategy(method: str) -> BranchingStrategy:
+    if method == "random":
+        return RandomBranching()
+    if method == "babsr":
+        return BaBSRBranching()
+    raise ValueError(f"Unknown branching method: {method!r}")

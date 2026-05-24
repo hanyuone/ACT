@@ -24,7 +24,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -55,6 +55,12 @@ class SubproblemBatch:
     ub: torch.Tensor  # (N, D)  upper bounds
     depths: torch.Tensor  # (N,)    tree depth
 
+    # -- warm-start fields (D.5) --------------------------------------------
+    warm_alpha: Optional[Dict[int, torch.Tensor]] = None  # layer_id → [N, M, n]
+    warm_eta: Optional[Dict[int, torch.Tensor]] = None  # layer_id → [N, M, n]
+    split_signs: Optional[Dict[int, torch.Tensor]] = None  # layer_id → [N, M, n] in {-1, 0, +1}
+    parent_margins: Optional[torch.Tensor] = None  # [N]
+
     # -- properties ---------------------------------------------------------
 
     @property
@@ -74,10 +80,19 @@ class SubproblemBatch:
 
     @staticmethod
     def from_bounds(bounds: Bounds, depth: int = 0) -> SubproblemBatch:
-        """Wrap a single ``Bounds`` into a batch of size 1 (flattened to (1, D))."""
-        lb = bounds.lb.detach().reshape(1, -1)  # (1, D_flat)
-        ub = bounds.ub.detach().reshape(1, -1)  # (1, D_flat)
-        depths = torch.tensor([depth], dtype=torch.long)
+        """Wrap ``Bounds[B, *shape]`` into ``SubproblemBatch[B, D]``.
+
+        Multi-sample inputs (``B > 1`` — e.g., wrapped models carrying several
+        specs at once) become ``B`` independent subproblems so each gets its
+        own BaB exploration tree. Single-sample (``B == 1``) is the legacy
+        path. Unbatched ``Bounds`` (``lb.dim() < 2``) is treated as ``B = 1``.
+        """
+        lb_raw = bounds.lb.detach()
+        ub_raw = bounds.ub.detach()
+        b = lb_raw.shape[0] if lb_raw.dim() >= 2 else 1
+        lb = lb_raw.reshape(b, -1)
+        ub = ub_raw.reshape(b, -1)
+        depths = torch.full((b,), depth, dtype=torch.long, device=lb.device)
         return SubproblemBatch(lb=lb, ub=ub, depths=depths)
 
     # -- conversions --------------------------------------------------------
@@ -108,7 +123,9 @@ def split_subproblems(
 ) -> tuple[SubproblemBatch, SubproblemBatch]:
     """Bisect each subproblem along the chosen input dimension.
 
-    This is a pure tensor operation — no Python loops over the batch.
+    This is a pure tensor operation — no Python loops over the batch. Warm-state
+    fields are deep-copied into both children so they do not alias the parent or
+    each other.
 
     Args:
         batch:      ``(N, D)`` subproblems.
@@ -131,15 +148,46 @@ def split_subproblems(
 
     new_depths = batch.depths + 1
 
+    def _clone_dict_tensors(
+        tensors: Optional[Dict[int, torch.Tensor]],
+    ) -> Optional[Dict[int, torch.Tensor]]:
+        return (
+            {key: tensor.clone() for key, tensor in tensors.items()}
+            if tensors is not None
+            else None
+        )
+
+    left_warm_alpha = _clone_dict_tensors(batch.warm_alpha)
+    left_warm_eta = _clone_dict_tensors(batch.warm_eta)
+    left_split_signs = _clone_dict_tensors(batch.split_signs)
+    left_parent_margins = (
+        batch.parent_margins.clone() if batch.parent_margins is not None else None
+    )
+
+    right_warm_alpha = _clone_dict_tensors(batch.warm_alpha)
+    right_warm_eta = _clone_dict_tensors(batch.warm_eta)
+    right_split_signs = _clone_dict_tensors(batch.split_signs)
+    right_parent_margins = (
+        batch.parent_margins.clone() if batch.parent_margins is not None else None
+    )
+
     left = SubproblemBatch(
-        lb=batch.lb,
+        lb=batch.lb.clone(),
         ub=left_ub,
-        depths=new_depths,
+        depths=new_depths.clone(),
+        warm_alpha=left_warm_alpha,
+        warm_eta=left_warm_eta,
+        split_signs=left_split_signs,
+        parent_margins=left_parent_margins,
     )
     right = SubproblemBatch(
         lb=right_lb,
-        ub=batch.ub,
-        depths=new_depths,
+        ub=batch.ub.clone(),
+        depths=new_depths.clone(),
+        warm_alpha=right_warm_alpha,
+        warm_eta=right_warm_eta,
+        split_signs=right_split_signs,
+        parent_margins=right_parent_margins,
     )
     return left, right
 

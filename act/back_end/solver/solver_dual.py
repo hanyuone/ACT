@@ -3,11 +3,11 @@
 # Copyright (C) 2025- ACT Team
 # Licensed under AGPLv3+; distributed without warranty.
 #===---------------------------------------------------------------------===#
-# DualSolver: Wong-Kolter dual certified lower-bound solver.
+# DualSolver: linear-relaxation dual certified lower-bound solver.
 # STRICT batched API ([B, *shape] only). Raises ValueError on 1-D input.
 # Mirrors HZSolver precedent in solver_hz.py.
 #===---------------------------------------------------------------------===#
-# pyright: reportMissingImports=false
+# pyright: reportMissingImports=false, reportImportCycles=false, reportArgumentType=false, reportIncompatibleMethodOverride=false
 
 from __future__ import annotations
 import torch
@@ -84,7 +84,7 @@ def _reverse_topological_sort(net: Net) -> List[int]:
 
 
 class DualSolver(Solver):
-    """Dual (Wong-Kolter) certified bounds solver. Strict [B, *shape] API."""
+    """Dual (linear-relaxation) certified bounds solver. Strict [B, *shape] API."""
 
     _AFFINE_CONTRIB_KINDS = {
         LayerKind.DENSE.value,
@@ -112,7 +112,26 @@ class DualSolver(Solver):
         c: torch.Tensor, M: int = 1,
         return_sce: bool = False,
         enable_grad: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+        alpha: Optional[Dict[int, torch.Tensor]] = None,
+        eta: Optional[Dict[int, torch.Tensor]] = None,
+        split_signs: Optional[Dict[int, torch.Tensor]] = None,
+        optimize: bool = False,
+        n_iters: int = 50,
+        lr_alpha: float = 0.1,
+        lr_beta: float = 0.1,
+        lr_decay: float = 0.98,
+        warm_alphas: Optional[Dict[int, torch.Tensor]] = None,
+        warm_etas: Optional[Dict[int, torch.Tensor]] = None,
+        return_optimized: bool = False,
+        per_class_alpha: bool = True,
+    ) -> Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, Optional[torch.Tensor]],
+        Tuple[torch.Tensor, Dict[int, torch.Tensor]],
+        Tuple[torch.Tensor, Dict[int, torch.Tensor], Dict[int, torch.Tensor]],
+        Tuple[torch.Tensor, Optional[torch.Tensor], Dict[int, torch.Tensor]],
+        Tuple[torch.Tensor, Optional[torch.Tensor], Dict[int, torch.Tensor], Dict[int, torch.Tensor]],
+    ]:
         """Batched certified lower bound on c^T @ output (DAG-aware).
 
         Implements ``Solver.compute_certified_bound``; see base for the
@@ -130,7 +149,60 @@ class DualSolver(Solver):
         (RELU/SIGMOID/TANH) view nu as ``[B, M, n]`` and broadcast bounds
         ``[B, 1, n]`` against it — mathematically equivalent to the legacy
         M-expanded path, with M× lower bounds memory.
+
+        Caveats:
+            Uses GLOBAL intermediate bounds — bounds_dict stays at [B, *shape] across
+            BaB lanes within the same sample (lazy-M-broadcast design). Per-lane
+            intermediate-bound tightening (a stricter dual variant) is OUT OF SCOPE
+            for this solver; bounds may be looser than a per-lane refinement would
+            give, but the dual lower bound remains SOUND.
+
+        When ``optimize=True``, runs joint Adam optimization over ReLU α slopes via
+        ``_optimize_alpha``. If ``return_optimized=True``, also returns the optimized
+        α state for warm-starting. When ``optimize=False``, executes the original
+        single-pass backward path; with ``alpha=None`` this remains bit-identical to
+        the pre-optimization API.
+
+        eta: Per-layer η multiplier — Lagrange (KKT) multiplier for branch-split
+            constraints on activation pre-activations. Keyed by activation layer id
+            (RELU, LRELU, SIGMOID, TANH, GELU). η ≥ 0 invariant (enforced by clamp).
+        split_signs: Per-layer split direction. {-1: inactive, +1: active, 0: unsplit}.
+            Same key set as eta.
+
+        η is applied at PRE-ACTIVATION (immediately BEFORE the activation handler
+        runs in the reverse-topological backward loop). This yields
+        nu_pre = slope · (nu_post − η · sign), equivalently a lifted KKT multiplier
+        β = slope · η ≥ 0 acting at the pre-activation. Sound for any η ≥ 0.
         """
+        if optimize:
+            bound, sce, alpha_state, eta_state = self._optimize_alpha(
+                net,
+                bounds_dict,
+                c,
+                M=M,
+                n_iters=n_iters,
+                lr_alpha=lr_alpha,
+                lr_beta=lr_beta,
+                lr_decay=lr_decay,
+                warm_alphas=warm_alphas,
+                warm_etas=warm_etas,
+                split_signs=split_signs,
+                return_sce=return_sce,
+                per_class_alpha=per_class_alpha,
+            )
+            if return_optimized:
+                has_eta_state = bool(eta_state)
+                if return_sce:
+                    if has_eta_state:
+                        return bound, sce, alpha_state, eta_state
+                    return bound, sce, alpha_state
+                if has_eta_state:
+                    return bound, alpha_state, eta_state
+                return bound, alpha_state
+            if return_sce:
+                return bound, sce
+            return bound
+
         if c.dim() != 2:
             raise ValueError(
                 f"c must be 2-D [B*M, num_classes], got shape {tuple(c.shape)}. "
@@ -194,8 +266,27 @@ class DualSolver(Solver):
                         f"Supported kinds: {sorted(registry.keys())}"
                     )
 
+                if eta is not None and split_signs is not None and lid in eta:
+                    eta_l = eta[lid].to(device=nu_here.device, dtype=nu_here.dtype)
+                    signs_l = split_signs[lid].to(device=nu_here.device, dtype=nu_here.dtype)
+                    if eta_l.dim() == 3:
+                        eta_l = eta_l.reshape(-1, eta_l.shape[-1])
+                    if signs_l.dim() == 3:
+                        signs_l = signs_l.reshape(-1, signs_l.shape[-1])
+                    n_clip = min(nu_here.shape[-1], eta_l.shape[-1])
+                    nu_here = nu_here.clone()
+                    nu_here[..., :n_clip] = (
+                        nu_here[..., :n_clip]
+                        - eta_l[..., :n_clip] * signs_l[..., :n_clip]
+                    )
+
                 preds = list(net.preds.get(lid, []))
-                pred_nus, contrib = handler(layer, nu_here, bounds_dict, preds, M)
+                if alpha is None:
+                    pred_nus, contrib = handler(layer, nu_here, bounds_dict, preds, M)
+                else:
+                    pred_nus, contrib = handler(
+                        layer, nu_here, bounds_dict, preds, M, alpha=alpha.get(lid)
+                    )
 
                 if len(pred_nus) != len(preds):
                     raise ValueError(
@@ -237,6 +328,252 @@ class DualSolver(Solver):
             )
             obj = obj + input_contrib
             return (obj, sce) if return_sce else obj
+
+    def _optimize_alpha(
+        self,
+        net: Net,
+        bounds_dict: Dict[int, Bounds],
+        c: torch.Tensor,
+        M: int = 1,
+        n_iters: int = 50,
+        lr_alpha: float = 0.1,
+        lr_beta: float = 0.1,
+        lr_decay: float = 0.98,
+        warm_alphas: Optional[Dict[int, torch.Tensor]] = None,
+        warm_etas: Optional[Dict[int, torch.Tensor]] = None,
+        split_signs: Optional[Dict[int, torch.Tensor]] = None,
+        return_sce: bool = False,
+        per_class_alpha: bool = True,
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Dict[int, torch.Tensor],
+        Dict[int, torch.Tensor],
+    ]:
+        """Joint α/η optimization: iterative dual lower-bound refinement.
+
+        Each ReLU gets a learnable lower-envelope slope α constrained to [0, 1].
+        Each split layer with a nonzero split sign gets a learnable η multiplier
+        constrained to η ≥ 0.
+
+        Returns:
+            ``(best_bounds, best_sce, alpha_state, eta_state)`` where
+            ``best_bounds`` has shape ``[B*M]``, ``best_sce`` is optional,
+            ``alpha_state`` maps ReLU layer id to optimized α, and ``eta_state``
+            maps split layer id to optimized η.
+        """
+        if c.dim() != 2:
+            raise ValueError(
+                f"c must be 2-D [B*M, n_out], got shape {tuple(c.shape)}"
+            )
+        if M < 1:
+            raise ValueError(f"M must be >= 1, got {M}")
+        BM = c.shape[0]
+        if BM % M != 0:
+            raise ValueError(
+                f"c batch dim {BM} not divisible by M={M}; expected B*M rows"
+            )
+        B = BM // M
+        device, dtype = c.device, c.dtype
+
+        input_lid = self._find_input_layer_id(net)
+        if input_lid is None:
+            raise ValueError("DualSolver._optimize_alpha: net has no INPUT/INPUT_SPEC layer")
+        by_id = getattr(net, "by_id", {layer.id: layer for layer in net.layers})
+        input_layer = by_id[input_lid]
+        input_bounds = bounds_dict.get(input_lid)
+        if input_bounds is None:
+            if "lb" not in input_layer.params or "ub" not in input_layer.params:
+                raise ValueError(
+                    f"DualSolver._optimize_alpha: input layer {input_lid} has no bounds"
+                )
+            input_lb = cast(torch.Tensor, input_layer.params["lb"])
+            input_ub = cast(torch.Tensor, input_layer.params["ub"])
+        else:
+            input_lb = input_bounds.lb
+            input_ub = input_bounds.ub
+        input_lb = input_lb.to(device=device, dtype=dtype)
+        input_ub = input_ub.to(device=device, dtype=dtype)
+
+        alphas: Dict[int, torch.nn.Parameter] = {}
+        for layer in net.layers:
+            k = layer.kind.upper() if isinstance(layer.kind, str) else layer.kind
+            if k != LayerKind.RELU.value:
+                continue
+            b = bounds_dict.get(layer.id)
+            if b is None:
+                continue
+            if warm_alphas is not None and layer.id in warm_alphas:
+                alpha_init = (
+                    warm_alphas[layer.id]
+                    .detach()
+                    .clone()
+                    .to(device=device, dtype=dtype)
+                    .clamp(0.0, 1.0)
+                )
+            else:
+                lb_flat = b.lb.to(device=device, dtype=dtype).flatten(start_dim=1)
+                ub_flat = b.ub.to(device=device, dtype=dtype).flatten(start_dim=1)
+                n_neurons = lb_flat.shape[-1]
+                denom = (ub_flat - lb_flat).clamp(min=1e-12)
+                alpha_init_bn = (ub_flat / denom).clamp(0.0, 1.0).detach()
+                if per_class_alpha:
+                    alpha_init = (
+                        alpha_init_bn.unsqueeze(1)
+                        .expand(B, M, n_neurons)
+                        .contiguous()
+                    )
+                else:
+                    alpha_init = alpha_init_bn.contiguous()
+            alphas[layer.id] = torch.nn.Parameter(alpha_init)
+
+        etas: Dict[int, torch.nn.Parameter] = {}
+        if split_signs is not None:
+            for lid, signs in split_signs.items():
+                signs_init = signs.detach().to(device=device, dtype=dtype)
+                if not (signs_init != 0).any():
+                    continue
+                if warm_etas is not None and lid in warm_etas:
+                    eta_init = (
+                        warm_etas[lid]
+                        .detach()
+                        .clone()
+                        .to(device=device, dtype=dtype)
+                        .clamp(min=0)
+                    )
+                    if eta_init.shape != signs_init.shape:
+                        eta_init = torch.zeros_like(signs_init)
+                else:
+                    eta_init = torch.zeros_like(signs_init)
+                etas[lid] = torch.nn.Parameter(eta_init)
+
+        if not alphas and not etas:
+            result = self.compute_certified_bound(
+                net, bounds_dict, c, M=M, return_sce=return_sce
+            )
+            if return_sce:
+                bound, sce = cast(Tuple[torch.Tensor, Optional[torch.Tensor]], result)
+                return bound.detach(), sce, {}, {}
+            return cast(torch.Tensor, result).detach(), None, {}, {}
+
+        param_groups: List[Dict[str, object]] = []
+        alpha_params = list(alphas.values())
+        eta_params = list(etas.values())
+        if alpha_params:
+            param_groups.append({"params": alpha_params, "lr": lr_alpha})
+        if eta_params:
+            param_groups.append({"params": eta_params, "lr": lr_beta})
+        optimizer = torch.optim.Adam(param_groups)
+        scheduler = (
+            torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=lr_decay)
+            if lr_decay < 1.0
+            else None
+        )
+        best_bounds = torch.full((BM,), float("-inf"), device=device, dtype=dtype)
+        best_sce: Optional[torch.Tensor] = None
+        best_alpha_state: Dict[int, torch.Tensor] = {
+            lid: a.detach().clone() for lid, a in alphas.items()
+        }
+        best_eta_state: Dict[int, torch.Tensor] = {
+            lid: e.detach().clone() for lid, e in etas.items()
+        }
+
+        from act.back_end.dual_tf.tf_forward import compute_forward_bounds
+
+        with torch.enable_grad():
+            for _ in range(n_iters):
+                optimizer.zero_grad()
+                alpha_tensors = cast(Dict[int, torch.Tensor], alphas)
+                eta_tensors = cast(Dict[int, torch.Tensor], etas)
+                forward_alphas = {
+                    lid: a[:, 0, :] if a.dim() == 3 else a
+                    for lid, a in alpha_tensors.items()
+                }
+                fresh_bounds = compute_forward_bounds(
+                    net,
+                    input_lb,
+                    input_ub,
+                    post_activation=False,
+                    alphas=forward_alphas,
+                )
+                if return_sce:
+                    bound_bm, sce = cast(
+                        Tuple[torch.Tensor, Optional[torch.Tensor]],
+                        self.compute_certified_bound(
+                            net,
+                            fresh_bounds,
+                            c,
+                            M=M,
+                            return_sce=True,
+                            enable_grad=True,
+                            alpha=alpha_tensors,
+                            eta=eta_tensors,
+                            split_signs=split_signs,
+                        ),
+                    )
+                else:
+                    bound_bm = cast(
+                        torch.Tensor,
+                        self.compute_certified_bound(
+                            net,
+                            fresh_bounds,
+                            c,
+                            M=M,
+                            return_sce=False,
+                            enable_grad=True,
+                            alpha=alpha_tensors,
+                            eta=eta_tensors,
+                            split_signs=split_signs,
+                        ),
+                    )
+                    sce = None
+
+                (-bound_bm.sum()).backward()
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+
+                with torch.no_grad():
+                    for a in alphas.values():
+                        a.data.clamp_(0.0, 1.0)
+                    for e in etas.values():
+                        e.data.clamp_(min=0)
+
+                    improved = bound_bm > best_bounds
+                    if improved.any():
+                        best_bounds = torch.where(improved, bound_bm.detach(), best_bounds)
+                        best_alpha_state = {
+                            lid: a.detach().clone() for lid, a in alphas.items()
+                        }
+                        best_eta_state = {
+                            lid: e.detach().clone() for lid, e in etas.items()
+                        }
+                    if return_sce and sce is not None:
+                        if best_sce is None:
+                            best_sce = sce.detach().clone()
+                        else:
+                            best_sce[improved] = sce[improved].detach()
+
+        if n_iters <= 0:
+            result = self.compute_certified_bound(
+                net,
+                bounds_dict,
+                c,
+                M=M,
+                return_sce=return_sce,
+                enable_grad=False,
+                alpha=cast(Dict[int, torch.Tensor], alphas),
+                eta=cast(Dict[int, torch.Tensor], etas),
+                split_signs=split_signs,
+            )
+            if return_sce:
+                best_bounds, best_sce = cast(
+                    Tuple[torch.Tensor, Optional[torch.Tensor]], result
+                )
+            else:
+                best_bounds = cast(torch.Tensor, result)
+
+        return best_bounds.detach(), best_sce, best_alpha_state, best_eta_state
 
     def evaluate_spec(
         self, net: Net,
@@ -401,12 +738,18 @@ class DualSolver(Solver):
 
         For large M (e.g. CIFAR-100 K=100), trades time for memory by
         processing chunk_size specs per sample at a time.
+
+        Chunked evaluation invariant: slicing the leading B*M axis at arbitrary
+        chunk_size is bit-identical to unchunked evaluation, because each
+        (sample, spec) row is fully independent in the dual backward pass — no
+        cross-row computation exists within a chunk or across chunk boundaries.
         """
         C_view = C_neg.view(B, M, n_out)
         chunks: List[torch.Tensor] = []
         for start in range(0, M, chunk_size):
             end = min(start + chunk_size, M)
             m_chunk = end - start
+            # Slice specs [start:end] for all B samples — independent rows, invariant-safe.
             C_chunk = C_view[:, start:end, :].reshape(B * m_chunk, n_out).contiguous()
             margins_chunk = self.compute_certified_bound(
                 net, bounds_dict, C_chunk, M=m_chunk, enable_grad=enable_grad,

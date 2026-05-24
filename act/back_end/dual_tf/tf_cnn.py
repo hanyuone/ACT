@@ -72,7 +72,7 @@ _CONV_CHANNEL_CHUNK_SIZE = 32
 
 
 def backward_conv2d(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                    preds: List[int], M: int = 1
+                    preds: List[int], M: int = 1, alpha=None
                     ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     stride = L.params.get("stride", 1)
     padding = L.params.get("padding", 0)
@@ -207,7 +207,7 @@ def forward_maxpool2d(
     return stored, out, lin, frame
 
 
-def backward_maxpool2d(L, nu, bounds_dict, preds, M: int = 1):
+def backward_maxpool2d(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
     """MaxPool2D backward — conservative constant-bound (sound but loose).
 
     MaxPool is non-linear: ``y = max(x_window)``. For sound dual lower bound
@@ -301,7 +301,7 @@ def forward_avgpool2d(
     return stored, out, lin, frame
 
 
-def backward_avgpool2d(L, nu, bounds_dict, preds, M: int = 1):
+def backward_avgpool2d(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
     """AvgPool2D backward — exact linear transpose.
 
     AvgPool is mathematically EXACT linear: ``y = (1/k²) · conv(x, ones_k)``,

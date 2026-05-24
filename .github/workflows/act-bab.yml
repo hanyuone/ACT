@@ -78,6 +78,59 @@ jobs:
               --timeout 30 --bab-max-depth 8 --bab-max-subproblems 300
           done
 
+      - name: Download VNNLIB benchmarks for BaB dual-tier coverage
+        run: |
+          cd ${{ github.workspace }}
+          for cat in acasxu_2023 dist_shift_2023 safenlp_2024; do
+            coverage run -p -m act.front_end --download $cat
+          done
+
+      # ─────────────────────────────────────────────────────────────────
+      # BaB + dual-tier coverage (exercises verify_bab_batched dispatch,
+      # _optimize_alpha_eta, warm-state plumbing, η pre-activation step,
+      # branching strategies, per-class α modes, warm-start toggle).
+      # Smoke budget: max_depth=3, max_nodes=10 — each call <60 s.
+      # Any final VerifyStatus (CERTIFIED/FALSIFIED/UNKNOWN/TIMEOUT) is
+      # acceptable; the goal is exercising the code paths end-to-end.
+      # ─────────────────────────────────────────────────────────────────
+
+      - name: Verify acasxu_2023 with BaB (dual / dual_alpha / dual_alpha_eta)
+        run: |
+          cd ${{ github.workspace }}
+          for tier in dual dual_alpha dual_alpha_eta; do
+            coverage run -p -m act.pipeline --verify vnnlib --category acasxu_2023 --max-instances 2 \
+              --solvers dual --bab --bab-solver-tier $tier --bab-max-depth 3 --bab-max-nodes 10 \
+              --device cpu --dtype float64
+          done
+
+      - name: Verify dist_shift_2023 with BaB (dual_alpha_eta)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --verify vnnlib --category dist_shift_2023 --max-instances 2 \
+            --solvers dual --bab --bab-solver-tier dual_alpha_eta --bab-max-depth 3 --bab-max-nodes 10 \
+            --device cpu --dtype float64
+
+      - name: Verify safenlp_2024 with BaB (dual_alpha_eta)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --verify vnnlib --category safenlp_2024 --max-instances 2 \
+            --solvers dual --bab --bab-solver-tier dual_alpha_eta --bab-max-depth 3 --bab-max-nodes 10 \
+            --device cpu --dtype float64
+
+      - name: Verify acasxu with BaB knobs — BaBSR / shared-α / no-warm-start
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --verify vnnlib --category acasxu_2023 --max-instances 1 \
+            --solvers dual --bab --bab-solver-tier dual_alpha_eta \
+            --bab-branching-method babsr \
+            --bab-max-depth 3 --bab-max-nodes 10 --device cpu --dtype float64
+          coverage run -p -m act.pipeline --verify vnnlib --category acasxu_2023 --max-instances 1 \
+            --solvers dual --bab --bab-solver-tier dual_alpha --bab-per-class-alpha false \
+            --bab-max-depth 3 --bab-max-nodes 10 --device cpu --dtype float64
+          coverage run -p -m act.pipeline --verify vnnlib --category acasxu_2023 --max-instances 1 \
+            --solvers dual --bab --bab-solver-tier dual_alpha_eta --bab-no-warm-start \
+            --bab-max-depth 3 --bab-max-nodes 10 --device cpu --dtype float64
+
       - name: Combine coverage data
         if: always()
         run: |

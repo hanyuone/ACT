@@ -141,7 +141,7 @@ def _verify_one_net(
         any_unknown = any(r.status == VerifyStatus.UNKNOWN for r in results)
 
         # SOUNDNESS-CRITICAL: under --solver dual, verify_once already ran
-        # DualSolver.evaluate_spec (Wong-Kolter dual backward) — Tier-2 LP and Tier-3 BaB
+        # DualSolver.evaluate_spec (linear-relaxation dual backward) — Tier-2 LP and Tier-3 BaB
         # would build under-constrained LPs (DualSolver does not produce LP-feed
         # ConSet entries; the forward analyze() pipeline is bypassed) and emit
         # spurious FALSIFIED. Do not remove this gate without first switching
@@ -844,7 +844,7 @@ Examples:
             "  'gurobi'  — commercial MILP/LP (license required).  LP cascade.\n"
             "  'torchlp' — PyTorch-tensor LP (Adam + penalty + box projection,\n"
             "              GPU-capable).  LP cascade.\n"
-            "  'dual'    — DualSolver, Wong-Kolter dual certified bounds via\n"
+                "  'dual'    — DualSolver, linear-relaxation dual certified bounds via\n"
             "              backward propagation.  No LP cascade (DualSolver is\n"
             "              its own verification pipeline).\n"
             "  'auto'    — try gurobi, fall back to torchlp.\n"

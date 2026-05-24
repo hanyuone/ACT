@@ -27,7 +27,7 @@ def forward_attention(L, parent_boxes, parent_lins, parent_frames, preds,
     raise NotImplementedError("forward for attention-family not implemented in dual_tf")
 
 
-def backward_attention(L, nu, bounds_dict, preds, M: int = 1):
+def backward_attention(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
     """Attention backward via linearization around reference weights. (Pending)
     Shared by all attention-family kinds via registry aliasing.
     """
@@ -42,7 +42,7 @@ def forward_layernorm(L, parent_boxes, parent_lins, parent_frames, preds,
     raise NotImplementedError("forward for LAYERNORM not implemented in dual_tf")
 
 
-def backward_layernorm(L, nu, bounds_dict, preds, M: int = 1):
+def backward_layernorm(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
     """LayerNorm backward via linearization around reference mean/var. (Pending)"""
     raise NotImplementedError("backward for LAYERNORM not implemented in dual_tf")
 
@@ -53,6 +53,6 @@ def forward_gelu(L, parent_boxes, parent_lins, parent_frames, preds,
     raise NotImplementedError("forward for GELU not implemented in dual_tf")
 
 
-def backward_gelu(L, nu, bounds_dict, preds, M: int = 1):
+def backward_gelu(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
     """GELU backward: linear relaxation similar to smooth activations. (Pending)"""
     raise NotImplementedError("backward for GELU not implemented in dual_tf")

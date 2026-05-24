@@ -3,7 +3,7 @@
 # Copyright (C) 2025- ACT Team
 # Licensed under AGPLv3+; distributed without warranty.
 #===---------------------------------------------------------------------===#
-# Batch-aware MLP backward kernels for dual (Wong-Kolter) bound computation.
+# Batch-aware MLP backward kernels for linear-relaxation dual bound computation.
 #
 # Kernel convention (STRICT, batch-first):
 #   nu      : Tensor[B, *layer_shape]   # dual variable, batch-first
@@ -73,7 +73,7 @@ def forward_identity(
 
 
 def backward_identity(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                      preds: List[int], M: int = 1
+                      preds: List[int], M: int = 1, alpha=None
                       ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     nu_out, contrib = dual_identity_backward(nu)
     # 0 preds (pure INPUT) -> []; 1 pred (FLATTEN/RESHAPE/…) -> [nu_out].
@@ -125,7 +125,7 @@ def forward_dense(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tuple[Bounds, Bounds, LinearBound, Frame]:
-    """Forward handler for DENSE (Wong-Kolter dual-track + interval intersection).
+    """Forward handler for DENSE (linear-relaxation dual-track + interval intersection).
 
     Source: tf_forward.py lines 371-378. Composes lin via ``_fwd_dense``,
     concretizes against the predecessor frame, intersects with the interval
@@ -154,7 +154,7 @@ def forward_dense(
 
 
 def backward_dense(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                   preds: List[int], M: int = 1
+                   preds: List[int], M: int = 1, alpha=None
                    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     nu_out, contrib = dual_dense_backward(nu, L.params["weight"], L.params.get("bias"))
     assert len(preds) == 1, f"DENSE expects 1 predecessor, got {len(preds)}"
@@ -268,32 +268,29 @@ def forward_lrelu(
 
 
 def backward_relu(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                  preds: List[int], M: int = 1
+                  preds: List[int], M: int = 1, alpha=None
                   ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     bounds = bounds_dict.get(L.id)
     if bounds is None:
         raise ValueError(f"backward_relu: layer {L.id} missing bounds in bounds_dict")
-    nu_out, contrib = dual_relu_backward(nu, bounds, M)
+    nu_out, contrib = dual_relu_backward(nu, bounds, M, alpha=alpha)
     assert len(preds) == 1, f"RELU expects 1 predecessor, got {len(preds)}"
     return [nu_out], contrib
 
 
-def dual_relu_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1
+def dual_relu_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1,
+                       alpha: Optional[torch.Tensor] = None
                        ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Wong-Kolter backward for ReLU, computing LB(nu @ relu(z)).
+    """Backward kernel for ReLU with optional Lagrange-relaxed lower slope.
 
-    Relaxation (ambiguous neurons, l<0<u): slope = u/(u-l), intercept = -slope*l.
-        Lower envelope: y >= slope*z              (sound: slope*z <= relu(z))
-        Upper envelope: y <= slope*z + intercept  (line through (l,0) and (u,u))
+    When alpha is None: use chord slope u/(u-l) on both lower and upper
+    envelopes (fixed-slope dual relaxation).
+    When alpha is provided shape [B, M, n] (per-spec optimizable lower slope):
+        v >= 0 (LB env): slope = alpha[b, m, i]   (α ∈ [0, 1], optimizable)
+        v <  0 (UB env): slope = u/(u-l)          (chord, unchanged)
 
-    LB(nu @ y) decomposes per neuron:
-        nu_i >= 0: bound y_i from BELOW (lower env)  -> intercept contrib = 0
-        nu_i <  0: bound y_i from ABOVE (upper env)  -> intercept contrib = nu_i * intercept
-
-    Both envelopes share the same slope, so d = slope for all amb regardless of
-    sign of nu — the contrib term is what differs.
-
-    Lazy M-broadcast: bounds stays at [B, *shape]; nu is [B*M, *shape].
+    Crossing intercept: -slope * l where slope = chord, applied only where v < 0.
+    Preserves lazy-M-broadcast: bounds [B, n] broadcast against nu [B, M, n].
     """
     BM = nu.shape[0]
     assert BM % M == 0, f"dual_relu_backward: nu batch {BM} not divisible by M={M}"
@@ -307,6 +304,8 @@ def dual_relu_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1
         v_flat = v_flat[..., :n]
         l_B = l_B[..., :n]
         u_B = u_B[..., :n]
+        if alpha is not None and alpha.shape[-1] != n:
+            alpha = alpha[..., :n]
     assert (l_B <= u_B).all(), "Invalid bounds: l > u"
 
     v = v_flat.view(B, M, n)
@@ -314,17 +313,33 @@ def dual_relu_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1
     u = u_B.unsqueeze(1)
 
     on, off, amb = get_relu_masks(l, u)
-    d = torch.zeros_like(v)
-    d = torch.where(on, torch.ones_like(d), d)
     if amb.any():
         denom = (u - l).clamp(min=1e-12)
         slope = u / denom
-        d = torch.where(amb, slope.expand_as(v), d)
+
+        if alpha is not None:
+            assert alpha.dim() >= 2, f"alpha must be batched, got {alpha.shape}"
+            if alpha.dim() == 2:
+                alpha_bmn = alpha.unsqueeze(1).expand(B, M, n)
+            else:
+                alpha_bmn = alpha
+            d_lower = alpha_bmn
+            d_upper_bmn = slope.expand(B, M, n)
+            d = torch.where(v >= 0, d_lower, d_upper_bmn)
+            d = torch.where(on.expand_as(d), torch.ones_like(d), d)
+            d = torch.where(off.expand_as(d), torch.zeros_like(d), d)
+        else:
+            d = torch.zeros_like(v)
+            d = torch.where(on, torch.ones_like(d), d)
+            d = torch.where(amb, slope.expand_as(v), d)
+
         intercept = -slope * l
         contrib_per = torch.where(amb, v.clamp(max=0) * intercept,
                                   torch.zeros_like(v))
         contrib = contrib_per.sum(dim=-1).view(BM)
     else:
+        d = torch.zeros_like(v)
+        d = torch.where(on, torch.ones_like(d), d)
         contrib = torch.zeros(BM, dtype=nu.dtype, device=nu.device)
 
     v_out = d * v
@@ -362,7 +377,7 @@ def forward_bias(
 
 
 def backward_bias(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                  preds: List[int], M: int = 1
+                  preds: List[int], M: int = 1, alpha=None
                   ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     nu_out, contrib = dual_bias_backward(nu, L.params["c"])
     assert len(preds) == 1, f"BIAS expects 1 predecessor, got {len(preds)}"
@@ -409,7 +424,7 @@ def forward_scale(
 
 
 def backward_scale(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                   preds: List[int], M: int = 1
+                   preds: List[int], M: int = 1, alpha=None
                    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     nu_out, contrib = dual_scale_backward(nu, L.params["a"])
     assert len(preds) == 1, f"SCALE expects 1 predecessor, got {len(preds)}"
@@ -458,7 +473,7 @@ def forward_bn(
 
 
 def backward_bn(L: Any, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                preds: List[int], M: int = 1
+                preds: List[int], M: int = 1, alpha=None
                 ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     nu_out, contrib = dual_bn_backward(nu, L.params["A"], L.params["c"])
     assert len(preds) == 1, f"BN expects 1 predecessor, got {len(preds)}"

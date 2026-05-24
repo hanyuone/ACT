@@ -49,7 +49,7 @@ class Solver:
         Implemented by ``GurobiSolver`` and ``HZSolver``.
       * ``solve_batch(BatchLPProblem)`` — batched LP/MILP. Implemented by
         ``GurobiSolver``, ``TorchLPSolver``, ``HZSolver``.
-      * ``compute_certified_bound(net, bounds_dict, c)`` — Wong-Kolter
+      * ``compute_certified_bound(net, bounds_dict, c)`` — linear-relaxation
         dual lower bound on ``c @ output``. Implemented by ``DualSolver``.
 
     Callers dispatch by reading ``capabilities()`` rather than relying on
