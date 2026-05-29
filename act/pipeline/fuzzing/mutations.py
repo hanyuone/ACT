@@ -487,13 +487,17 @@ class MutationEngine:
         # LINF_BALL: feasible region is [center - eps, center + eps] (L∞ ball around center)
         if self.input_spec.kind == InKind.BOX:
             # BOX constraints: lb and ub are directly specified
+            assert self.input_spec.lb is not None and self.input_spec.ub is not None
             lb = self.input_spec.lb
             ub = self.input_spec.ub
         elif self.input_spec.kind == InKind.LINF_BALL:
             # L∞ ball constraints: range is 2*eps around center point
             # The feasible region is all points x such that ||x - center||_∞ <= eps
-            lb = self.input_spec.center - self.input_spec.eps
-            ub = self.input_spec.center + self.input_spec.eps
+            assert self.input_spec.center is not None and self.input_spec.eps is not None
+            center = self.input_spec.center
+            eps = self.input_spec.eps.to(device=center.device, dtype=center.dtype)
+            lb = center - eps
+            ub = center + eps
         else:
             print(f"[MutationEngine] Unsupported InputSpec kind '{self.input_spec.kind}', falling back to fixed perturb_size=0.01")
             return 0.01
@@ -589,9 +593,13 @@ class MutationEngine:
         # Dynamic per-seed scale: s_b = 1 - (1 - s₀)^{n_b+1}
         if self.perturb_mode != "fixed" and self.input_spec is not None:
             if self.input_spec.kind == InKind.LINF_BALL:
-                _lb = seeds.original_tensor.to(self.device) - self.input_spec.eps
-                _ub = seeds.original_tensor.to(self.device) + self.input_spec.eps
+                assert self.input_spec.eps is not None
+                _orig = seeds.original_tensor.to(self.device)
+                _eps = self.input_spec.eps.to(device=_orig.device, dtype=_orig.dtype)
+                _lb = _orig - _eps
+                _ub = _orig + _eps
             else:
+                assert self.input_spec.lb is not None and self.input_spec.ub is not None
                 _lb = self.input_spec.lb.to(self.device)
                 _ub = self.input_spec.ub.to(self.device)
                 if _lb.shape[0] > 1:
@@ -656,6 +664,7 @@ class MutationEngine:
         B = tensor.shape[0]
         
         if self.input_spec.kind == InKind.BOX:
+            assert self.input_spec.lb is not None and self.input_spec.ub is not None
             lb = self.input_spec.lb.to(tensor.device)
             ub = self.input_spec.ub.to(tensor.device)
             
@@ -675,12 +684,14 @@ class MutationEngine:
         
         elif self.input_spec.kind == InKind.LINF_BALL:
             eps = self.input_spec.eps
+            assert eps is not None
             
             assert seeds is not None and len(seeds) == B, \
                 f"LINF_BALL projection requires seeds (got {len(seeds) if seeds else 0}, expected {B})"
             
             # Use original_tensor as center to maintain L∞ distance from original
             center = seeds.original_tensor.to(tensor.device)
+            eps = eps.to(device=tensor.device, dtype=tensor.dtype)
             
             delta = tensor - center
             delta = torch.clamp(delta, -eps, eps)

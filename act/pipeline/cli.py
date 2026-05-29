@@ -13,8 +13,9 @@ License: AGPLv3+
 import argparse
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 import sys
+import torch
 
 from act.util.cli_utils import add_device_args, initialize_from_args
 
@@ -514,7 +515,31 @@ def cmd_list_verifications():
     print(f"\n{'=' * 80}\n")
 
 
-def _run_vnnlib_verify(args) -> None:
+def _run_soundness_check(tag: str, vm, net, results, validator, solver: str):
+    vm = vm.to(validator.device, validator.dtype).eval()
+    summary = validator.validate_results_soundness(
+        tag, vm, results, solver=solver, act_net=net
+    )
+    for result in summary["results"]:
+        status = result["validation_status"]
+        ce_label = "FOUND" if result["concrete_counterexample"] else "NOT_FOUND"
+        verifier = result["verifier_result"].name
+        print(
+            f"  [soundness] {result['network']}: {status} "
+            f"(concrete_ce={ce_label}, verifier={verifier})"
+        )
+    return summary
+
+
+def _print_soundness_summary(summary: dict[str, Any]) -> None:
+    print(
+        f"SOUNDNESS SUMMARY: total={summary['total']} passed={summary['passed']} "
+        f"acceptable={summary['acceptable']} inconclusive={summary['inconclusive']} "
+        f"failed={summary['failed']} unknown={summary['unknown']}"
+    )
+
+
+def _run_vnnlib_verify(args) -> bool:
     """Drive ``verify_once`` over a VNNLIB benchmark end-to-end.
 
     Bridges the front-end load → ACT-Net path that ``act.back_end --verify
@@ -535,6 +560,7 @@ def _run_vnnlib_verify(args) -> None:
         set_solver_mode,
         set_transfer_function_mode,
     )
+    from act.pipeline.verification.validate_verifier import VerificationValidator
 
     if not args.category:
         raise ValueError("--verify vnnlib requires --category (e.g. --category acasxu_2023)")
@@ -558,15 +584,32 @@ def _run_vnnlib_verify(args) -> None:
     if not wrapped:
         raise RuntimeError("synthesize_models_from_specs produced no VerifiableModels")
 
+    validator = None
+    soundness_summary = None
+    if args.validate_soundness:
+        dtype = torch.float64 if args.dtype == "float64" else torch.float32
+        validator = VerificationValidator(device=args.device, dtype=dtype)
     for mid, vm in wrapped.items():
         tag = "/".join(str(p) for p in mid)
         net = TorchToACT(vm).run()
         results = verify_once(net)
         statuses = [r.status.name for r in results]
         print(f"  {tag}: {statuses}")
+        if args.validate_soundness:
+            assert validator is not None
+            soundness_summary = _run_soundness_check(
+                tag, vm, net, results, validator, solver
+            )
+
+    if args.validate_soundness:
+        assert validator is not None and soundness_summary is not None
+        soundness_summary = validator._compute_summary(validation_type="counterexample")
+        _print_soundness_summary(soundness_summary)
+        return soundness_summary["failed"] > 0
+    return False
 
 
-def _run_torchvision_verify(args) -> None:
+def _run_torchvision_verify(args) -> bool:
     """Drive ``verify_once`` over a TorchVision dataset-model pair end-to-end.
 
     Bridges the front-end load → ACT-Net path for TorchVision the same way
@@ -589,6 +632,7 @@ def _run_torchvision_verify(args) -> None:
         set_solver_mode,
         set_transfer_function_mode,
     )
+    from act.pipeline.verification.validate_verifier import VerificationValidator
 
     if not args.dataset:
         raise ValueError("--verify torchvision requires --dataset (e.g. --dataset MNIST)")
@@ -621,12 +665,29 @@ def _run_torchvision_verify(args) -> None:
     if not wrapped:
         raise RuntimeError("synthesize_models_from_specs produced no VerifiableModels")
 
+    validator = None
+    soundness_summary = None
+    if args.validate_soundness:
+        dtype = torch.float64 if args.dtype == "float64" else torch.float32
+        validator = VerificationValidator(device=args.device, dtype=dtype)
     for mid, vm in wrapped.items():
         tag = "/".join(str(p) for p in mid)
         net = TorchToACT(vm).run()
         results = verify_once(net)
         statuses = [r.status.name for r in results]
         print(f"  {tag}: {statuses}")
+        if args.validate_soundness:
+            assert validator is not None
+            soundness_summary = _run_soundness_check(
+                tag, vm, net, results, validator, solver
+            )
+
+    if args.validate_soundness:
+        assert validator is not None and soundness_summary is not None
+        soundness_summary = validator._compute_summary(validation_type="counterexample")
+        _print_soundness_summary(soundness_summary)
+        return soundness_summary["failed"] > 0
+    return False
 
 
 def cmd_verify(target: str, args):
@@ -675,8 +736,8 @@ def cmd_verify(target: str, args):
             print(f"VERIFICATION TEST: VNNLIB → VerifiableModel → verify_once")
             print(f"{'=' * 80}\n")
             try:
-                _run_vnnlib_verify(args)
-                results[test_name] = "PASSED"
+                soundness_failed = _run_vnnlib_verify(args)
+                results[test_name] = "FAILED" if soundness_failed else "PASSED"
             except Exception as e:
                 print(f"\n❌ Test failed: {e}")
                 import traceback
@@ -688,8 +749,8 @@ def cmd_verify(target: str, args):
             print(f"VERIFICATION TEST: TorchVision → VerifiableModel → verify_once")
             print(f"{'=' * 80}\n")
             try:
-                _run_torchvision_verify(args)
-                results[test_name] = "PASSED"
+                soundness_failed = _run_torchvision_verify(args)
+                results[test_name] = "FAILED" if soundness_failed else "PASSED"
             except Exception as e:
                 print(f"\n❌ Test failed: {e}")
                 import traceback
@@ -1081,6 +1142,13 @@ Examples:
         "--ignore-errors",
         action="store_true",
         help="Always exit 0 (ignore failures and errors for CI)",
+    )
+
+    verify_group = parser.add_argument_group("Verify Options")
+    verify_group.add_argument(
+        "--validate-soundness",
+        action="store_true",
+        help="After --verify vnnlib/torchvision, run concrete-counterexample soundness validation on the same instances",
     )
 
     # Add standard device/dtype arguments (shared across all ACT CLIs)

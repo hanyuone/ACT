@@ -131,15 +131,28 @@ def _merge_specs_to_batch(
         center, eps = None, None
     elif in_kind == InKind.LINF_BALL:
         # Assert all center tensors have the same shape
+        first_center = in_specs[0].center
+        assert first_center is not None
         if len(in_specs) > 1:
-            first_center_shape = in_specs[0].center.shape
-            assert all(s.center.shape == first_center_shape for s in in_specs), \
-                f"InputSpec.center shape mismatch: {[s.center.shape for s in in_specs]}"
+            first_center_shape = first_center.shape
+            assert all(s.center is not None and s.center.shape == first_center_shape for s in in_specs), \
+                f"InputSpec.center shape mismatch: {[s.center.shape if s.center is not None else None for s in in_specs]}"
         
-        center = torch.cat([s.center for s in in_specs], dim=0)
-        lb = torch.cat([torch.clamp(s.center - s.eps, 0) for s in in_specs], dim=0)
-        ub = torch.cat([torch.clamp(s.center + s.eps, 1) for s in in_specs], dim=0)
-        eps = torch.stack([s.eps for s in in_specs])
+        centers: List[torch.Tensor] = []
+        lbs: List[torch.Tensor] = []
+        ubs: List[torch.Tensor] = []
+        eps_values: List[torch.Tensor] = []
+        for spec in in_specs:
+            assert spec.center is not None and spec.eps is not None
+            centers.append(spec.center)
+            lbs.append(torch.clamp(spec.center - spec.eps, 0))
+            ubs.append(torch.clamp(spec.center + spec.eps, 1))
+            eps_values.append(spec.eps.reshape(-1)[0])
+        center = torch.cat(centers, dim=0)
+        lb = torch.cat(lbs, dim=0)
+        ub = torch.cat(ubs, dim=0)
+        eps = torch.stack(eps_values)
+        eps = eps.reshape(center.shape[0], *([1] * (center.ndim - 1)))
     else:
         raise NotImplementedError(f"Batching for {in_kind} not implemented")
     

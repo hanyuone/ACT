@@ -61,6 +61,11 @@ jobs:
           cd ${{ github.workspace }}
           coverage run -p -m act.front_end --download MNIST
 
+      - name: Verify TorchVision MNIST + simple_cnn with verifier soundness validation
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --verify torchvision --dataset MNIST --model simple_cnn --num-samples 1 --tf-modes interval --solvers torchlp --validate-soundness --device cpu --dtype float64
+
       - name: Verify acasxu_2023 (interval / hybridz / dual)
         run: |
           cd ${{ github.workspace }}
