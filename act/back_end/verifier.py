@@ -202,7 +202,7 @@ def seed_from_input_specs(spec_layers) -> Bounds:
             center = spec_layer.params.get("center")
             eps = spec_layer.params.get("eps")
             if center is not None and eps is not None:
-                e = torch.tensor(eps)
+                e = eps.to(device=center.device, dtype=center.dtype) if torch.is_tensor(eps) else center.new_tensor(eps)
                 return Bounds(center - e, center + e)
     
     # LIN_POLY only -> error
@@ -233,7 +233,7 @@ def add_all_input_specs(globalC: ConSet, input_ids: List[int], spec_layers) -> N
             else:
                 center = L.params["center"]
                 eps = L.params["eps"]
-                e = torch.tensor(eps)
+                e = eps.to(device=center.device, dtype=center.dtype) if torch.is_tensor(eps) else center.new_tensor(eps)
                 globalC.add_box(-1, input_ids, Bounds(center - e, center + e))
         elif k == InKind.LIN_POLY:
             A, b = L.params["A"], L.params["b"]

@@ -217,7 +217,11 @@ class PropertyChecker:
         runner_up_logits = outputs.masked_fill(~mask, float('-inf')).max(dim=1).values
         
         margins = true_logits - runner_up_logits
-        threshold = getattr(self.spec, 'margin', 0.0) or 0.0
+        threshold = getattr(self.spec, 'margin', None)
+        if threshold is None:
+            threshold = 0.0
+        elif torch.is_tensor(threshold):
+            threshold = threshold.to(device)
         violations_mask = valid_mask & (margins < threshold)
         
         actual = torch.full((B,), -1, dtype=torch.long, device=device)

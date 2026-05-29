@@ -444,7 +444,8 @@ class VerificationValidator:
         model.eval()
 
         try:
-            act_net = self.factory.get_act_net(name)
+            if act_net is None:
+                act_net = self.factory.get_act_net(name)
             input_shape = None
             shape_prod = None
             if act_net is not None:
@@ -824,11 +825,35 @@ class VerificationValidator:
         self.validation_results.append(validation)
         return validation
 
+    def validate_results_soundness(
+        self,
+        name: str,
+        model: torch.nn.Module,
+        results: List[Any],
+        solver: str,
+        act_net: Optional[Net] = None,
+    ) -> Dict[str, Any]:
+        counterexample = self.find_concrete_counterexample(
+            name, model, act_net=act_net
+        )
+        call_results = []
+        for idx, verify_result in enumerate(results):
+            validation = self._cross_validate_counterexample(
+                network_name=f"{name}[{idx}]",
+                solver_name=solver,
+                concrete_counterexample=counterexample,
+                verifier_status=verify_result.status,
+            )
+            validation["batch_size"] = None
+            self.validation_results.append(validation)
+            call_results.append(validation)
+        return self._summarize_results("counterexample", call_results)
+
     def _cross_validate_counterexample(
         self,
         network_name: str,
         solver_name: str,
-        concrete_counterexample: Optional[Tuple],
+        concrete_counterexample: Optional[Tuple[torch.Tensor, Dict[str, Any]]],
         verifier_status: VerifyStatus,
     ) -> Dict[str, Any]:
         """
@@ -1271,6 +1296,11 @@ class VerificationValidator:
             for r in self.validation_results
             if r.get("validation_type") == validation_type
         ]
+        return self._summarize_results(validation_type, results)
+
+    def _summarize_results(
+        self, validation_type: str, results: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
         total = len(results)
 
         if total == 0:
@@ -1282,6 +1312,7 @@ class VerificationValidator:
                 "acceptable": 0,
                 "inconclusive": 0,
                 "skipped": 0,
+                "unknown": 0,
                 "errors": 0,
                 "results": [],
                 "error_message": "No validation results (all tests encountered errors)",
@@ -1298,6 +1329,9 @@ class VerificationValidator:
         skipped = sum(
             1 for r in results if r.get("validation_status") == "SKIPPED"
         )
+        unknown = sum(
+            1 for r in results if r.get("validation_status") == "UNKNOWN"
+        )
         errors = sum(1 for r in results if r.get("status") == "ERROR")
 
         summary = {
@@ -1308,6 +1342,7 @@ class VerificationValidator:
             "acceptable": acceptable,
             "inconclusive": inconclusive,
             "skipped": skipped,
+            "unknown": unknown,
             "errors": errors,
             "results": results,
         }

@@ -545,8 +545,9 @@ class InputSpecLayer(nn.Module):
             # Per-sample L∞ distance
             linf = (x - center).abs().reshape(batch_size, -1).max(dim=1)[0]  # (batch,)
             
-            # Compare against eps threshold (tensor, supports batched comparison)
-            satisfied = linf <= self.eps
+            # Compare against per-sample eps threshold.
+            eps = self.eps.reshape(self.eps.shape[0])
+            satisfied = linf <= eps
             
             n_ok = satisfied.sum().item()
             explanation = f"✅ INPUT L∞: {n_ok}/{batch_size} satisfied"
