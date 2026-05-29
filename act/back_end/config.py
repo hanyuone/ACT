@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, Final, List, Optional, Union
 
 import yaml
 
@@ -21,6 +21,7 @@ _VALID_DEVICES = {"cpu", "cuda", "gpu"}
 _VALID_DTYPES = {"float32", "float64"}
 _VALID_REGISTRY_MODES = {"intersection", "union"}
 _VALID_COVERAGE_MODES = {"basic", "full"}
+VALID_SOLVER_TIERS: Final[tuple[str, ...]] = ("lp", "dual", "dual_alpha", "dual_alpha_eta")
 
 
 # ---------------------------------------------------------------------------
@@ -41,20 +42,20 @@ class BaBConfig:
 
     max_depth: int = 20
     max_nodes: int = 2000
+    frontier_cap: int = 0
+    input_split_fanout: int = 2
 
     branching_method: str = "random"
     bounding_method: str = "random"
+    bounding_order: str = "depth_lb"
+    bounding_depth_weight: float = 0.5
+    bounding_bound_weight: float = 0.5
+    sa_cooling_rate: float = 0.99
 
     # Dual-tier solver knobs — support solver_tier="dual_alpha_eta" with
     # Iterative slope + Lagrange-multiplier optimization for the dual backward pass.
     solver_tier: str = "lp"
-    """Solver tier for BaB bound computation. One of:
-
-    - ``"lp"``             (default): LP/MILP backend.
-    - ``"dual"``           : DualSolver (linear-relaxation dual bound, no iterative optimization).
-    - ``"dual_alpha"``     : DualSolver with Lagrange-relaxed lower-slope optimization (Adam on α ∈ [0, 1]).
-    - ``"dual_alpha_eta"`` : DualSolver with joint slope + split-constraint KKT-multiplier optimization (α, η).
-    """
+    f"""Solver tier for BaB bound computation. Valid: {VALID_SOLVER_TIERS}."""
 
     dual_n_iters: int = 50
     """Number of Adam iterations for α/η optimization (only used in ``dual_alpha`` / ``dual_alpha_eta`` tiers)."""
@@ -68,11 +69,14 @@ class BaBConfig:
     lr_decay: float = 0.98
     """Multiplicative learning-rate decay applied each Adam iteration."""
 
-    warm_start_enabled: bool = True
+    incremental_start_enabled: bool = True
     """Reuse α/η tensors from the parent subproblem as the initial point for child optimization."""
 
     per_class_alpha: bool = True
     """Allocate separate α tensors per output class (tighter bounds) rather than sharing one α."""
+
+    provenance_enabled: bool = False
+    """Track logical BaB node ids and parent ids in TopKBounding."""
 
     verbose: bool = False
 
@@ -99,7 +103,7 @@ class BaBConfig:
 
         # Support both nested (backend.bab) and flat (bab) YAML layouts.
         backend_section = yaml_data.get("backend", {})
-        yaml_config: dict = backend_section.get("bab", yaml_data.get("bab", {}))
+        yaml_config: dict[str, Any] = backend_section.get("bab", yaml_data.get("bab", {}))
 
         valid_keys = {fld.name for fld in fields(cls)}
         merged = {k: v for k, v in yaml_config.items() if k in valid_keys}
@@ -279,9 +283,9 @@ class BackendConfig:
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
 
-        backend_raw: dict = raw.get("backend", {})
-        bab_raw: dict = backend_raw.pop("bab", {})
-        gen_raw: dict = backend_raw.pop("generation", {})
+        backend_raw: dict[str, Any] = raw.get("backend", {})
+        bab_raw: dict[str, Any] = backend_raw.pop("bab", {})
+        gen_raw: dict[str, Any] = backend_raw.pop("generation", {})
 
         # Extract "enabled" from bab section → top-level bab_enabled
         bab_enabled = bab_raw.pop("enabled", None)
@@ -289,9 +293,9 @@ class BackendConfig:
         # Route prefixed overrides to the right sub-config
         bab_fields = {fld.name for fld in fields(BaBConfig)}
         gen_fields = {fld.name for fld in fields(GenerationConfig)}
-        bab_overrides: dict = {}
-        gen_overrides: dict = {}
-        top_overrides: dict = {}
+        bab_overrides: dict[str, Any] = {}
+        gen_overrides: dict[str, Any] = {}
+        top_overrides: dict[str, Any] = {}
         for k, v in overrides.items():
             if k.startswith("bab_") and k[4:] in bab_fields:
                 bab_overrides[k[4:]] = v
@@ -312,7 +316,7 @@ class BackendConfig:
 
         # Build top-level config
         top_fields = {fld.name for fld in fields(cls)} - {"bab", "generation"}
-        top_merged: dict = {}
+        top_merged: dict[str, Any] = {}
         for k, v in backend_raw.items():
             if k in top_fields:
                 top_merged[k] = v

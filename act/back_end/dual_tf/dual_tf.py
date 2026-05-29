@@ -7,6 +7,8 @@
 # --solver choice, not a --tf-mode. Instantiated internally by
 # act.back_end.solver.solver_dual.DualSolver.
 #===---------------------------------------------------------------------===#
+# pyright: reportImportCycles=false, reportOptionalMemberAccess=false, reportAttributeAccessIssue=false, reportCallIssue=false, reportArgumentType=false
+# justification: registry imports are intentionally cyclic with kernel modules; Layer params and LinearBound fields are dynamically validated tensors.
 
 
 import torch
@@ -214,7 +216,7 @@ class DualTF:
     # ---------------------------------------------------------
     # The η subtraction `nu = nu - eta * signs` executes immediately BEFORE the
     # activation-layer's backward handler runs, inside the reverse-topological
-    # iteration. `etas` and `stacked_signs` are keyed by ACTIVATION layer.id
+    # iteration. `etas` and `split_signs` are keyed by ACTIVATION layer.id
     # (RELU, LRELU, SIGMOID, TANH), not by the upstream linear layer.id. This
     # yields
     #     nu_pre = slope · (nu_post − η · sign) = slope · nu_post − (slope · η) · sign

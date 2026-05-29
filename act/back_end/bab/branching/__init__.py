@@ -11,7 +11,16 @@ from act.back_end.bab.branching.branching import (
     RandomBranching,
     BaBSRBranching,
 )
-from act.back_end.bab.branching.bounding import BoundingStrategy, RandomBounding
+from act.back_end.bab.branching.bounding import (
+    BoundingStrategy,
+    RandomBounding,
+    TopKBounding,
+    OrderFunction,
+    DepthLowerBoundOrder,
+    GreedyOrder,
+    SAOrder,
+    ORDER_REGISTRY,
+)
 
 __all__ = [
     "BranchingStrategy",
@@ -19,4 +28,10 @@ __all__ = [
     "BaBSRBranching",
     "BoundingStrategy",
     "RandomBounding",
+    "TopKBounding",
+    "OrderFunction",
+    "DepthLowerBoundOrder",
+    "GreedyOrder",
+    "SAOrder",
+    "ORDER_REGISTRY",
 ]

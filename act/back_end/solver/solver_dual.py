@@ -7,11 +7,14 @@
 # STRICT batched API ([B, *shape] only). Raises ValueError on 1-D input.
 # Mirrors HZSolver precedent in solver_hz.py.
 #===---------------------------------------------------------------------===#
-# pyright: reportMissingImports=false, reportImportCycles=false, reportArgumentType=false, reportIncompatibleMethodOverride=false
+# pyright: reportMissingImports=false, reportImportCycles=false
+# justification: torch C-extension stubs are absent in CI; DualSolver and verifier share result utilities during type analysis
 
 from __future__ import annotations
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, cast
+
 import torch
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union, cast
 from act.back_end.core import Bounds, Net
 from act.back_end.layer_schema import LayerKind
 from act.back_end.solver.solver_base import Solver, SolverCaps
@@ -23,16 +26,24 @@ if TYPE_CHECKING:
     from act.back_end.dual_tf.dual_tf import DualTF
 
 
+@dataclass(frozen=True)
+class DualResult:
+    """Result of ``compute_certified_bound``. Fields depend on caller flags."""
+
+    margins: torch.Tensor
+    sce: Optional[Any] = None
+    alpha_state: Optional[Dict[int, torch.Tensor]] = None
+    eta_state: Optional[Dict[int, torch.Tensor]] = None
+    nu_per_layer: Optional[Dict[int, torch.Tensor]] = None
+
+
 def expand_bounds_dict(bounds_dict: Dict[int, Bounds], M: int) -> Dict[int, Bounds]:
     """Expand each batched Bounds entry from [B, *shape] to [B*M, *shape].
 
-    .. deprecated:: superseded by lazy M-broadcast
-        ``DualSolver.evaluate_spec`` and ``_chunked_eval`` no longer call this
-        helper — they thread ``M`` through ``compute_certified_bound`` and
-        broadcast inside activation handlers instead, avoiding the M× memory
-        blowup. Retained for transitional numerical-equivalence testing and
-        external callers (e.g. legacy BaB code paths); will be removed once
-        all callers migrate.
+    The dual solver threads ``M`` through ``compute_certified_bound`` and
+    broadcasts inside the activation handlers (lazy M-broadcast), avoiding the
+    M× memory blowup; this explicit expansion is for callers that need a
+    materialized M-expanded bounds dict.
 
     repeat_interleave aligns with row b*M+j sharing sample b's bounds. All
     entries must already be batched (lb.dim() >= 2). M=1 returns the dict
@@ -89,16 +100,15 @@ class DualSolver(Solver):
     _AFFINE_CONTRIB_KINDS = {
         LayerKind.DENSE.value,
         LayerKind.CONV2D.value,
-        "BIAS",
-        "BN",
-        "ADD",
+        LayerKind.BIAS.value,
+        LayerKind.BN.value,
+        LayerKind.ADD.value,
     }
 
     def __init__(self, n_iters: int = 0):
-        # DualTF is now a backward-registry holder (not a TransferFunction);
-        # instantiate internally so callers don't need to know about it.
-        # Recent refactor moved dual from the --tf-mode axis to the --solver axis,
-        # making DualSolver fully self-contained — no external TF coupling.
+        # DualTF is a backward-handler registry (not a TransferFunction);
+        # instantiate it internally so DualSolver is self-contained and callers
+        # need no knowledge of it.
         from act.back_end.dual_tf.dual_tf import DualTF
         self.tf = DualTF()
         self.n_iters = n_iters
@@ -114,24 +124,18 @@ class DualSolver(Solver):
         enable_grad: bool = False,
         alpha: Optional[Dict[int, torch.Tensor]] = None,
         eta: Optional[Dict[int, torch.Tensor]] = None,
-        split_signs: Optional[Dict[int, torch.Tensor]] = None,
+        split_signs: Optional[Union[Dict[int, torch.Tensor], List[Dict[int, torch.Tensor]]]] = None,
         optimize: bool = False,
         n_iters: int = 50,
         lr_alpha: float = 0.1,
         lr_beta: float = 0.1,
         lr_decay: float = 0.98,
-        warm_alphas: Optional[Dict[int, torch.Tensor]] = None,
-        warm_etas: Optional[Dict[int, torch.Tensor]] = None,
+        incremental_alphas: Optional[Dict[int, torch.Tensor]] = None,
+        incremental_etas: Optional[Dict[int, torch.Tensor]] = None,
         return_optimized: bool = False,
         per_class_alpha: bool = True,
-    ) -> Union[
-        torch.Tensor,
-        Tuple[torch.Tensor, Optional[torch.Tensor]],
-        Tuple[torch.Tensor, Dict[int, torch.Tensor]],
-        Tuple[torch.Tensor, Dict[int, torch.Tensor], Dict[int, torch.Tensor]],
-        Tuple[torch.Tensor, Optional[torch.Tensor], Dict[int, torch.Tensor]],
-        Tuple[torch.Tensor, Optional[torch.Tensor], Dict[int, torch.Tensor], Dict[int, torch.Tensor]],
-    ]:
+        return_nu_per_layer: bool = False,
+    ) -> DualResult:
         """Batched certified lower bound on c^T @ output (DAG-aware).
 
         Implements ``Solver.compute_certified_bound``; see base for the
@@ -157,25 +161,67 @@ class DualSolver(Solver):
             for this solver; bounds may be looser than a per-lane refinement would
             give, but the dual lower bound remains SOUND.
 
-        When ``optimize=True``, runs joint Adam optimization over ReLU α slopes via
-        ``_optimize_alpha``. If ``return_optimized=True``, also returns the optimized
-        α state for warm-starting. When ``optimize=False``, executes the original
-        single-pass backward path; with ``alpha=None`` this remains bit-identical to
-        the pre-optimization API.
+        When ``optimize=True``, runs joint Adam optimization over ReLU α/η via
+        ``_optimize_alpha_eta``. If ``return_optimized=True``, also returns the optimized
+        α state for incremental-starting. When ``optimize=False``, executes a single-pass
+        backward; with ``alpha=None`` it uses the default fixed-slope relaxation.
 
         eta: Per-layer η multiplier — Lagrange (KKT) multiplier for branch-split
             constraints on activation pre-activations. Keyed by activation layer id
             (RELU, LRELU, SIGMOID, TANH, GELU). η ≥ 0 invariant (enforced by clamp).
         split_signs: Per-layer split direction. {-1: inactive, +1: active, 0: unsplit}.
             Same key set as eta.
-
         η is applied at PRE-ACTIVATION (immediately BEFORE the activation handler
         runs in the reverse-topological backward loop). This yields
         nu_pre = slope · (nu_post − η · sign), equivalently a lifted KKT multiplier
         β = slope · η ≥ 0 acting at the pre-activation. Sound for any η ≥ 0.
         """
+        if isinstance(split_signs, list):
+            # KFSB path: accept K split hypotheses and return stacked margins
+            # [K, N, ...], evaluating each hypothesis through the single-hypothesis
+            # backward pass (no leading-K vectorization).
+            if not split_signs:
+                raise ValueError("split_signs list cannot be empty")
+            if optimize:
+                raise ValueError("list-form split_signs is only supported with optimize=False")
+            if return_optimized:
+                raise ValueError("return_optimized requires optimize=True and single split_signs")
+            stacked_split_signs = self._stack_split_sign_hypotheses(split_signs)
+            normalized_split_signs = self._unstack_split_sign_hypotheses(stacked_split_signs)
+            margins = []
+            sce_values = []
+            for hypo in normalized_split_signs:
+                result = self.compute_certified_bound(
+                    net,
+                    bounds_dict,
+                    c,
+                    M=M,
+                    return_sce=return_sce,
+                    enable_grad=enable_grad,
+                    alpha=alpha,
+                    eta=eta,
+                    split_signs=hypo,
+                    optimize=False,
+                    n_iters=n_iters,
+                    lr_alpha=lr_alpha,
+                    lr_beta=lr_beta,
+                    lr_decay=lr_decay,
+                    incremental_alphas=incremental_alphas,
+                    incremental_etas=incremental_etas,
+                    return_optimized=False,
+                    per_class_alpha=per_class_alpha,
+                    return_nu_per_layer=False,
+                )
+                margins.append(result.margins)
+                if return_sce:
+                    sce_values.append(result.sce)
+            stacked_sce = None
+            if return_sce and sce_values and all(sce is not None for sce in sce_values):
+                stacked_sce = torch.stack(cast(List[torch.Tensor], sce_values), dim=0)
+            return DualResult(margins=torch.stack(margins, dim=0), sce=stacked_sce)
+
         if optimize:
-            bound, sce, alpha_state, eta_state = self._optimize_alpha(
+            bound, sce, alpha_state, eta_state = self._optimize_alpha_eta(
                 net,
                 bounds_dict,
                 c,
@@ -184,24 +230,23 @@ class DualSolver(Solver):
                 lr_alpha=lr_alpha,
                 lr_beta=lr_beta,
                 lr_decay=lr_decay,
-                warm_alphas=warm_alphas,
-                warm_etas=warm_etas,
+                incremental_alphas=incremental_alphas,
+                incremental_etas=incremental_etas,
                 split_signs=split_signs,
                 return_sce=return_sce,
                 per_class_alpha=per_class_alpha,
             )
             if return_optimized:
-                has_eta_state = bool(eta_state)
-                if return_sce:
-                    if has_eta_state:
-                        return bound, sce, alpha_state, eta_state
-                    return bound, sce, alpha_state
-                if has_eta_state:
-                    return bound, alpha_state, eta_state
-                return bound, alpha_state
-            if return_sce:
-                return bound, sce
-            return bound
+                return DualResult(
+                    margins=bound,
+                    sce=sce if return_sce else None,
+                    alpha_state=alpha_state if alpha_state else None,
+                    eta_state=eta_state if eta_state else None,
+                )
+            return DualResult(
+                margins=bound,
+                sce=sce if return_sce else None,
+            )
 
         if c.dim() != 2:
             raise ValueError(
@@ -242,6 +287,7 @@ class DualSolver(Solver):
 
             output_lid = assert_preds[0]
             nu_accum: Dict[int, torch.Tensor] = {output_lid: c.clone()}
+            nu_snapshot: Dict[int, torch.Tensor] = {}
             obj = torch.zeros(B, dtype=c.dtype, device=c.device)
 
             topo_order = _reverse_topological_sort(net)
@@ -280,6 +326,9 @@ class DualSolver(Solver):
                         - eta_l[..., :n_clip] * signs_l[..., :n_clip]
                     )
 
+                if return_nu_per_layer and k == LayerKind.RELU.value:
+                    nu_snapshot[lid] = nu_here.detach().clone()
+
                 preds = list(net.preds.get(lid, []))
                 if alpha is None:
                     pred_nus, contrib = handler(layer, nu_here, bounds_dict, preds, M)
@@ -311,11 +360,19 @@ class DualSolver(Solver):
 
             input_lid = self._find_input_layer_id(net)
             if input_lid is None:
-                return (obj, None) if return_sce else obj
+                return DualResult(
+                    margins=obj,
+                    sce=None if return_sce else None,
+                    nu_per_layer=nu_snapshot if return_nu_per_layer else None,
+                )
 
             nu_final = nu_accum.get(input_lid)
             if nu_final is None:
-                return (obj, None) if return_sce else obj
+                return DualResult(
+                    margins=obj,
+                    sce=None if return_sce else None,
+                    nu_per_layer=nu_snapshot if return_nu_per_layer else None,
+                )
 
             input_contrib, sce = self._input_contribution_from_nu(
                 net,
@@ -327,9 +384,35 @@ class DualSolver(Solver):
                 enable_grad=enable_grad,
             )
             obj = obj + input_contrib
-            return (obj, sce) if return_sce else obj
+            return DualResult(
+                margins=obj,
+                sce=sce if return_sce else None,
+                nu_per_layer=nu_snapshot if return_nu_per_layer else None,
+            )
 
-    def _optimize_alpha(
+    def _stack_split_sign_hypotheses(
+        self,
+        split_signs: List[Dict[int, torch.Tensor]],
+    ) -> Dict[int, torch.Tensor]:
+        layer_ids = sorted({lid for hypo in split_signs for lid in hypo})
+        stacked: Dict[int, torch.Tensor] = {}
+        for lid in layer_ids:
+            template = next(hypo[lid] for hypo in split_signs if lid in hypo)
+            entries = [hypo.get(lid, torch.zeros_like(template)) for hypo in split_signs]
+            stacked[lid] = torch.stack(entries, dim=0)
+        return stacked
+
+    def _unstack_split_sign_hypotheses(
+        self,
+        stacked_split_signs: Dict[int, torch.Tensor],
+    ) -> List[Dict[int, torch.Tensor]]:
+        first = next(iter(stacked_split_signs.values()))
+        hypotheses: List[Dict[int, torch.Tensor]] = []
+        for idx in range(first.shape[0]):
+            hypotheses.append({lid: signs[idx] for lid, signs in stacked_split_signs.items()})
+        return hypotheses
+
+    def _optimize_alpha_eta(
         self,
         net: Net,
         bounds_dict: Dict[int, Bounds],
@@ -339,8 +422,8 @@ class DualSolver(Solver):
         lr_alpha: float = 0.1,
         lr_beta: float = 0.1,
         lr_decay: float = 0.98,
-        warm_alphas: Optional[Dict[int, torch.Tensor]] = None,
-        warm_etas: Optional[Dict[int, torch.Tensor]] = None,
+        incremental_alphas: Optional[Dict[int, torch.Tensor]] = None,
+        incremental_etas: Optional[Dict[int, torch.Tensor]] = None,
         split_signs: Optional[Dict[int, torch.Tensor]] = None,
         return_sce: bool = False,
         per_class_alpha: bool = True,
@@ -378,14 +461,14 @@ class DualSolver(Solver):
 
         input_lid = self._find_input_layer_id(net)
         if input_lid is None:
-            raise ValueError("DualSolver._optimize_alpha: net has no INPUT/INPUT_SPEC layer")
+            raise ValueError("DualSolver._optimize_alpha_eta: net has no INPUT/INPUT_SPEC layer")
         by_id = getattr(net, "by_id", {layer.id: layer for layer in net.layers})
         input_layer = by_id[input_lid]
         input_bounds = bounds_dict.get(input_lid)
         if input_bounds is None:
             if "lb" not in input_layer.params or "ub" not in input_layer.params:
                 raise ValueError(
-                    f"DualSolver._optimize_alpha: input layer {input_lid} has no bounds"
+                        f"DualSolver._optimize_alpha_eta: input layer {input_lid} has no bounds"
                 )
             input_lb = cast(torch.Tensor, input_layer.params["lb"])
             input_ub = cast(torch.Tensor, input_layer.params["ub"])
@@ -403,9 +486,9 @@ class DualSolver(Solver):
             b = bounds_dict.get(layer.id)
             if b is None:
                 continue
-            if warm_alphas is not None and layer.id in warm_alphas:
+            if incremental_alphas is not None and layer.id in incremental_alphas:
                 alpha_init = (
-                    warm_alphas[layer.id]
+                    incremental_alphas[layer.id]
                     .detach()
                     .clone()
                     .to(device=device, dtype=dtype)
@@ -433,9 +516,9 @@ class DualSolver(Solver):
                 signs_init = signs.detach().to(device=device, dtype=dtype)
                 if not (signs_init != 0).any():
                     continue
-                if warm_etas is not None and lid in warm_etas:
+                if incremental_etas is not None and lid in incremental_etas:
                     eta_init = (
-                        warm_etas[lid]
+                        incremental_etas[lid]
                         .detach()
                         .clone()
                         .to(device=device, dtype=dtype)
@@ -451,10 +534,7 @@ class DualSolver(Solver):
             result = self.compute_certified_bound(
                 net, bounds_dict, c, M=M, return_sce=return_sce
             )
-            if return_sce:
-                bound, sce = cast(Tuple[torch.Tensor, Optional[torch.Tensor]], result)
-                return bound.detach(), sce, {}, {}
-            return cast(torch.Tensor, result).detach(), None, {}, {}
+            return result.margins.detach(), result.sce, {}, {}
 
         param_groups: List[Dict[str, object]] = []
         alpha_params = list(alphas.values())
@@ -496,37 +576,19 @@ class DualSolver(Solver):
                     post_activation=False,
                     alphas=forward_alphas,
                 )
-                if return_sce:
-                    bound_bm, sce = cast(
-                        Tuple[torch.Tensor, Optional[torch.Tensor]],
-                        self.compute_certified_bound(
-                            net,
-                            fresh_bounds,
-                            c,
-                            M=M,
-                            return_sce=True,
-                            enable_grad=True,
-                            alpha=alpha_tensors,
-                            eta=eta_tensors,
-                            split_signs=split_signs,
-                        ),
-                    )
-                else:
-                    bound_bm = cast(
-                        torch.Tensor,
-                        self.compute_certified_bound(
-                            net,
-                            fresh_bounds,
-                            c,
-                            M=M,
-                            return_sce=False,
-                            enable_grad=True,
-                            alpha=alpha_tensors,
-                            eta=eta_tensors,
-                            split_signs=split_signs,
-                        ),
-                    )
-                    sce = None
+                result = self.compute_certified_bound(
+                    net,
+                    fresh_bounds,
+                    c,
+                    M=M,
+                    return_sce=return_sce,
+                    enable_grad=True,
+                    alpha=alpha_tensors,
+                    eta=eta_tensors,
+                    split_signs=split_signs,
+                )
+                bound_bm = result.margins
+                sce = result.sce
 
                 (-bound_bm.sum()).backward()
                 optimizer.step()
@@ -566,14 +628,63 @@ class DualSolver(Solver):
                 eta=cast(Dict[int, torch.Tensor], etas),
                 split_signs=split_signs,
             )
-            if return_sce:
-                best_bounds, best_sce = cast(
-                    Tuple[torch.Tensor, Optional[torch.Tensor]], result
-                )
-            else:
-                best_bounds = cast(torch.Tensor, result)
+            best_bounds = result.margins
+            best_sce = result.sce
 
         return best_bounds.detach(), best_sce, best_alpha_state, best_eta_state
+
+    def recompute_bounds_and_nu(
+        self,
+        net: Net,
+        bounds_dict: Dict[int, Bounds],
+        c: torch.Tensor,
+        M: int,
+        alpha_state: Optional[Dict[int, torch.Tensor]] = None,
+        eta_state: Optional[Dict[int, torch.Tensor]] = None,
+        split_signs: Optional[Dict[int, torch.Tensor]] = None,
+        per_class_alpha: bool = True,
+    ) -> Tuple[Dict[int, Bounds], Optional[Dict[int, torch.Tensor]]]:
+        """Forward bounds and per-RELU ν at the converged (α, η), from one pass.
+
+        BaBSR/FSB scoring pairs each RELU's slope/intercept (from interval bounds)
+        with its backward multiplier ν. Both MUST come from the same forward pass or
+        the heuristic mixes an un-optimized interval with an optimized multiplier.
+        Returns ``(fresh_bounds, nu_per_layer)``; soundness is unaffected (the
+        certified bound is produced separately — this output is heuristic-only).
+        """
+        from act.back_end.dual_tf.tf_forward import compute_forward_bounds
+
+        device, dtype = c.device, c.dtype
+        input_lid = self._find_input_layer_id(net)
+        if input_lid is None:
+            return bounds_dict, None
+        input_bounds = bounds_dict.get(input_lid)
+        if input_bounds is None:
+            return bounds_dict, None
+        input_lb = input_bounds.lb.to(device=device, dtype=dtype)
+        input_ub = input_bounds.ub.to(device=device, dtype=dtype)
+
+        with torch.no_grad():
+            forward_alphas = (
+                {lid: (a[:, 0, :] if a.dim() == 3 else a) for lid, a in alpha_state.items()}
+                if alpha_state
+                else None
+            )
+            fresh_bounds = compute_forward_bounds(
+                net, input_lb, input_ub, post_activation=False, alphas=forward_alphas,
+            )
+            result = self.compute_certified_bound(
+                net,
+                fresh_bounds,
+                c,
+                M=M,
+                enable_grad=False,
+                alpha=alpha_state if alpha_state else None,
+                eta=eta_state if eta_state else None,
+                split_signs=split_signs,
+                return_nu_per_layer=True,
+            )
+        return fresh_bounds, result.nu_per_layer
 
     def evaluate_spec(
         self, net: Net,
@@ -678,15 +789,14 @@ class DualSolver(Solver):
 
             with torch.set_grad_enabled(enable_grad):
                 if chunk_size is None or N <= chunk_size:
-                    margins_flat = self.compute_certified_bound(
+                    result = self.compute_certified_bound(
                         net, bounds_dict, C, M=N, enable_grad=enable_grad,
                     )
+                    margins_flat = result.margins
                 else:
                     margins_flat = self._chunked_eval(
                         net, bounds_dict, C, B, N, n_out, chunk_size, enable_grad,
                     )
-                if isinstance(margins_flat, tuple):
-                    margins_flat = margins_flat[0]
                 margins = margins_flat.view(B, N)
                 slack = margins - thresholds
                 certified = ((slack > 0) & active_mask).any(dim=-1)
@@ -706,16 +816,14 @@ class DualSolver(Solver):
 
         with torch.set_grad_enabled(enable_grad):
             if chunk_size is None or M <= chunk_size:
-                margins_flat = self.compute_certified_bound(
+                result = self.compute_certified_bound(
                     net, bounds_dict, C_neg, M=M, enable_grad=enable_grad,
                 )
+                margins_flat = result.margins
             else:
                 margins_flat = self._chunked_eval(
                     net, bounds_dict, C_neg, B, M, n_out, chunk_size, enable_grad,
                 )
-
-            if isinstance(margins_flat, tuple):
-                margins_flat = margins_flat[0]
 
             margins = margins_flat.view(B, M)
             slack = margins - thresholds_neg
@@ -751,12 +859,10 @@ class DualSolver(Solver):
             m_chunk = end - start
             # Slice specs [start:end] for all B samples — independent rows, invariant-safe.
             C_chunk = C_view[:, start:end, :].reshape(B * m_chunk, n_out).contiguous()
-            margins_chunk = self.compute_certified_bound(
+            result = self.compute_certified_bound(
                 net, bounds_dict, C_chunk, M=m_chunk, enable_grad=enable_grad,
             )
-            if isinstance(margins_chunk, tuple):
-                margins_chunk = margins_chunk[0]
-            chunks.append(margins_chunk.view(B, m_chunk))
+            chunks.append(result.margins.view(B, m_chunk))
         return torch.cat(chunks, dim=1).reshape(B * M)
 
     def compute_robust_bound(
@@ -799,10 +905,15 @@ class DualSolver(Solver):
         out_spec = OutputSpec(
             kind=kind,
             y_true=y_true_t,
-            margin=margin if margin > 0 else None,
+            margin=(
+                torch.as_tensor([margin], device=device, dtype=sample.lb.dtype)
+                if margin > 0
+                else None
+            ),
         )
         result = self.evaluate_spec(
-            net, bounds_dict, out_spec,
+            net, out_spec,
+            bounds_dict=bounds_dict,
             num_classes=num_classes,
             enable_grad=enable_grad,
         )

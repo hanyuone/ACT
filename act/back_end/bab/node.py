@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Dict, Optional
 
 import numpy as np
@@ -55,11 +56,16 @@ class SubproblemBatch:
     ub: torch.Tensor  # (N, D)  upper bounds
     depths: torch.Tensor  # (N,)    tree depth
 
-    # -- warm-start fields (D.5) --------------------------------------------
-    warm_alpha: Optional[Dict[int, torch.Tensor]] = None  # layer_id → [N, M, n]
-    warm_eta: Optional[Dict[int, torch.Tensor]] = None  # layer_id → [N, M, n]
+    # -- incremental-start fields ---------------------------------------------------
+    incremental_alpha: Optional[Dict[int, torch.Tensor]] = None  # layer_id → [N, M, n]
+    incremental_eta: Optional[Dict[int, torch.Tensor]] = None  # layer_id → [N, M, n]
     split_signs: Optional[Dict[int, torch.Tensor]] = None  # layer_id → [N, M, n] in {-1, 0, +1}
     parent_margins: Optional[torch.Tensor] = None  # [N]
+    # [N] certified lower bound (min slack) from the parent solve; the node-selection
+    # signal consumed by TopKBounding. Distinct from parent_margins (FSB's baseline).
+    lower_bound: Optional[torch.Tensor] = None
+    node_id: Optional[torch.Tensor] = None  # [N] long; logical identity
+    parent_id: Optional[torch.Tensor] = None  # [N] long; parent's node_id (-1 for root)
 
     # -- properties ---------------------------------------------------------
 
@@ -117,13 +123,146 @@ class SubproblemBatch:
 # ---------------------------------------------------------------------------
 
 
+def _gather_optional_dict(
+    d: Optional[Dict[int, torch.Tensor]],
+    idx: torch.Tensor,
+) -> Optional[Dict[int, torch.Tensor]]:
+    if d is None:
+        return None
+    return {k: t.index_select(0, idx.to(t.device)) for k, t in d.items()}
+
+
+def split_input(
+    batch: SubproblemBatch,
+    split_dims: torch.Tensor,
+) -> tuple[SubproblemBatch, torch.Tensor]:
+    n = batch.batch_size
+    device = batch.lb.device
+    mid = (batch.lb + batch.ub) / 2
+    split_vals = mid.gather(1, split_dims.unsqueeze(1))
+    parent_index = torch.arange(n, device=device).repeat(2)
+
+    child_lb = batch.lb.index_select(0, parent_index)
+    child_ub = batch.ub.index_select(0, parent_index)
+    dims2 = split_dims.unsqueeze(1)
+    child_ub[:n].scatter_(1, dims2, split_vals)
+    child_lb[n:].scatter_(1, dims2, split_vals)
+    child_depths = batch.depths.index_select(0, parent_index) + 1
+
+    children = SubproblemBatch(
+        lb=child_lb,
+        ub=child_ub,
+        depths=child_depths,
+        incremental_alpha=_gather_optional_dict(batch.incremental_alpha, parent_index),
+        incremental_eta=_gather_optional_dict(batch.incremental_eta, parent_index),
+        split_signs=_gather_optional_dict(batch.split_signs, parent_index),
+        parent_margins=(
+            batch.parent_margins.index_select(0, parent_index.to(batch.parent_margins.device))
+            if batch.parent_margins is not None
+            else None
+        ),
+        lower_bound=(
+            batch.lower_bound.index_select(0, parent_index.to(batch.lower_bound.device))
+            if batch.lower_bound is not None
+            else None
+        ),
+    )
+    return children, parent_index
+
+
+def split_input_nary(
+    batch: SubproblemBatch,
+    cut_dim: torch.Tensor,
+    k: int,
+) -> tuple[SubproblemBatch, torch.Tensor]:
+    if k < 2:
+        raise ValueError(f"fanout must be >= 2, got {k}")
+    n = batch.batch_size
+    device = batch.lb.device
+    parent_index = torch.arange(n, device=device).repeat(k)
+    section = torch.arange(k, device=device).repeat_interleave(n)
+
+    child_lb = batch.lb.index_select(0, parent_index)
+    child_ub = batch.ub.index_select(0, parent_index)
+    cut_c = cut_dim.to(device=device, dtype=torch.long).index_select(0, parent_index)
+    cut_c2 = cut_c.unsqueeze(1)
+    lb_at = child_lb.gather(1, cut_c2)
+    ub_at = child_ub.gather(1, cut_c2)
+    seg = (ub_at - lb_at) / k
+    section_f = section.to(dtype=child_lb.dtype).unsqueeze(1)
+    new_lb = torch.where(section.unsqueeze(1) == 0, lb_at, lb_at + section_f * seg)
+    new_ub = torch.where(
+        section.unsqueeze(1) == k - 1,
+        ub_at,
+        lb_at + (section_f + 1) * seg,
+    )
+    child_lb.scatter_(1, cut_c2, new_lb)
+    child_ub.scatter_(1, cut_c2, new_ub)
+
+    depth_inc = math.ceil(math.log2(k))
+    child_depths = batch.depths.index_select(0, parent_index) + depth_inc
+
+    children = SubproblemBatch(
+        lb=child_lb,
+        ub=child_ub,
+        depths=child_depths,
+        incremental_alpha=_gather_optional_dict(batch.incremental_alpha, parent_index),
+        incremental_eta=_gather_optional_dict(batch.incremental_eta, parent_index),
+        split_signs=_gather_optional_dict(batch.split_signs, parent_index),
+        parent_margins=(
+            batch.parent_margins.index_select(0, parent_index.to(batch.parent_margins.device))
+            if batch.parent_margins is not None
+            else None
+        ),
+        lower_bound=(
+            batch.lower_bound.index_select(0, parent_index.to(batch.lower_bound.device))
+            if batch.lower_bound is not None
+            else None
+        ),
+    )
+    return children, parent_index
+
+
+def concat_children(a: SubproblemBatch, b: SubproblemBatch) -> SubproblemBatch:
+    def _concat_optional_dicts(
+        da: Optional[Dict[int, torch.Tensor]],
+        db: Optional[Dict[int, torch.Tensor]],
+    ) -> Optional[Dict[int, torch.Tensor]]:
+        if da is None or db is None:
+            assert da is None and db is None, "child dict fields must both be present or absent"
+            return None
+        assert set(da) == set(db), "child dict fields must have equal keys"
+        return {key: torch.cat([da[key], db[key]], dim=0) for key in sorted(da)}
+
+    def _concat_optional_tensor(
+        ta: Optional[torch.Tensor],
+        tb: Optional[torch.Tensor],
+        name: str,
+    ) -> Optional[torch.Tensor]:
+        if ta is None or tb is None:
+            assert ta is None and tb is None, f"{name} must be present in both children or neither"
+            return None
+        return torch.cat([ta, tb], dim=0)
+
+    return SubproblemBatch(
+        lb=torch.cat([a.lb, b.lb], dim=0),
+        ub=torch.cat([a.ub, b.ub], dim=0),
+        depths=torch.cat([a.depths, b.depths], dim=0),
+        incremental_alpha=_concat_optional_dicts(a.incremental_alpha, b.incremental_alpha),
+        incremental_eta=_concat_optional_dicts(a.incremental_eta, b.incremental_eta),
+        split_signs=_concat_optional_dicts(a.split_signs, b.split_signs),
+        parent_margins=_concat_optional_tensor(a.parent_margins, b.parent_margins, "parent_margins"),
+        lower_bound=_concat_optional_tensor(a.lower_bound, b.lower_bound, "lower_bound"),
+    )
+
+
 def split_subproblems(
     batch: SubproblemBatch,
     split_dims: torch.Tensor,
 ) -> tuple[SubproblemBatch, SubproblemBatch]:
     """Bisect each subproblem along the chosen input dimension.
 
-    This is a pure tensor operation — no Python loops over the batch. Warm-state
+    This is a pure tensor operation — no Python loops over the batch. Incremental-state
     fields are deep-copied into both children so they do not alias the parent or
     each other.
 
@@ -157,15 +296,15 @@ def split_subproblems(
             else None
         )
 
-    left_warm_alpha = _clone_dict_tensors(batch.warm_alpha)
-    left_warm_eta = _clone_dict_tensors(batch.warm_eta)
+    left_incremental_alpha = _clone_dict_tensors(batch.incremental_alpha)
+    left_incremental_eta = _clone_dict_tensors(batch.incremental_eta)
     left_split_signs = _clone_dict_tensors(batch.split_signs)
     left_parent_margins = (
         batch.parent_margins.clone() if batch.parent_margins is not None else None
     )
 
-    right_warm_alpha = _clone_dict_tensors(batch.warm_alpha)
-    right_warm_eta = _clone_dict_tensors(batch.warm_eta)
+    right_incremental_alpha = _clone_dict_tensors(batch.incremental_alpha)
+    right_incremental_eta = _clone_dict_tensors(batch.incremental_eta)
     right_split_signs = _clone_dict_tensors(batch.split_signs)
     right_parent_margins = (
         batch.parent_margins.clone() if batch.parent_margins is not None else None
@@ -175,21 +314,74 @@ def split_subproblems(
         lb=batch.lb.clone(),
         ub=left_ub,
         depths=new_depths.clone(),
-        warm_alpha=left_warm_alpha,
-        warm_eta=left_warm_eta,
+        incremental_alpha=left_incremental_alpha,
+        incremental_eta=left_incremental_eta,
         split_signs=left_split_signs,
         parent_margins=left_parent_margins,
+        lower_bound=(batch.lower_bound.clone() if batch.lower_bound is not None else None),
     )
     right = SubproblemBatch(
         lb=right_lb,
         ub=batch.ub.clone(),
         depths=new_depths.clone(),
-        warm_alpha=right_warm_alpha,
-        warm_eta=right_warm_eta,
+        incremental_alpha=right_incremental_alpha,
+        incremental_eta=right_incremental_eta,
         split_signs=right_split_signs,
         parent_margins=right_parent_margins,
+        lower_bound=(batch.lower_bound.clone() if batch.lower_bound is not None else None),
     )
     return left, right
+
+
+def split_neuron_subproblems(
+    batch: SubproblemBatch,
+    *,
+    layer_id: int,
+    neuron_idx: int,
+    n_neurons: int,
+    n_specs: int,
+) -> tuple[SubproblemBatch, SubproblemBatch]:
+    if neuron_idx < 0 or neuron_idx >= n_neurons:
+        raise IndexError(f"neuron_idx {neuron_idx} out of range for n_neurons={n_neurons}")
+
+    def _clone_dict_tensors(
+        tensors: Optional[Dict[int, torch.Tensor]],
+    ) -> Optional[Dict[int, torch.Tensor]]:
+        return {key: tensor.clone() for key, tensor in tensors.items()} if tensors is not None else None
+
+    def _clone_signs(sign: float) -> Dict[int, torch.Tensor]:
+        signs = _clone_dict_tensors(batch.split_signs) or {}
+        if layer_id not in signs:
+            signs[layer_id] = torch.zeros(
+                (batch.batch_size, n_specs, n_neurons),
+                dtype=batch.lb.dtype,
+                device=batch.lb.device,
+            )
+        signs[layer_id][:, :, neuron_idx] = sign
+        return signs
+
+    new_depths = batch.depths + 1
+    on = SubproblemBatch(
+        lb=batch.lb.clone(),
+        ub=batch.ub.clone(),
+        depths=new_depths.clone(),
+        incremental_alpha=_clone_dict_tensors(batch.incremental_alpha),
+        incremental_eta=_clone_dict_tensors(batch.incremental_eta),
+        split_signs=_clone_signs(+1.0),
+        parent_margins=batch.parent_margins.clone() if batch.parent_margins is not None else None,
+        lower_bound=batch.lower_bound.clone() if batch.lower_bound is not None else None,
+    )
+    off = SubproblemBatch(
+        lb=batch.lb.clone(),
+        ub=batch.ub.clone(),
+        depths=new_depths.clone(),
+        incremental_alpha=_clone_dict_tensors(batch.incremental_alpha),
+        incremental_eta=_clone_dict_tensors(batch.incremental_eta),
+        split_signs=_clone_signs(-1.0),
+        parent_margins=batch.parent_margins.clone() if batch.parent_margins is not None else None,
+        lower_bound=batch.lower_bound.clone() if batch.lower_bound is not None else None,
+    )
+    return on, off
 
 
 # ---------------------------------------------------------------------------

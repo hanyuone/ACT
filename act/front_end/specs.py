@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional
 import torch
 
 class InKind:
@@ -37,10 +37,6 @@ class InputSpec:
         # Convert eps (scalar → 1-D tensor)
         if self.eps is not None and not isinstance(self.eps, torch.Tensor):
             self.eps = torch.tensor([float(self.eps)])
-        
-        # Convert d (scalar → 1-D tensor)
-        if hasattr(self, 'd') and self.d is not None and not isinstance(self.d, torch.Tensor):
-            self.d = torch.tensor([float(self.d)])
         
         # Convert lb, ub, center (list or scalar → tensor)
         for field in ['lb', 'ub', 'center']:
@@ -67,6 +63,10 @@ class OutKind:
 
 @dataclass
 class OutputSpec:
+    SLICEABLE_PARAM_KEYS: ClassVar[tuple[str, ...]] = (
+        "y_true", "margin", "c", "d", "lb", "ub", "C", "thresholds"
+    )
+
     kind: str
     c: Optional[torch.Tensor] = None
     d: Optional[torch.Tensor] = None
