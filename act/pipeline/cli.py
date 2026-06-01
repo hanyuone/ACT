@@ -11,6 +11,8 @@ License: AGPLv3+
 """
 
 import argparse
+from contextlib import contextmanager
+from copy import deepcopy
 import logging
 from pathlib import Path
 from typing import Any, List, Optional
@@ -18,8 +20,10 @@ import sys
 import torch
 
 from act.util.cli_utils import add_device_args, initialize_from_args
+from act.back_end.config import VALID_SOLVER_TIERS
 
 logger = logging.getLogger(__name__)
+from act.front_end.specs import OutputSpec
 from act.front_end.spec_creator_base import LabeledInputTensor
 from act.front_end.vnnlib_loader.create_specs import VNNLibSpecCreator
 from act.front_end.vnnlib_loader import data_model_loader as vnnlib_loader
@@ -310,7 +314,7 @@ def cmd_fuzz(args):
     print()
 
     # Load configuration from YAML with CLI overrides
-    overrides = dict(
+    overrides: dict[str, Any] = dict(
         max_iterations=args.iterations,
         timeout_seconds=args.timeout,
         save_counterexamples=not args.no_save,
@@ -592,14 +596,19 @@ def _run_vnnlib_verify(args) -> bool:
     for mid, vm in wrapped.items():
         tag = "/".join(str(p) for p in mid)
         net = TorchToACT(vm).run()
-        results = verify_once(net)
-        statuses = [r.status.name for r in results]
-        print(f"  {tag}: {statuses}")
-        if args.validate_soundness:
-            assert validator is not None
-            soundness_summary = _run_soundness_check(
-                tag, vm, net, results, validator, solver
-            )
+        if getattr(args, "bab", False):
+            status = _run_bab_on_net(net, args)
+            label = f"BaB[{args.bab_solver_tier}]"
+            print(f"  {tag}: {label} → {status}")
+        else:
+            results = verify_once(net)
+            statuses = [r.status.name for r in results]
+            print(f"  {tag}: {statuses}")
+            if args.validate_soundness:
+                assert validator is not None
+                soundness_summary = _run_soundness_check(
+                    tag, vm, net, results, validator, solver
+                )
 
     if args.validate_soundness:
         assert validator is not None and soundness_summary is not None
@@ -607,6 +616,130 @@ def _run_vnnlib_verify(args) -> bool:
         _print_soundness_summary(soundness_summary)
         return soundness_summary["failed"] > 0
     return False
+
+
+@contextmanager
+def _sliced_net_view(net, sample_idx: int, batch_size: int):
+    """Yield a per-sample view of ``net`` with spec/assert/input layers sliced.
+
+    On exit, original layer params/out_vars are restored. Safer than inline
+    try/finally because mutation surface is encapsulated.
+    """
+    from act.back_end.verifier import (
+        find_entry_layer_id,
+        gather_input_spec_layers,
+        get_assert_layer,
+    )
+
+    assert_layer = get_assert_layer(net)
+    spec_layers = gather_input_spec_layers(net)
+    input_layer = net.by_id[find_entry_layer_id(net)]
+    full_input_ids = list(input_layer.out_vars)
+    input_dim = len(full_input_ids) // batch_size
+    if len(full_input_ids) != input_dim * batch_size:
+        raise RuntimeError(
+            f"InputLayer.out_vars ({len(full_input_ids)}) not divisible by B={batch_size}"
+        )
+
+    orig_assert_params = deepcopy(assert_layer.params)
+    orig_spec_params = [deepcopy(spec_layer.params) for spec_layer in spec_layers]
+    orig_input_outvars = list(input_layer.out_vars)
+    try:
+        for key in OutputSpec.SLICEABLE_PARAM_KEYS:
+            val = orig_assert_params.get(key)
+            if (
+                val is not None
+                and hasattr(val, "dim")
+                and val.dim() >= 1
+                and val.shape[0] == batch_size
+            ):
+                assert_layer.params[key] = val[sample_idx : sample_idx + 1]
+
+        for spec_layer, sp_orig in zip(spec_layers, orig_spec_params):
+            for sp_key, sp_val in sp_orig.items():
+                if (
+                    hasattr(sp_val, "dim")
+                    and sp_val.dim() >= 1
+                    and sp_val.shape[0] == batch_size
+                ):
+                    spec_layer.params[sp_key] = sp_val[sample_idx : sample_idx + 1]
+
+        input_layer.out_vars = full_input_ids[
+            sample_idx * input_dim : (sample_idx + 1) * input_dim
+        ]
+        yield net
+    finally:
+        assert_layer.params = orig_assert_params
+        for spec_layer, sp_orig in zip(spec_layers, orig_spec_params):
+            spec_layer.params = sp_orig
+        input_layer.out_vars = orig_input_outvars
+
+
+def _run_bab_on_net(net, args, bab_first_sample_only: bool = False):
+    """Verify an ACT Net via verify_bab_batched.
+
+    For single-sample wrappers (B=1) returns one status string.
+    For multi-sample wrappers (B>1, e.g. TorchVision), the behavior depends
+    on ``bab_first_sample_only``:
+      - True  → only sample 0 is verified (one local-robustness instance —
+                the BaB-natural unit), returning a single status string.
+      - False → all B samples are verified via per-sample iteration,
+                returning a list of status strings.
+    """
+    from act.back_end.bab.bab import verify_bab_batched
+    from act.back_end.config import BaBConfig
+    from act.back_end.solver.solver_torchlp import TorchLPSolver
+    from act.back_end.verifier import (
+        gather_input_spec_layers,
+        seed_from_input_specs,
+    )
+
+    config = BaBConfig(
+        solver_tier=args.bab_solver_tier,
+        max_depth=args.bab_max_depth,
+        max_nodes=args.bab_max_nodes,
+        branching_method=getattr(args, "bab_branching_method", "random"),
+        bounding_method=getattr(args, "bab_bounding_method", "random"),
+        bounding_order=getattr(args, "bab_bounding_order", "depth_lb"),
+        sa_cooling_rate=getattr(args, "bab_sa_cooling_rate", 0.99),
+        frontier_cap=getattr(args, "bab_frontier_cap", 0),
+        input_split_fanout=getattr(args, "bab_input_split_fanout", 2),
+        per_class_alpha=(
+            str(getattr(args, "bab_per_class_alpha", "true")).lower() == "true"
+        ),
+        incremental_start_enabled=not getattr(args, "bab_no_incremental_start", False),
+        provenance_enabled=getattr(args, "bab_provenance", False),
+    )
+    budget = float(getattr(args, "timeout", 60.0) or 60.0)
+
+    spec_layers = gather_input_spec_layers(net)
+    seed_bounds = seed_from_input_specs(spec_layers)
+    B = seed_bounds.lb.shape[0] if seed_bounds.lb.dim() >= 2 else 1
+
+    if B <= 1:
+        result = verify_bab_batched(
+            net=net,
+            solver_factory=TorchLPSolver,
+            config=config,
+            max_batch_size=None,
+            time_budget_s=budget,
+        )
+        return result.status.name
+
+    sample_range = range(1) if bab_first_sample_only else range(B)
+
+    statuses = []
+    for sample_idx in sample_range:
+        with _sliced_net_view(net, sample_idx, B) as sliced_net:
+            result = verify_bab_batched(
+                net=sliced_net,
+                solver_factory=TorchLPSolver,
+                config=config,
+                max_batch_size=None,
+                time_budget_s=budget,
+            )
+            statuses.append(result.status.name)
+    return statuses[0] if bab_first_sample_only and statuses else statuses
 
 
 def _run_torchvision_verify(args) -> bool:
@@ -664,6 +797,20 @@ def _run_torchvision_verify(args) -> bool:
     wrapped = synthesize_models_from_specs(spec_results)
     if not wrapped:
         raise RuntimeError("synthesize_models_from_specs produced no VerifiableModels")
+
+    if getattr(args, "bab", False):
+        local_robust = [
+            (mid, vm) for mid, vm in wrapped.items() if "LINF_BALL" in tuple(str(p) for p in mid)
+        ]
+        if not local_robust:
+            local_robust = list(wrapped.items())
+        mid, vm = local_robust[0]
+        tag = "/".join(str(p) for p in mid)
+        net = TorchToACT(vm).run()
+        status = _run_bab_on_net(net, args, bab_first_sample_only=True)
+        label = f"BaB[{args.bab_solver_tier}]"
+        print(f"  {tag} (sample 0 / local-robustness): {label} → {status}")
+        return False
 
     validator = None
     soundness_summary = None
@@ -1015,6 +1162,100 @@ Examples:
         type=int,
         default=10,
         help="Number of samples to load (default: 10)",
+    )
+
+    bab_group = parser.add_argument_group("Branch-and-Bound Options (--verify {vnnlib,torchvision})")
+    bab_group.add_argument(
+        "--bab",
+        action="store_true",
+        help="Run BaB (verify_bab_batched) instead of single-shot verify_once",
+    )
+    bab_group.add_argument(
+        "--bab-solver-tier",
+        type=str,
+        default="dual_alpha_eta",
+        choices=list(VALID_SOLVER_TIERS),
+        help=(
+            "BaB solver tier when --bab is set (default: dual_alpha_eta). "
+            "'lp' uses the existing LP/MILP backend; 'dual' uses DualSolver "
+            "single-pass; 'dual_alpha' adds Lagrange-relaxed lower-slope "
+            "optimization; 'dual_alpha_eta' adds joint slope + split-constraint "
+            "KKT multipliers."
+        ),
+    )
+    bab_group.add_argument(
+        "--bab-max-depth",
+        type=int,
+        default=8,
+        help="Maximum BaB tree depth (default: 8)",
+    )
+    bab_group.add_argument(
+        "--bab-max-nodes",
+        type=int,
+        default=100,
+        help="Maximum BaB nodes to expand (default: 100)",
+    )
+    bab_group.add_argument(
+        "--bab-branching-method",
+        type=str,
+        default="random",
+        choices=["random", "babsr", "fsb"],
+        help="BaB branching strategy when --bab is set (default: random)",
+    )
+    bab_group.add_argument(
+        "--bab-bounding-method",
+        type=str,
+        default="random",
+        choices=["random", "topk"],
+        help=(
+            "Pool selection when subproblems exceed the batch size: 'random' or "
+            "'topk' (keep the top-k by depth + lower-bound). Default: random."
+        ),
+    )
+    bab_group.add_argument(
+        "--bab-bounding-order",
+        type=str,
+        default="depth_lb",
+        choices=["depth_lb", "greedy", "sa"],
+        help="TopKBounding order policy (default: depth_lb)",
+    )
+    bab_group.add_argument(
+        "--bab-sa-cooling-rate",
+        type=float,
+        default=0.99,
+        help="Cooling rate for --bab-bounding-order sa (default: 0.99)",
+    )
+    bab_group.add_argument(
+        "--bab-per-class-alpha",
+        type=str,
+        default="true",
+        choices=["true", "false"],
+        help=(
+            "Per-spec α tensor (True; tighter bounds, M× memory) vs shared α "
+            "across specs (False; looser, 1× memory). Default: true."
+        ),
+    )
+    bab_group.add_argument(
+        "--bab-no-incremental-start",
+        action="store_true",
+        help="Disable parent→child α/η incremental-start propagation (debugging / ablation).",
+    )
+    bab_group.add_argument(
+        "--bab-frontier-cap",
+        type=int,
+        default=0,
+        help="Maximum pending BaB frontier leaves to retain; 0 disables eviction (default: 0)",
+    )
+    bab_group.add_argument(
+        "--bab-input-split-fanout",
+        type=int,
+        default=2,
+        help="Uniform fanout for input splits; 2 preserves binary splitting (default: 2)",
+    )
+    bab_group.add_argument(
+        "--bab-provenance",
+        action="store_true",
+        help="Enable node_id/parent_id provenance sidecar (requires --bab-bounding-method topk).",
     )
 
     # Fuzzing configuration

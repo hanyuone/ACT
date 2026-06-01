@@ -69,7 +69,7 @@ def _make_solver(solver_name: str):
 
 def _verify_one_net(
     net_path: str, backend_cfg
-) -> tuple[list, Optional[Union[_SkipUnsupported, str]], Optional[int]]:
+) -> tuple[list[Any], Optional[Union[_SkipUnsupported, str]], Optional[int]]:
     """[BATCHED-API] Verify *net_path* via 3-tier cascade.
 
     Returns ``(results, err, n_layers)`` where ``err`` is one of:
@@ -141,7 +141,7 @@ def _verify_one_net(
         any_unknown = any(r.status == VerifyStatus.UNKNOWN for r in results)
 
         # SOUNDNESS-CRITICAL: under --solver dual, verify_once already ran
-        # DualSolver.evaluate_spec (Wong-Kolter dual backward) — Tier-2 LP and Tier-3 BaB
+        # DualSolver.evaluate_spec (linear-relaxation dual backward) — Tier-2 LP and Tier-3 BaB
         # would build under-constrained LPs (DualSolver does not produce LP-feed
         # ConSet entries; the forward analyze() pipeline is bypassed) and emit
         # spurious FALSIFIED. Do not remove this gate without first switching
@@ -368,7 +368,7 @@ def list_examples(args):
     print(f"Total networks: {len(names)}\n")
 
     # Group by category (inferred from filename)
-    categories: dict = {}
+    categories: dict[str, list[tuple[str, dict[str, Any]]]] = {}
     for name in names:
         info = factory.get_network_info(name)
         nl = name.lower()
@@ -844,7 +844,7 @@ Examples:
             "  'gurobi'  — commercial MILP/LP (license required).  LP cascade.\n"
             "  'torchlp' — PyTorch-tensor LP (Adam + penalty + box projection,\n"
             "              GPU-capable).  LP cascade.\n"
-            "  'dual'    — DualSolver, Wong-Kolter dual certified bounds via\n"
+                "  'dual'    — DualSolver, linear-relaxation dual certified bounds via\n"
             "              backward propagation.  No LP cascade (DualSolver is\n"
             "              its own verification pipeline).\n"
             "  'auto'    — try gurobi, fall back to torchlp.\n"
@@ -917,6 +917,35 @@ Examples:
         default=None,
         dest="bab_bounding",
         help="Bounding strategy (default: from config.yaml)",
+    )
+    verify_group.add_argument(
+        "--bab-bounding-order",
+        type=str,
+        default=None,
+        choices=["depth_lb", "greedy", "sa"],
+        dest="bab_bounding_order",
+        help="TopKBounding order policy (default: from config.yaml)",
+    )
+    verify_group.add_argument(
+        "--bab-sa-cooling-rate",
+        type=float,
+        default=None,
+        dest="bab_sa_cooling_rate",
+        help="Cooling rate for --bab-bounding-order sa (default: from config.yaml)",
+    )
+    verify_group.add_argument(
+        "--bab-frontier-cap",
+        type=int,
+        default=None,
+        dest="bab_frontier_cap",
+        help="Maximum pending BaB frontier leaves to retain; 0 disables eviction (default: from config.yaml)",
+    )
+    verify_group.add_argument(
+        "--bab-input-split-fanout",
+        type=int,
+        default=None,
+        dest="bab_input_split_fanout",
+        help="Uniform fanout for input splits (default: from config.yaml)",
     )
 
     # Backend config file
@@ -1011,7 +1040,7 @@ Examples:
 
 # (override_key, args_attr, env_var, env_cast, cli_check)
 # cli_check="user_set" for flags with non-None defaults (--device/--dtype/--registry-mode)
-_BACKEND_OVERRIDE_SPEC: List[tuple] = [
+_BACKEND_OVERRIDE_SPEC: list[tuple[str, str, Optional[str], Any, str]] = [
     ("solver",               "solver",              "ACT_SOLVER",     None, "not_none"),
     ("device",               "device",              "ACT_DEVICE",     None, "user_set"),
     ("dtype",                "dtype",               "ACT_DTYPE",      None, "user_set"),
@@ -1021,6 +1050,10 @@ _BACKEND_OVERRIDE_SPEC: List[tuple] = [
     ("bab_max_nodes",        "bab_max_subproblems", None,             None, "not_none"),
     ("bab_branching_method", "bab_branching",       None,             None, "not_none"),
     ("bab_bounding_method",  "bab_bounding",        None,             None, "not_none"),
+    ("bab_bounding_order",   "bab_bounding_order",  None,             None, "not_none"),
+    ("bab_sa_cooling_rate",  "bab_sa_cooling_rate", None,             None, "not_none"),
+    ("bab_frontier_cap",     "bab_frontier_cap",    None,             None, "not_none"),
+    ("bab_input_split_fanout", "bab_input_split_fanout", None,          None, "not_none"),
     ("gen_gen_config_path",  "config",              None,             None, "not_none"),
     ("gen_output_dir",       "output",              "ACT_GEN_OUTPUT", None, "not_none"),
     ("gen_num_instances",    "num",                 "ACT_GEN_NUM",    int,  "not_none"),
@@ -1031,9 +1064,9 @@ _BACKEND_OVERRIDE_SPEC: List[tuple] = [
 ]
 
 
-def _collect_backend_overrides(args, _user_set) -> dict:
+def _collect_backend_overrides(args: Any, _user_set: Any) -> dict[str, Any]:
     """Build overrides dict from CLI flags + env vars (precedence: CLI > env > yaml)."""
-    overrides: dict = {}
+    overrides: dict[str, Any] = {}
     for key, attr, env, cast, check in _BACKEND_OVERRIDE_SPEC:
         cli_val = getattr(args, attr, None)
         if check == "user_set":

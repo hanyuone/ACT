@@ -17,7 +17,7 @@
 
 # Disable pyright import-cycle error for this module (circular imports are intentional)
 # pyright: reportImportCycles=false
-"""Dual transfer functions: Wong-Kolter certified bounds via backward Lagrangian.
+"""Dual transfer functions: certified bounds via backward Lagrangian relaxation.
 
 Entry point: ``DualSolver.evaluate_spec`` (in ``act.back_end.solver.solver_dual``).
 Per-layer kernels live in ``tf_mlp`` (MLP), ``tf_cnn`` (CNN), ``tf_smooth``

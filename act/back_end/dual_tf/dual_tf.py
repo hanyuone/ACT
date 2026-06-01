@@ -7,6 +7,8 @@
 # --solver choice, not a --tf-mode. Instantiated internally by
 # act.back_end.solver.solver_dual.DualSolver.
 #===---------------------------------------------------------------------===#
+# pyright: reportImportCycles=false, reportOptionalMemberAccess=false, reportAttributeAccessIssue=false, reportCallIssue=false, reportArgumentType=false
+# justification: registry imports are intentionally cyclic with kernel modules; Layer params and LinearBound fields are dynamically validated tensors.
 
 
 import torch
@@ -89,7 +91,7 @@ def forward_add(
 
 
 def backward_add(L: Layer, nu: torch.Tensor, bounds_dict: Dict[int, Bounds],
-                 preds: List[int], M: int = 1
+                 preds: List[int], M: int = 1, alpha=None
                  ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     """ADD backward: identity skip — same ν routed to every predecessor.
 
@@ -147,7 +149,7 @@ def forward_concat(
     return out, out, lin, frame
 
 
-def backward_concat(L, nu, bounds_dict, preds, M: int = 1):
+def backward_concat(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
     """CONCAT backward. (Pending)
     Will require: concat_dim parameter to split nu into per-predecessor slices.
     """
@@ -209,6 +211,23 @@ class DualTF:
         LayerKind.LAYERNORM.value:  forward_layernorm,
         LayerKind.GELU.value:       forward_gelu,
     }
+
+    # η placement invariant (split-constraint KKT multipliers)
+    # ---------------------------------------------------------
+    # The η subtraction `nu = nu - eta * signs` executes immediately BEFORE the
+    # activation-layer's backward handler runs, inside the reverse-topological
+    # iteration. `etas` and `split_signs` are keyed by ACTIVATION layer.id
+    # (RELU, LRELU, SIGMOID, TANH), not by the upstream linear layer.id. This
+    # yields
+    #     nu_pre = slope · (nu_post − η · sign) = slope · nu_post − (slope · η) · sign
+    # so the effective multiplier at the pre-activation is (slope · η), which
+    # remains ≥ 0 under the η ≥ 0 invariant enforced by the optimizer's projection.
+    #
+    # Projection invariant (joint α/η optimization)
+    # ---------------------------------------------
+    # After every `optimizer.step()`:
+    #     α.data.clamp_(0.0, 1.0)   # slope variables, α ∈ [0, 1]
+    #     η.data.clamp_(min=0)      # KKT multipliers, η ≥ 0
 
     _BACKWARD_REGISTRY = {
         LayerKind.INPUT.value:      backward_identity,

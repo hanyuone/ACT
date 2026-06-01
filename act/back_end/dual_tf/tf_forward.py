@@ -320,7 +320,8 @@ def _sum_linear_bounds(lins: List[LinearBound]) -> LinearBound:
 
 @torch.no_grad()
 def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Tensor,
-                           post_activation: bool = False) -> Dict[int, Bounds]:
+                           post_activation: bool = False,
+                           alphas: Optional[Dict[int, torch.Tensor]] = None) -> Dict[int, Bounds]:
     """Forward bounds, natively batched with singleton auto-promotion."""
     # Lazy import to break circular dep (dual_tf imports compute_forward_bounds)
     from .dual_tf import DualTF
@@ -347,12 +348,13 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
     lin_state: Dict[int, LinearBound] = {}
     frame_dict: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
     topo_order = _topological_sort(net)
+    by_id = getattr(net, "by_id", {layer.id: layer for layer in net.layers})
     entry_box = Bounds(lb_in, ub_in)
     entry_lin = _identity_lin(B, input_dim, device, dtype)
     entry_frame = (lb_in, ub_in)
 
     for lid in topo_order:
-        layer = net.by_id[lid]
+        layer = by_id[lid]
         lid = layer.id
         kind = layer.kind.upper()
         preds = list(net.preds.get(lid, []) or [])
@@ -392,6 +394,33 @@ def compute_forward_bounds(net: Net, input_lb: torch.Tensor, input_ub: torch.Ten
                 layer, pred_boxes, pred_lins, pred_frames, preds,
                 post_activation, device, dtype,
             )
+            _store_forward_state(bounds_dict, box_state, lin_state, frame_dict,
+                                 lid, stored, out, lin, frame)
+            continue
+
+        if kind == LayerKind.RELU.value and alphas is not None:
+            parent_box = box_state[preds[0]]
+            parent_lin = lin_state[preds[0]]
+            parent_frame = frame_dict[preds[0]]
+            x_L, x_U = parent_frame
+            pre_lb, pre_ub = parent_box.lb, parent_box.ub
+            alpha = alphas.get(lid)
+            new_lin = _fwd_relu(parent_lin, pre_lb, pre_ub, alpha=alpha)
+            int_lb, int_ub = _box_relu(pre_lb, pre_ub)
+            if new_lin is None:
+                lb, ub = int_lb, int_ub
+                out = Bounds(lb, ub)
+                stored = out
+                lin, frame = _reset_forward_box(lb, ub, device, dtype)
+            else:
+                lin = new_lin
+                lin_lb, lin_ub = _concretize(lin, x_L, x_U)
+                lb, ub = _intersect_boxes(lin_lb, lin_ub, int_lb, int_ub)
+                out = Bounds(lb, ub)
+                stored = out if post_activation else Bounds(pre_lb, pre_ub)
+                frame = parent_frame
+                if post_activation:
+                    lin, frame = _reset_forward_box(lb, ub, device, dtype)
             _store_forward_state(bounds_dict, box_state, lin_state, frame_dict,
                                  lid, stored, out, lin, frame)
             continue
@@ -455,7 +484,8 @@ def _fwd_dense(layer: Layer, lin: LinearBound) -> Optional[LinearBound]:
     )
 
 
-def _fwd_relu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor
+def _fwd_relu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor,
+              alpha: Optional[torch.Tensor] = None
               ) -> Optional[LinearBound]:
     """Apply forward ReLU linear relaxation with per-batch alpha choice.
 
@@ -477,11 +507,12 @@ def _fwd_relu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor
         torch.where(on, torch.ones_like(lb), torch.zeros_like(lb)),
     )
     up_inter = torch.where(amb, -up_slope * lb, torch.zeros_like(lb))
-    alpha = torch.where(
-        amb,
-        (up_slope > 0.5).to(lb.dtype),
-        torch.where(on, torch.ones_like(lb), torch.zeros_like(lb)),
-    )
+    if alpha is None:
+        low_slope = (ub > -lb).to(lb.dtype)
+    else:
+        low_slope = alpha.to(device=lb.device, dtype=lb.dtype)
+    low_slope = torch.where(on, torch.ones_like(low_slope), low_slope)
+    low_slope = torch.where(off, torch.zeros_like(low_slope), low_slope)
 
     if lin.A_lb is None or lin.A_ub is None:
         B, n = lb.shape
@@ -491,15 +522,15 @@ def _fwd_relu(lin: LinearBound, lb: torch.Tensor, ub: torch.Tensor
         A_lb_in = lin.A_lb if lin.A_lb is not None else eye
         A_ub_in = lin.A_ub if lin.A_ub is not None else eye
         return LinearBound(
-            A_lb=alpha.unsqueeze(-1) * A_lb_in,
-            b_lb=alpha * lin.b_lb,
+            A_lb=low_slope.unsqueeze(-1) * A_lb_in,
+            b_lb=low_slope * lin.b_lb,
             A_ub=up_slope.unsqueeze(-1) * A_ub_in,
             b_ub=up_slope * lin.b_ub + up_inter,
         )
 
     return LinearBound(
-        A_lb=alpha.unsqueeze(-1) * lin.A_lb,
-        b_lb=alpha * lin.b_lb,
+        A_lb=low_slope.unsqueeze(-1) * lin.A_lb,
+        b_lb=low_slope * lin.b_lb,
         A_ub=up_slope.unsqueeze(-1) * lin.A_ub,
         b_ub=up_slope * lin.b_ub + up_inter,
     )

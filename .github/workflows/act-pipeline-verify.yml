@@ -99,6 +99,19 @@ jobs:
             coverage run -p -m act.pipeline --verify torchvision --dataset MNIST --model simple_cnn --num-samples 2 $combo --device cpu --dtype float64
           done
 
+      # ─────────────────────────────────────────────────────────────────
+      # TorchVision + BaB smoke (only the multi-sample per-sample iteration
+      # path; VNNLIB BaB tiers live in act-bab.yml). Tightest possible budget
+      # because simple_cnn has 25M params and we iterate 4-8 samples × 4
+      # wrapped models. CI goal: exercise the code path, not converge.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Verify TorchVision MNIST with BaB (single local-robustness instance)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.pipeline --verify torchvision --dataset MNIST --model simple_cnn --num-samples 1 \
+            --solvers dual --bab --bab-solver-tier dual --bab-max-depth 1 --bab-max-nodes 1 \
+            --device cpu --dtype float64
+
       - name: Combine coverage data
         if: always()
         run: |

@@ -46,13 +46,70 @@ backend:
     # Maximum number of subproblems (nodes) to explore.
     max_nodes: 10
 
-    # How to pick the next input dimension to split.
-    #   "random" – uniform random selection (baseline)
+    # Maximum pending frontier leaves to retain; 0 disables eviction.
+    frontier_cap: 0
+
+    # Uniform fanout for input-domain splits; 2 preserves binary splitting.
+    input_split_fanout: 2
+
+    # Branching strategy.
+    #   "random" – uniform random input-dimension split (baseline)
+    #   "babsr"  – ReLU neuron-split scored by dual ν + bound slope/intercept
+    #   "fsb"    – filtered smart branching (babsr top-k + bound re-evaluation)
+    # NOTE: "babsr"/"fsb" perform real neuron-split only on a dual tier
+    #       (solver_tier "dual_alpha" or "dual_alpha_eta"); on "lp" they use the
+    #       width-based baseline.
     branching_method: "random"
 
-    # How to order subproblems in the work pool.
-    #   "random" – random ordering (baseline)
+    # How to select the next wave of subproblems when the pool exceeds the
+    # batch (tensor) size.
+    #   "random" – uniform-random selection (baseline)
+    #   "topk"   – keep the top-k by (depth, lower-bound): deeper (more refined)
+    #              and smaller lower-bound (closer to a counterexample) rank higher
     bounding_method: "random"
+
+    # TopKBounding order policy: depth_lb (default), greedy, or sa.
+    bounding_order: "depth_lb"
+
+    # Simulated-annealing cooling rate for bounding_order = "sa".
+    sa_cooling_rate: 0.99
+
+    # TopKBounding score weights (only used when bounding_method = "topk").
+    # Metrics are min-max normalised within the pool; defaults give depth and
+    # lower-bound 50% each.
+    bounding_depth_weight: 0.5
+    bounding_bound_weight: 0.5
+
+    # ── Dual-tier knobs (α/η optimization for DualSolver BaB) ────────────
+    # Solver tier for BaB bound computation:
+    # Source of truth: act.back_end.config.VALID_SOLVER_TIERS
+    #   "lp"               – LP/MILP backend
+    #   "dual"             – DualSolver (linear-relaxation dual, no iterative optimization)
+    #   "dual_alpha"       – DualSolver with Lagrange-relaxed lower-slope optimization (Adam on α ∈ [0,1])
+    #   "dual_alpha_eta"   – DualSolver with joint α + η (split-constraint KKT multipliers)
+    solver_tier: "lp"
+
+    # Number of Adam iterations for α/η optimization (only used in
+    # dual_alpha / dual_alpha_eta tiers).
+    dual_n_iters: 50
+
+    # Learning rate for α (ReLU lower-bound slope, clamped to [0, 1]).
+    lr_alpha: 0.1
+
+    # Learning rate for η (split-constraint KKT multipliers, clamped ≥ 0).
+    lr_beta: 0.1
+
+    # Adam ExponentialLR decay per iteration. 1.0 = no decay.
+    lr_decay: 0.98
+
+    # Inherit optimized (α, η) from parent BaB node into children (incremental-start).
+    incremental_start_enabled: true
+
+    # Per-spec α (tighter bounds, M× memory) vs shared α (looser, 1× memory).
+    per_class_alpha: true
+
+    # Track logical BaB node ids and parent ids in TopKBounding.
+    provenance_enabled: false
 
   # ── Network Generation (net_factory) ────────────────────────────────────
   # Controls how many networks to generate, where, and TF filtering.

@@ -14,7 +14,7 @@
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
-from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Optional
 
 if TYPE_CHECKING:
     import torch
@@ -49,7 +49,7 @@ class Solver:
         Implemented by ``GurobiSolver`` and ``HZSolver``.
       * ``solve_batch(BatchLPProblem)`` — batched LP/MILP. Implemented by
         ``GurobiSolver``, ``TorchLPSolver``, ``HZSolver``.
-      * ``compute_certified_bound(net, bounds_dict, c)`` — Wong-Kolter
+      * ``compute_certified_bound(net, bounds_dict, c)`` — linear-relaxation
         dual lower bound on ``c @ output``. Implemented by ``DualSolver``.
 
     Callers dispatch by reading ``capabilities()`` rather than relying on
@@ -82,7 +82,7 @@ class Solver:
         M: int = 1,
         return_sce: bool = False,
         enable_grad: bool = False,
-    ) -> "Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]":
+    ) -> object:
         """Sound certified lower bound ``L <= min_x c @ f(x)`` for x in the
         input region described by ``bounds_dict``, computed via backward
         propagation through ``net``'s graph.

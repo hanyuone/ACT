@@ -19,17 +19,39 @@ import os
 import sys
 import tempfile
 import time
-from typing import Callable, List, Optional, cast
+import inspect
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, cast
 
 import torch
 
-from act.back_end.config import BaBConfig
-from act.back_end.bab.node import BabNode, SubproblemBatch, split_subproblems
-from act.back_end.bab.branching.branching import BranchingStrategy, RandomBranching
-from act.back_end.bab.branching.bounding import BoundingStrategy, RandomBounding
+from act.back_end.config import BaBConfig, VALID_SOLVER_TIERS
+from act.back_end.bab.node import (
+    BabNode,
+    SubproblemBatch,
+    concat_children,
+    split_input,
+    split_input_nary,
+    split_neuron_subproblems,
+    split_subproblems,
+)
+from act.back_end.bab.branching.branching import (
+    BranchingStrategy,
+    RandomBranching,
+    SplitDecision,
+    _build_branching_strategy as _build_branching_strategy_impl,
+)
+from act.back_end.bab.branching.bounding import (
+    BoundingStrategy,
+    RandomBounding,
+    TopKBounding,
+    DepthLowerBoundOrder,
+    GreedyOrder,
+    SAOrder,
+)
 
 from act.back_end.core import Bounds, Layer, Net, ParamValue
-from act.back_end.solver.solver_base import Solver, SolveStatus
+from act.back_end.solver.solver_base import BatchLPSolution, Solver, SolveStatus
 from act.back_end.verifier import (
     gather_input_spec_layers,
     get_assert_layer,
@@ -37,11 +59,144 @@ from act.back_end.verifier import (
     seed_from_input_specs,
     setup_and_solve_batch,
 )
-from act.front_end.specs import OutKind
+from act.front_end.specs import OutKind, OutputSpec
 from act.util.model_inference import infer_single_model
 from act.util.stats import VerifyStatus, VerifyResult
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class DualSolveResult:
+    solution: BatchLPSolution
+    bounds_dict: Optional[Dict[int, Bounds]] = None
+    nu_per_layer: Optional[Dict[int, torch.Tensor]] = None
+
+
+def _want_babsr_neuron_branching(config: BaBConfig) -> bool:
+    return (
+        getattr(config, "branching_method", "random") in ("babsr", "fsb")
+        and getattr(config, "solver_tier", "lp") in ("dual_alpha", "dual_alpha_eta")
+    )
+
+
+def _input_axis_decision_tensor(
+    decision: SplitDecision,
+    batch: SubproblemBatch,
+) -> torch.Tensor:
+    if decision.input_axis is None:
+        raise ValueError("input-axis decision missing input_axis")
+    input_axis = torch.as_tensor(decision.input_axis, device=batch.lb.device, dtype=torch.long).reshape(-1)
+    if input_axis.numel() == 1:
+        input_axis = input_axis.expand(batch.batch_size)
+    if input_axis.numel() != batch.batch_size:
+        raise ValueError(
+            f"input-axis decision has {input_axis.numel()} lanes for batch size {batch.batch_size}"
+        )
+    return input_axis.contiguous()
+
+
+def _split_from_decision(
+    batch: SubproblemBatch,
+    decision: SplitDecision,
+    net: Net,
+) -> tuple[SubproblemBatch, torch.Tensor]:
+    fanout = max(2, int(getattr(decision, "fanout", 2)))
+    if decision.kind == "input_axis":
+        dims = (
+            _input_axis_decision_tensor(SplitDecision(kind="input_axis", input_axis=decision.cut_dim), batch)
+            if decision.cut_dim is not None
+            else _input_axis_decision_tensor(decision, batch)
+        )
+        if fanout == 2:
+            return split_input(batch, dims)
+        return split_input_nary(batch, dims, fanout)
+
+    if decision.kind == "neuron":
+        if decision.layer_id is None or decision.neuron_idx is None:
+            raise ValueError("neuron decision missing layer_id or neuron_idx")
+
+        layer_id_tensor = decision.layer_id.reshape(-1)
+        neuron_idx_tensor = decision.neuron_idx.reshape(-1)
+        if layer_id_tensor.numel() == 0 or neuron_idx_tensor.numel() == 0:
+            raise ValueError("neuron decision tensors must be non-empty")
+
+        rep_lid = int(layer_id_tensor[0].item())
+        rep_idx = int(neuron_idx_tensor[0].item())
+        if rep_lid < 0:
+            fallback_dims = (batch.ub - batch.lb).argmax(dim=-1)
+            if fanout == 2:
+                return split_input(batch, fallback_dims)
+            return split_input_nary(batch, fallback_dims, fanout)
+
+        layer = net.by_id[rep_lid]
+        n_neurons = int(layer.out_vars[-1] - layer.out_vars[0] + 1)
+        n_specs = (
+            int(batch.incremental_alpha[rep_lid].shape[1])
+            if batch.incremental_alpha is not None and rep_lid in batch.incremental_alpha
+            else 1
+        )
+        on, off = split_neuron_subproblems(
+            batch,
+            layer_id=rep_lid,
+            neuron_idx=rep_idx,
+            n_neurons=n_neurons,
+            n_specs=n_specs,
+        )
+        parent_index = torch.arange(batch.batch_size, device=batch.lb.device).repeat(2)
+        return concat_children(on, off), parent_index
+
+    raise ValueError(f"Unknown SplitDecision.kind: {decision.kind!r}")
+
+
+def _slice_branching_state(
+    bounds_dict: Optional[Dict[int, Bounds]],
+    nu_per_layer: Optional[Dict[int, torch.Tensor]],
+    lane_idx: torch.Tensor,
+    k_actual: int,
+) -> tuple[Optional[Dict[int, Bounds]], Optional[Dict[int, torch.Tensor]]]:
+    # ν/bounds are computed over the full k_actual wave; the brancher runs on the
+    # sub-batch actually being split. Bounds are [k_actual, *]; ν is [k_actual*M, n]
+    # packed sample-major (row b*M+j), so ν rows expand per selected lane.
+    bd_out: Optional[Dict[int, Bounds]] = None
+    if bounds_dict is not None:
+        bd_out = {
+            lid: Bounds(
+                b.lb.index_select(0, lane_idx.to(b.lb.device)),
+                b.ub.index_select(0, lane_idx.to(b.ub.device)),
+            )
+            for lid, b in bounds_dict.items()
+        }
+    nu_out: Optional[Dict[int, torch.Tensor]] = None
+    if nu_per_layer is not None:
+        nu_out = {}
+        for lid, t in nu_per_layer.items():
+            total = int(t.shape[0])
+            if k_actual > 0 and total != k_actual and total % k_actual == 0:
+                m = total // k_actual
+                rows = (
+                    lane_idx.to(t.device).unsqueeze(1) * m
+                    + torch.arange(m, device=t.device)
+                ).reshape(-1)
+            else:
+                rows = lane_idx.to(t.device)
+            nu_out[lid] = t.index_select(0, rows)
+    return bd_out, nu_out
+
+
+
+def _unbatch_field(val: Any) -> Any:
+    """Strip lazy-M broadcast batch dim when a field is shared by one sample.
+
+    BaB dual dispatch rebuilds an ``OutputSpec`` from ASSERT parameters while
+    subproblem lanes live in the leading lazy-M dimension. If a parameter is a
+    tensor with a singleton leading batch axis, remove that axis so
+    ``OutputSpec.encode_linear`` can re-broadcast it to the current K lanes.
+    """
+    if isinstance(val, torch.Tensor) and val.dim() >= 2 and val.shape[0] == 1:
+        return val[0]
+    return val
+
 
 
 
@@ -260,16 +415,203 @@ def check_violations_batched(net: object, x_batch: torch.Tensor, assert_layer: L
 # ---------------------------------------------------------------------------
 
 
-def _build_branching_strategy(method: str) -> BranchingStrategy:
-    if method == "random":
-        return RandomBranching()
-    raise ValueError(f"Unknown branching method: {method!r}")
+def _build_branching_strategy(method: str, *, dual_solver: Any = None) -> BranchingStrategy:
+    return _build_branching_strategy_impl(method, dual_solver=dual_solver)
 
 
-def _build_bounding(method: str) -> BoundingStrategy:
+def _build_bounding(
+    method: str,
+    *,
+    depth_weight: float = 1.0,
+    bound_weight: float = 1.0,
+    order_name: str = "depth_lb",
+    cooling_rate: float = 0.99,
+) -> BoundingStrategy:
     if method == "random":
         return RandomBounding()
+    if method == "topk":
+        if order_name == "depth_lb":
+            order = DepthLowerBoundOrder(depth_weight=depth_weight, bound_weight=bound_weight)
+        elif order_name == "greedy":
+            order = GreedyOrder()
+        elif order_name == "sa":
+            order = SAOrder(cooling_rate=cooling_rate)
+        else:
+            raise ValueError(f"unknown bounding_order {order_name!r}")
+
+        return TopKBounding(order)
     raise ValueError(f"Unknown bounding method: {method!r}")
+
+
+def _dispatch_dual_solve(
+    *,
+    net: Net,
+    assert_layer: Layer,
+    batched_bounds: Bounds,
+    k_actual: int,
+    batch: SubproblemBatch,
+    config: BaBConfig,
+    optimize: bool,
+) -> DualSolveResult:
+    """Run one dual-family BaB bound pass and decode lane statuses."""
+    from act.back_end.dual_tf.tf_forward import compute_forward_bounds
+    from act.back_end.solver.solver_dual import DualSolver
+
+    solver_tier = getattr(config, "solver_tier", "lp")
+    bounds_dict_dual = compute_forward_bounds(net, batched_bounds.lb, batched_bounds.ub)
+    out_kind_raw = assert_layer.params["kind"]
+    if not isinstance(out_kind_raw, str):
+        raise TypeError(f"ASSERT kind must be str, got {type(out_kind_raw).__name__}")
+
+    out_spec_fields: dict[str, torch.Tensor] = {}
+    for key in OutputSpec.SLICEABLE_PARAM_KEYS:
+        if key in assert_layer.params and assert_layer.params[key] is not None:
+            value = assert_layer.params[key]
+            tensor_value = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+            out_spec_fields[key] = _unbatch_field(tensor_value)
+
+    out_spec = OutputSpec(
+        kind=out_kind_raw,
+        y_true=out_spec_fields.get("y_true"),
+        margin=out_spec_fields.get("margin"),
+        c=out_spec_fields.get("c"),
+        d=out_spec_fields.get("d"),
+        lb=out_spec_fields.get("lb"),
+        ub=out_spec_fields.get("ub"),
+    )
+    sample_bounds = next(iter(bounds_dict_dual.values()))
+    device = sample_bounds.lb.device
+    dtype = sample_bounds.lb.dtype
+    assert_preds = net.preds.get(assert_layer.id, [])
+    if len(assert_preds) != 1:
+        raise ValueError(
+            f"ASSERT layer {assert_layer.id} must have exactly 1 predecessor, "
+            f"got {len(assert_preds)}"
+        )
+    output_bounds = bounds_dict_dual[assert_preds[0]]
+    n_out = int(output_bounds.lb.flatten(start_dim=1).shape[-1])
+    encoded_spec = out_spec.encode_linear(B=k_actual, n_out=n_out, device=device, dtype=dtype)
+    m_specs = int(encoded_spec["M"])
+    active_mask = torch.ones(k_actual, m_specs, dtype=torch.bool, device=device)
+    dual = DualSolver()
+
+    if out_spec.kind == OutKind.UNSAFE_LINEAR:
+        c_rows = cast(torch.Tensor, encoded_spec["C"]).contiguous()
+        thresholds = cast(torch.Tensor, encoded_spec["thresholds"]).contiguous()
+    else:
+        c_rows = -cast(torch.Tensor, encoded_spec["C"]).contiguous()
+        thresholds = -cast(torch.Tensor, encoded_spec["thresholds"]).contiguous()
+
+    return_nu = _want_babsr_neuron_branching(config)
+    supports_return_nu = "return_nu_per_layer" in inspect.signature(
+        dual.compute_certified_bound
+    ).parameters
+
+    compute_certified_bound = cast(Any, dual.compute_certified_bound)
+
+    if optimize:
+        dual_result = compute_certified_bound(
+            net,
+            bounds_dict_dual,
+            c_rows,
+            M=m_specs,
+            optimize=True,
+            n_iters=config.dual_n_iters,
+            lr_alpha=config.lr_alpha,
+            lr_beta=config.lr_beta,
+            lr_decay=config.lr_decay,
+            eta=batch.incremental_eta if solver_tier == "dual_alpha_eta" else None,
+            incremental_alphas=batch.incremental_alpha if getattr(config, "incremental_start_enabled", True) else None,
+            incremental_etas=(
+                batch.incremental_eta
+                if solver_tier == "dual_alpha_eta"
+                and getattr(config, "incremental_start_enabled", True)
+                else None
+            ),
+            split_signs=batch.split_signs if solver_tier == "dual_alpha_eta" else None,
+            return_optimized=True,
+            return_sce=True,
+            per_class_alpha=config.per_class_alpha,
+            **({"return_nu_per_layer": True} if return_nu and supports_return_nu else {}),
+        )
+        margins_flat = dual_result.margins
+        sce = cast(Optional[torch.Tensor], dual_result.sce)
+        batch.incremental_alpha = dual_result.alpha_state
+        if solver_tier == "dual_alpha_eta":
+            batch.incremental_eta = dual_result.eta_state
+    else:
+        dual_result = compute_certified_bound(
+            net,
+            bounds_dict_dual,
+            c_rows,
+            M=m_specs,
+            return_sce=True,
+            **({"return_nu_per_layer": True} if return_nu and supports_return_nu else {}),
+        )
+        margins_flat = dual_result.margins
+        sce = cast(Optional[torch.Tensor], dual_result.sce)
+
+    margins = margins_flat.view(k_actual, m_specs)
+    slack = margins - thresholds
+    if out_spec.kind == OutKind.UNSAFE_LINEAR:
+        certified = ((slack > 0) & active_mask).any(dim=-1)
+        candidate_rows = torch.zeros(k_actual, dtype=torch.long, device=device)
+    else:
+        violations = (slack < 0) & active_mask
+        certified = ~violations.any(dim=-1)
+        candidate_rows = torch.where(
+            violations.any(dim=1),
+            violations.to(torch.int64).argmax(dim=1),
+            torch.zeros(k_actual, dtype=torch.long, device=device),
+        )
+
+    statuses = tuple(
+        SolveStatus.UNSAT if bool(is_certified.item()) else SolveStatus.SAT
+        for is_certified in certified
+    )
+    nvars = max((max(layer.out_vars) for layer in net.layers if layer.out_vars), default=-1) + 1
+    x_candidate = torch.zeros(k_actual, nvars, device=device, dtype=dtype)
+    if sce is not None:
+        sce_flat = sce.flatten(start_dim=1).to(device=device)
+        row_offsets = torch.arange(k_actual, device=device) * m_specs + candidate_rows.to(device=device)
+        chosen_sce = sce_flat.index_select(0, row_offsets)
+        input_ids = torch.tensor(get_input_ids(net), device=device, dtype=torch.long)
+        x_candidate[:, input_ids] = chosen_sce.to(device=device, dtype=dtype)
+    else:
+        # TODO: extend CE-candidate generation for dual paths that do not return SCE.
+        statuses = tuple(
+            SolveStatus.UNSAT if status == SolveStatus.UNSAT else SolveStatus.UNKNOWN
+            for status in statuses
+        )
+    solution = BatchLPSolution(
+        statuses=statuses,
+        x=x_candidate,
+        max_viol=-slack.min(dim=1).values.detach(),
+    )
+    branch_bounds: Optional[Dict[int, Bounds]] = None
+    branch_nu: Optional[Dict[int, torch.Tensor]] = None
+    if return_nu:
+        branch_bounds, branch_nu = dual.recompute_bounds_and_nu(
+            net,
+            bounds_dict_dual,
+            c_rows,
+            m_specs,
+            alpha_state=getattr(dual_result, "alpha_state", None),
+            eta_state=(
+                getattr(dual_result, "eta_state", None)
+                if solver_tier == "dual_alpha_eta"
+                else None
+            ),
+            split_signs=(
+                batch.split_signs if solver_tier == "dual_alpha_eta" else None
+            ),
+            per_class_alpha=config.per_class_alpha,
+        )
+    return DualSolveResult(
+        solution=solution,
+        bounds_dict=branch_bounds,
+        nu_per_layer=branch_nu,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -329,15 +671,49 @@ def verify_bab_batched(
 
     budget_s = time_budget_s if time_budget_s is not None else 300.0
 
-    brancher = _build_branching_strategy(config.branching_method)
-    pool = _build_bounding(config.bounding_method)
+    fsb_dual_solver = None
+    if config.branching_method == "fsb":
+        from act.back_end.solver.solver_dual import DualSolver
+
+        fsb_dual_solver = DualSolver()
+    brancher = _build_branching_strategy(config.branching_method, dual_solver=fsb_dual_solver)
+    pool = _build_bounding(
+        config.bounding_method,
+        depth_weight=getattr(config, "bounding_depth_weight", 1.0),
+        bound_weight=getattr(config, "bounding_bound_weight", 1.0),
+        order_name=getattr(config, "bounding_order", "depth_lb"),
+        cooling_rate=getattr(config, "sa_cooling_rate", 0.99),
+    )
+    provenance = bool(getattr(config, "provenance_enabled", False))
+    if provenance and not isinstance(pool, TopKBounding):
+        raise ValueError("provenance_enabled requires bounding_method='topk'")
+    node_counter = 0
+    fanout = max(2, int(getattr(config, "input_split_fanout", 2)))
+    frontier_cap = int(getattr(config, "frontier_cap", 0))
 
     spec_layers = gather_input_spec_layers(net)
     assert_layer = get_assert_layer(net)
     root_bounds = seed_from_input_specs(spec_layers)
     input_shape: tuple[int, ...] = tuple(root_bounds.lb.shape[1:])
 
-    pool.push(SubproblemBatch.from_bounds(root_bounds))
+    root_batch = SubproblemBatch.from_bounds(root_bounds)
+    if provenance:
+        n = root_batch.batch_size
+        root_batch.node_id = torch.arange(
+            node_counter,
+            node_counter + n,
+            device=root_batch.lb.device,
+            dtype=torch.long,
+        )
+        root_batch.parent_id = torch.full(
+            (n,), -1, device=root_batch.lb.device, dtype=torch.long
+        )
+        node_counter += n
+    pool.push(root_batch)
+    any_dropped_frontier_cap = False
+    if frontier_cap > 0 and len(pool) > frontier_cap:
+        if pool.evict_to(frontier_cap) > 0:
+            any_dropped_frontier_cap = True
 
     start = time.time()
     processed = 0
@@ -366,10 +742,45 @@ def verify_bab_batched(
             k_ub = batch.ub
         batched_bounds = Bounds(k_lb, k_ub)
 
-        solver = solver_factory()
-        solution = setup_and_solve_batch(
-            net, batched_bounds, solver, timelimit=None,
-        )
+        solver_tier = getattr(config, "solver_tier", "lp")
+        want_neuron_branching = _want_babsr_neuron_branching(config)
+        bounds_dict_for_branching: Optional[Dict[int, Bounds]] = None
+        nu_per_layer_for_branching: Optional[Dict[int, torch.Tensor]] = None
+        if solver_tier == "lp":
+            solver = solver_factory()
+            solution = setup_and_solve_batch(
+                net, batched_bounds, solver, timelimit=None,
+            )
+        elif solver_tier == "dual":
+            dual_solve_result = _dispatch_dual_solve(
+                net=net,
+                assert_layer=assert_layer,
+                batched_bounds=batched_bounds,
+                k_actual=k_actual,
+                batch=batch,
+                config=config,
+                optimize=False,
+            )
+            solution = dual_solve_result.solution
+        elif solver_tier in ("dual_alpha", "dual_alpha_eta"):
+            dual_solve_result = _dispatch_dual_solve(
+                net=net,
+                assert_layer=assert_layer,
+                batched_bounds=batched_bounds,
+                k_actual=k_actual,
+                batch=batch,
+                config=config,
+                optimize=True,
+            )
+            solution = dual_solve_result.solution
+            bounds_dict_for_branching = dual_solve_result.bounds_dict
+            nu_per_layer_for_branching = dual_solve_result.nu_per_layer
+        else:
+            raise ValueError(
+                f"Unknown solver_tier={solver_tier!r}. Valid: {VALID_SOLVER_TIERS}."
+            )
+
+        node_lower_bound = (-solution.max_viol).detach()
 
         sat_lane_idx = [
             i for i, s in enumerate(solution.statuses) if s == SolveStatus.SAT
@@ -399,6 +810,8 @@ def verify_bab_batched(
                             "nodes": processed + k_actual,
                             "lane": lane,
                             "K": k_actual,
+                            "nodes_minted": node_counter,
+                            "any_dropped_frontier_cap": any_dropped_frontier_cap,
                         },
                     )
 
@@ -408,10 +821,42 @@ def verify_bab_batched(
             dtype=torch.long,
         )
         if int(unresolved_idx.numel()) > 0:
+            def _select_incremental_state(
+                state: Optional[dict[int, torch.Tensor]],
+                indices: torch.Tensor,
+            ) -> Optional[dict[int, torch.Tensor]]:
+                if state is None:
+                    return None
+                return {
+                    layer_id: tensor.index_select(0, indices.to(tensor.device))
+                    for layer_id, tensor in state.items()
+                }
+
             unresolved = SubproblemBatch(
-                lb=batch.lb.index_select(0, unresolved_idx),
-                ub=batch.ub.index_select(0, unresolved_idx),
-                depths=batch.depths.index_select(0, unresolved_idx.cpu()),
+                lb=batch.lb.index_select(0, unresolved_idx.to(batch.lb.device)),
+                ub=batch.ub.index_select(0, unresolved_idx.to(batch.ub.device)),
+                depths=batch.depths.index_select(0, unresolved_idx.to(batch.depths.device)),
+                incremental_alpha=_select_incremental_state(batch.incremental_alpha, unresolved_idx),
+                incremental_eta=_select_incremental_state(batch.incremental_eta, unresolved_idx),
+                split_signs=_select_incremental_state(batch.split_signs, unresolved_idx),
+                parent_margins=(
+                    batch.parent_margins.index_select(0, unresolved_idx.to(batch.parent_margins.device))
+                    if batch.parent_margins is not None
+                    else None
+                ),
+                lower_bound=node_lower_bound.index_select(
+                    0, unresolved_idx.to(node_lower_bound.device)
+                ),
+                node_id=(
+                    batch.node_id.index_select(0, unresolved_idx.to(batch.node_id.device))
+                    if batch.node_id is not None
+                    else None
+                ),
+                parent_id=(
+                    batch.parent_id.index_select(0, unresolved_idx.to(batch.parent_id.device))
+                    if batch.parent_id is not None
+                    else None
+                ),
             )
             branch_mask = unresolved.depths < int(config.max_depth)
             if bool((~branch_mask).any().item()):
@@ -422,12 +867,95 @@ def verify_bab_batched(
                     lb=unresolved.lb.index_select(0, branch_idx.to(unresolved.lb.device)),
                     ub=unresolved.ub.index_select(0, branch_idx.to(unresolved.ub.device)),
                     depths=unresolved.depths.index_select(0, branch_idx),
+                    incremental_alpha=_select_incremental_state(unresolved.incremental_alpha, branch_idx),
+                    incremental_eta=_select_incremental_state(unresolved.incremental_eta, branch_idx),
+                    split_signs=_select_incremental_state(unresolved.split_signs, branch_idx),
+                    parent_margins=(
+                        unresolved.parent_margins.index_select(0, branch_idx)
+                        if unresolved.parent_margins is not None
+                        else None
+                    ),
+                    lower_bound=(
+                        unresolved.lower_bound.index_select(0, branch_idx)
+                        if unresolved.lower_bound is not None
+                        else None
+                    ),
+                    node_id=(
+                        unresolved.node_id.index_select(0, branch_idx.to(unresolved.node_id.device))
+                        if unresolved.node_id is not None
+                        else None
+                    ),
+                    parent_id=(
+                        unresolved.parent_id.index_select(0, branch_idx.to(unresolved.parent_id.device))
+                        if unresolved.parent_id is not None
+                        else None
+                    ),
                 )
-                scores = brancher.compute_scores(branch_batch, net)
-                split_dims = brancher.select(scores)
-                left, right = split_subproblems(branch_batch, split_dims)
-                pool.push(left)
-                pool.push(right)
+                if want_neuron_branching:
+                    full_branch_idx = unresolved_idx.index_select(
+                        0, branch_idx.to(unresolved_idx.device)
+                    )
+                    bd_branch, nu_branch = _slice_branching_state(
+                        bounds_dict_for_branching,
+                        nu_per_layer_for_branching,
+                        full_branch_idx,
+                        k_actual,
+                    )
+                    scores = cast(Any, brancher).compute_scores(
+                        branch_batch,
+                        net,
+                        bounds_dict=bd_branch,
+                        nu_per_layer=nu_branch,
+                    )
+                    decision = cast(SplitDecision, cast(Any, brancher).select(scores))
+                    if decision.kind == "input_axis":
+                        decision.fanout = fanout
+                    children, parent_index = _split_from_decision(branch_batch, decision, net)
+                else:
+                    scores = brancher.compute_scores(branch_batch, net)
+                    legacy_decision = cast(Any, brancher).select(scores)
+                    split_fanout = fanout
+                    if isinstance(legacy_decision, SplitDecision):
+                        if legacy_decision.cut_dim is not None:
+                            split_dims = _input_axis_decision_tensor(
+                                SplitDecision(kind="input_axis", input_axis=legacy_decision.cut_dim),
+                                branch_batch,
+                            )
+                        else:
+                            if legacy_decision.input_axis is None:
+                                raise ValueError("input-axis decision missing input_axis")
+                            split_dims = _input_axis_decision_tensor(
+                                legacy_decision,
+                                branch_batch,
+                            )
+                        split_fanout = max(2, int(getattr(legacy_decision, "fanout", fanout)))
+                    else:
+                        split_dims = torch.as_tensor(
+                            legacy_decision,
+                            device=branch_batch.lb.device,
+                            dtype=torch.long,
+                        ).reshape(-1)
+                    if split_fanout == 2:
+                        children, parent_index = split_input(branch_batch, split_dims)
+                    else:
+                        children, parent_index = split_input_nary(branch_batch, split_dims, split_fanout)
+
+                if provenance:
+                    pid = branch_batch.node_id
+                    assert pid is not None
+                    children.parent_id = pid.index_select(0, parent_index.to(pid.device))
+                    nc = children.batch_size
+                    children.node_id = torch.arange(
+                        node_counter,
+                        node_counter + nc,
+                        device=children.lb.device,
+                        dtype=torch.long,
+                    )
+                    node_counter += nc
+                pool.push(children)
+                if frontier_cap > 0 and len(pool) > frontier_cap:
+                    if pool.evict_to(frontier_cap) > 0:
+                        any_dropped_frontier_cap = True
 
         processed += k_actual
 
@@ -436,7 +964,7 @@ def verify_bab_batched(
     exhausted_time = elapsed_total >= budget_s
     exhausted_nodes = processed >= config.max_nodes
 
-    if not any_dropped_max_depth and pool_remaining == 0:
+    if not any_dropped_max_depth and not any_dropped_frontier_cap and pool_remaining == 0:
         return VerifyResult(
             VerifyStatus.CERTIFIED,
             metadata={
@@ -444,6 +972,8 @@ def verify_bab_batched(
                 "pool_remaining": 0,
                 "exhausted_budget_time": exhausted_time,
                 "exhausted_budget_nodes": exhausted_nodes,
+                "nodes_minted": node_counter,
+                "any_dropped_frontier_cap": any_dropped_frontier_cap,
             },
         )
 
@@ -454,6 +984,8 @@ def verify_bab_batched(
             "pool_remaining": pool_remaining,
             "exhausted_budget_time": exhausted_time,
             "exhausted_budget_nodes": exhausted_nodes,
+            "nodes_minted": node_counter,
+            "any_dropped_frontier_cap": any_dropped_frontier_cap,
             "reason": "budget_exhausted_with_unproven_subboxes",
         },
     )
@@ -472,12 +1004,11 @@ def verify_bab(
     timelimit: Optional[float] = None,
     verbose: bool = False,
 ) -> VerifyResult:
-    """Legacy single-solver Branch-and-Bound entry; backward-compat shim.
+    """Single-solver Branch-and-Bound entry: one subproblem per iteration.
 
-    Thin wrapper over [BATCHED-API] ``verify_bab_batched`` with K=1 (legacy
-    one-subproblem-per-iteration semantics). Constructs a solver factory from
-    the supplied solver instance's type so each BaB iteration gets a fresh
-    instance. New callers should prefer ``verify_bab_batched`` directly.
+    Thin wrapper over ``verify_bab_batched`` with K=1. Constructs a solver factory
+    from the supplied solver instance's type so each BaB iteration gets a fresh
+    instance. Prefer ``verify_bab_batched`` directly for batched (K>1) solving.
     """
     if config is None:
         config = BaBConfig(
@@ -489,6 +1020,11 @@ def verify_bab(
         time_budget_s if time_budget_s is not None
         else (timelimit if timelimit is not None else 300.0)
     )
+    solver_tier = getattr(config, "solver_tier", "lp")
+    if solver_tier not in VALID_SOLVER_TIERS:
+        raise ValueError(
+            f"Unknown solver_tier={solver_tier!r}. Valid: {VALID_SOLVER_TIERS}."
+        )
     solver_type = type(solver)
     return verify_bab_batched(
         net=net,
@@ -594,7 +1130,7 @@ def test_random_branching():  # pragma: no cover
     assert scores.shape == (1, 3)
     assert (scores >= 0).all()
 
-    dims = brancher.select(scores)
+    dims = cast(torch.Tensor, brancher.select(scores))
     assert dims.shape == (1,)
     assert 0 <= dims.item() <= 2
 
@@ -609,7 +1145,7 @@ def test_random_branching_with_mask():  # pragma: no cover
     scores = brancher.compute_scores(batch, cast(Net, cast(object, _StubNet())), unstable_mask=mask)
     assert scores[0, 0].item() == 0.0
     assert scores[0, 2].item() == 0.0
-    assert brancher.select(scores).item() == 1
+    assert cast(torch.Tensor, brancher.select(scores)).item() == 1
 
 
 def test_random_bounding():  # pragma: no cover

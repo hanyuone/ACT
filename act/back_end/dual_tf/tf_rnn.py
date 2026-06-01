@@ -26,7 +26,7 @@ def forward_lstm(L, parent_boxes, parent_lins, parent_frames, preds,
     raise NotImplementedError("forward for LSTM not implemented in dual_tf")
 
 
-def backward_lstm(L, nu, bounds_dict, preds, M: int = 1):
+def backward_lstm(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
     """LSTM backward through time. (Pending)
     Will require: gate bounds from forward pass, per-timestep weight matrices
     (weight_ih, weight_hh), seq_len, hidden_size.
@@ -43,7 +43,7 @@ def forward_gru(L, parent_boxes, parent_lins, parent_frames, preds,
     raise NotImplementedError("forward for GRU not implemented in dual_tf")
 
 
-def backward_gru(L, nu, bounds_dict, preds, M: int = 1):
+def backward_gru(L, nu, bounds_dict, preds, M: int = 1, alpha=None):
     """GRU backward through time. (Pending)
     Will require: gate bounds from forward pass, per-timestep weight matrices.
     """
