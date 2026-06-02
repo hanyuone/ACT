@@ -13,30 +13,28 @@ ACT is a unified neural network verification framework with a modern three-tier 
 ### Core Components
 
 #### Front-End (`act/front_end/`)
-- **Loaders** (`loaders/`) - `DatasetLoader`, `ModelLoader`, `SpecLoader` for MNIST/CIFAR/VNNLIB
+- **Loaders** - `torchvision_loader/`, `vnnlib_loader/`, and `creator_registry.py` for benchmark discovery
 - **Specifications** (`specs.py`) - `InputSpec`/`OutputSpec` with `InKind`/`OutKind` enums
 - **Wrapper Layers** (`verifiable_model.py`) - PyTorch modules for verification: `InputLayer`, `InputSpecLayer`, `OutputSpecLayer`
 - **Model Synthesis** (`model_synthesis.py`) - Advanced model generation and optimization
 - **Device Management** (`util/device_manager.py`) - GPU-first CUDA device handling
-- **Preprocessors** - Image (`preprocessor_image.py`) and text (`preprocessor_text.py`) processing
 
 #### Back-End (`act/back_end/`)
 - **Core Engine** (`core.py`) - `Net`, `Layer`, `Bounds`, `Con`, `ConSet` data structures
-- **Verification** (`verifier.py`) - Spec-free verification: `verify_once()`, `verify_bab()`
+- **Verification** (`verifier.py`) - Spec-free verification: `verify_once()`, `verify_lp_batched()`, `verify_bab()`, `verify_bab_batched()`
 - **Layer Schema** (`layer_schema.py`) - Layer type definitions and validation rules
-- **Solvers** (`solver/`) - `GurobiSolver`, `TorchLPSolver` for MILP/LP optimization
-- **Transfer Functions** (`transfer_funs/`) - MLP, CNN, RNN, Transformer analysis
-- **Branch-and-Bound** (`bab.py`) - BaB refinement with counterexample validation
+- **Solvers** (`solver/`) - `GurobiSolver`, `TorchLPSolver`, `DualSolver`, `HybridZSolver`
+- **Transfer Functions** - `interval_tf/`, `hybridz_tf/`, `dual_tf/` dirs
+- **Branch-and-Bound** (`bab/`) - BaB refinement with counterexample validation
 
 #### Pipeline (`act/pipeline/`)
 - **Torch2ACT Converter** (`torch2act.py`) - Automatic PyTorch→ACT Net conversion
-- **Testing Framework** - Mock generation, correctness validation, regression testing
-- **Integration Bridge** (`integration.py`) - Front-end integration for real verification
-- **Configuration** (`config.py`) - YAML-based test scenario management
+- **Testing Framework** - Trace-based fuzzer, correctness validation, regression testing
+- **Integration Bridge** (`verification/`) - Front-end integration for real verification
 
 ### Key Data Structures
 - **Verification Results**: `VerifyStatus.{CERTIFIED, FALSIFIED, UNKNOWN, TIMEOUT, VERIFIER_ERROR, MODEL_INFER_FAILURE}`
-- **Specifications**: `InKind.{BOX, L_INF, LIN_POLY}`, `OutKind.{SAFETY, ASSERT}`
+- **Specifications**: `InKind.{BOX, LINF_BALL, LIN_POLY}`, `OutKind.{LINEAR_LE, TOP1_ROBUST, MARGIN_ROBUST, RANGE, UNSAFE_LINEAR}`
 - **Core ACT Types**: `Layer` (id, kind, params, meta, vars), `Net` (layers, graph)
 - **Bounds**: Box constraints with `lb`/`ub` tensors for variable ranges
 
@@ -44,39 +42,21 @@ ACT is a unified neural network verification framework with a modern three-tier 
 
 ### Environment Setup
 ```bash
-cd setup/
-source setup.sh main  # Creates conda env 'act-main'
-conda activate act-main
-```
-
-### Running Verification
-```bash
-python act/wrapper_exts/ext_runner.py \
-  --model_path act/wrapper_exts/models/vnnmodels/MNIST/small_relu_mnist_cnn_model_1.onnx \
-  --dataset mnist --spec_type local_lp \
-  --start 0 --end 1 --epsilon 0.03 --norm inf \
-  --mean 0.1307 --std 0.3081
+# Core environment only
+conda env create -f environment.yml
+conda activate act-py312
 ```
 
 ### Testing
-- **Pipeline tests**: `python act/pipeline/run_tests.py` for comprehensive validation
-- **Integration tests**: Built into the pipeline framework for end-to-end validation
+- **Pipeline tests**: `python -m act.pipeline --verify vnnlib` for comprehensive validation
+- **Verifier validation**: `python -m act.pipeline --validate-verifier` for end-to-end correctness
 
 ## Configuration System
 
-### Dataset Defaults
-Config files in `modules/configs/` provide verifier-specific defaults:
-```ini
-[MNIST] # eran_defaults.ini
-mean = [0.1307]
-std = [0.3081]
-spec_type = "local_lp"
-```
-
 ### Verifier Selection
 - **Command loading**: CLI parameters defined across multiple `options.py` files
-- **Backend routing**: Factory pattern in `main.py` based on verifier selection
-- **External integrations**: αβ-CROWN and ERAN wrappers in `wrapper_exts/`
+- **Entry points**: `python -m act.{front_end,back_end,pipeline}`
+- **Backend routing**: Modular CLI architecture based on verifier selection
 
 ## Critical Conventions
 
@@ -88,7 +68,6 @@ spec_type = "local_lp"
   - `get_model_dir()` - Model directory
   - Never hardcode paths - always use path_config.py functions
 - **Project root**: Always use project root as working directory
-- **Model paths**: Relative to project root (`act/wrapper_exts/models/vnnmodels/...`)
 - **Import structure**: Hierarchical imports following `act/front_end`, `act/back_end`, `act/pipeline`
 
 ### Device and Dtype Management
@@ -111,8 +90,6 @@ spec_type = "local_lp"
 ## Integration Points
 
 ### External Tools
-- **ERAN**: Subprocess execution with parameter translation
-- **αβ-CROWN**: YAML config generation and temp file management  
 - **Gurobi**: License required in `modules/gurobi/gurobi.lic` for MILP optimization
 
 ### VNNLIB Compatibility
@@ -145,7 +122,6 @@ When writing code for this project, follow these Python best practices:
 
 ### Testing Requirements
 - Focus on integration tests for critical verification workflows
-- Mock external verifier calls (ERAN, αβ-CROWN) when needed
 - Test both typical and edge cases, including error handling
 - Keep test logic isolated and independent
 - Use the pipeline testing framework for comprehensive validation

@@ -27,8 +27,8 @@ def configure_mirror_urls() -> None:
 
     The original mirror (yann.lecun.com) is no longer reliably reachable.
     Call this function once, early in any entry point that may trigger an MNIST
-    download (either directly via torchvision or transitively through abcrown /
-    ERAN data loaders).
+    download (either directly via torchvision or transitively through other
+    data loaders).
 
     This is idempotent – calling it multiple times has no side effects.
     """

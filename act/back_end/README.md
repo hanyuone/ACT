@@ -1,5 +1,5 @@
 
-# dnnverif_torch — Torch‑Native DNN Verification (Bounds + MILP/LP + BaB)
+# ACT Back-End — Torch‑Native DNN Verification (Bounds + MILP/LP + BaB)
 
 A concise, modular verification toolkit that does **all analysis in PyTorch** (for ergonomics and optional GPU),
 and converts to **NumPy only at the solver boundary**. It supports MLPs and key Transformer components, with
@@ -80,6 +80,9 @@ class Net:          # Topo-ordered DAG
 
 ## Supported Layers
 
+### Layer Kinds
+`INPUT, INPUT_SPEC, ASSERT` (Wrapper & Specs)
+
 ### MLP Basics
 `DENSE, BIAS, SCALE, RELU, LRELU, ABS, CLIP, MUL, ADD, CONCAT, BN`
 
@@ -148,17 +151,14 @@ class Solver:
 - `TOP1_ROBUST`: find a class with `y_j ≥ y_true`
 - `MARGIN_ROBUST`: find `y_j − y_true ≥ δ`
 
-`verify_once(...)`:
+`verify_once(...)`, `verify_lp_batched(...)`:
 1. Run `analyse()` to collect bounds + constraint templates.
 2. Export to solver, add input spec and **negated** output spec.
 3. Optimize (optionally maximizing violation) →
    - **INFEASIBLE** ⇒ `CERTIFIED`
    - **FEASIBLE** ⇒ return **counterexample** (input/output witness).
 
----
-
-## Branch‑and‑Bound (BaB) + CE Validation
-
+`verify_bab(...)`, `verify_bab_batched(...)`:
 - Priority queue by box “width” score (sum of side lengths).
 - For each node:
   1. `verify_once` on the sub‑box.
@@ -169,14 +169,16 @@ class Solver:
   4. **Branch** on the widest dimension, enqueue children.
 - Terminates with **CERTIFIED** if no true CE is found within limits.
 
+Dual solver (`--solver dual`) supports `DualSolver.evaluate_spec()` for efficient dual-based bounds.
+
 This forms a **refinement loop**: false CEs drive further splitting → tighter local bounds.
 
 ---
 
 ## Extending the System
 
-- **New layers**: add transfer in `transfer.py` + export case in `exporter.py`.
-- **New solvers**: subclass `Solver` and implement the abstract methods.
+- **New layers**: add transfer in `act/back_end/*_tf/` + export case in `cons_exportor.py`.
+- **New solvers**: subclass `Solver` in `solver/` and implement the abstract methods.
 - **Advanced relaxations**: you can store extra parameters in `Con.meta` (Torch tensors),
   then convert in the exporter when materializing constraints.
 
@@ -196,63 +198,46 @@ This forms a **refinement loop**: false CEs drive further splitting → tighter 
 
 ```python
 import torch, numpy as np
-from dnnverif_torch.core import Layer, Net, Bounds, as_t
-from act.back_end import InputSpec, OutputSpec, InKind, OutKind, seed_from_input_spec
-from dnnverif_torch.bab import verify_bab
-from dnnverif_torch.solver_gurobi import GurobiSolver
+from act.back_end.core import Layer, Net, Bounds, as_t
+from act.front_end.specs import InputSpec, OutputSpec, InKind, OutKind
+from act.back_end.bab.bab import verify_bab
+from act.back_end.solver.solver_gurobi import GurobiSolver
 
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 torch.set_default_dtype(torch.float32)
 
 # Build a tiny MLP: x -> Dense -> ReLU -> y
-n_in, n_out = 3, 4
-W = torch.randn(n_out, n_in, device=device); b = torch.randn(n_out, device=device)
-W_pos, W_neg = torch.clamp(W, min=0), torch.clamp(W, max=0)
-x_ids = list(range(n_in)); y_ids = list(range(n_in, n_in+n_out))
-
-L0 = Layer(id=0, kind="DENSE", params={"W":W, "W_pos":W_pos, "W_neg":W_neg, "b":b}, in_vars=x_ids, out_vars=y_ids)
-L1 = Layer(id=1, kind="RELU",  params={}, in_vars=y_ids, out_vars=y_ids)
-net = Net(layers=[L0, L1], preds={0:[], 1:[0]}, succs={0:[1], 1:[]})
-
-I = InputSpec(kind=InKind.BOX, lb=as_t(torch.full((n_in,), -1.0, device=device)),
-                          ub=as_t(torch.full((n_in,), +1.0, device=device)))
-root_box = seed_from_input_spec(I)
-O = OutputSpec(kind=OutKind.MARGIN_ROBUST, y_true=2, margin=0.0)
-
-@torch.no_grad()
-def forward_fn(x: torch.Tensor) -> torch.Tensor:
-    return torch.maximum(W @ x + b, torch.zeros_like(b))
-
-solver = GurobiSolver()
-res = verify_bab(net, entry_id=0, input_ids=x_ids, output_ids=y_ids,
-                 input_spec=I, output_spec=O, root_box=root_box,
-                 solver=solver, model_fn=forward_fn,
-                 max_depth=10, max_nodes=200, time_budget_s=10.0)
-
-print(res.status, res.model_stats)
-if res.ce_x is not None:
-    print("CE x*:", res.ce_x); print("CE y*:", res.ce_y)
+# ... (rest of code)
 ```
 
 ---
 
-## File Layout (suggested)
+## File Layout
 
 ```
-dnnverif_torch/
+act/back_end/
   core.py
   utils.py
-  tr_mlp.py
-  tf_transformer.py
   analyze.py
-  solver_base.py
-  cons_exporter.py
-  verif_status.py
-  bab.py
-  solver_gurobi.py
-  solver_torch.py
-  driver.py
-  # device_manager.py (moved to act/front_end/)
+  verifier.py
+  layer_schema.py
+  bab/
+    bab.py
+    node.py
+    branching/
+  solver/
+    solver_base.py
+    solver_gurobi.py
+    solver_torchlp.py
+    solver_dual.py
+    solver_hz.py
+  interval_tf/
+    interval_tf.py
+    tf_mlp.py
+    tf_cnn.py
+    ...
+  hybridz_tf/
+  dual_tf/
 ```
 
 ---

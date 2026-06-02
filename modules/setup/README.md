@@ -1,42 +1,21 @@
 # Setup Directory
 
-This directory contains all environment setup scripts and dependency requirements for the Abstract Constraint Transformer (ACT) framework.
+This directory contains the environment setup script and dependency requirements for the Abstract Constraint Transformer (ACT) framework.
 
 ## Files Overview
 
 ### Main Setup Script
-- **`setup.sh`**: Automated setup script that creates all required conda environments
-  - Creates `act-main`, `act-abcrown`, and `act-eran` environments
+- **`setup.sh`**: Automated setup script that creates the ACT conda environment
+  - Creates the `act-py312` environment
   - Installs all Python dependencies from requirement files
-  - Invokes ERAN-specific setup (GMP, MPFR, ELINA, DeepG)
   - Configures Gurobi optimizer
-  - Patches αβ-CROWN imports to prevent conflicts
-
-### ERAN-Specific Setup
-- **`eran_env_setup.sh`**: Specialised setup script for ERAN environment
-  - Handles ERAN's linux system dependencies
-  - Compiles mathematical libraries (GMP, MPFR)
-  - Builds ELINA abstract interpretation library
-  - Configures DeepG optimization components
 
 ### Python Requirements
-- **`main_requirements.txt`**: Dependencies for ACT main environment (`act-main`)
-  - PyTorch 2.x with CUDA support
+- **`main_requirements.txt`**: Dependencies for ACT environment (`act-py312`)
+  - PyTorch with CUDA support
   - ONNX tools and runtime
   - Gurobi Python interface
-  - NumPy, TensorFlow, and other scientific computing libraries
-
-- **`abcrown_requirements.txt`**: Dependencies for αβ-CROWN environment (`act-abcrown`)
-  - PyTorch 2.x compatible with αβ-CROWN
-  - ONNX simplification tools
-  - Gurobi optimizer
-  - Sorted containers for efficient data structures
-
-- **`eran_requirements.txt`**n: Dependencies for ERAN environment (`act-eran`)
-  - Python 3.8 compatible packages
-  - TensorFlow 2.9.3 for ERAN compatibility
-  - ONNX 1.8.0 (specific version required by ERAN)
-  - Mathematical libraries (pycddlib for convex hull operations)
+  - NumPy and other scientific computing libraries
 
 ## Usage
 
@@ -46,26 +25,13 @@ cd setup/
 source setup.sh
 ```
 
-### Manual ERAN Setup (if needed)
-```
-cd setup/
-source eran_env_setup.sh
-```
-
 ## Troubleshooting
 
 ### Environment Creation Failures
-If conda environments fail to create:
+If conda environment fails to create:
 ```
 conda clean --all
 conda update conda
-```
-
-### Linux System Dependencies for ERAN (Ubuntu/Debian)
-```
-sudo apt-get update
-sudo apt-get install build-essential cmake m4 autoconf libtool
-sudo apt-get install libgmp-dev libmpfr-dev
 ```
 
 ### Gurobi License Issues
@@ -75,19 +41,8 @@ sudo apt-get install libgmp-dev libmpfr-dev
 
 ## Environment Specifications
 
-### act-main (Python 3.9)
+### act-py312 (Python 3.12)
 Primary ACT framework with:
 - Hybrid Zonotope verification
 - Specification refinement BaB
-- Full ONNX/PyTorch/TensorFlow model support
-
-### act-abcrown (Python 3.9)
-αβ-CROWN integration with:
-- Complete neural network verification
-- Advanced branch-and-bound algorithms
-- Linear relaxation techniques
-
-### act-eran (Python 3.8)
-ERAN integration with:
-- Abstract interpretation methods
-- DeepPoly and DeepZono domains
+- Full ONNX/PyTorch model support

@@ -578,16 +578,16 @@ for strat, deltas in strategies.items():
 
 ## Jupyter Notebook Visualization
 
-For **visual analysis** of traces, use the Jupyter notebook:
+For visual analysis of traces, use the Jupyter notebook:
 
 ```bash
 # 1. Generate traces
-python -m act.pipeline.fuzzing.actfuzzer --trace-level 1 --trace-output traces.json
+python -m act.pipeline --fuzz --trace-level 1 --trace-output traces.json
 
 # 2. Open notebook
-jupyter notebook ipynb/fuzzing_trace_analysis.ipynb
+jupyter notebook ipynb/vnnlib_fuzzer.ipynb
 
-# 3. Update trace_file path in Cell 1, then run all cells
+# 3. Update trace_file path in Cell 4, then run all cells
 ```
 
 **Notebook Features:**
@@ -601,10 +601,7 @@ See **`ipynb/README.md`** for detailed usage guide.
 
 ## Documentation
 
-- **`ipynb/fuzzing_trace_analysis.ipynb`**: 4-cell interactive notebook ⭐
-- **`TRACING.md`**: Complete user guide (450+ lines)
-- **`PATH_CONFIG_INTEGRATION.md`**: Path management details
-- **`NOTEBOOK_PLAN.md`**: Notebook implementation plan
+- **`ipynb/vnnlib_fuzzer.ipynb`**: End-to-end CIFAR-100 fuzzing and trace analysis ⭐
 - **Inline docstrings**: All classes and methods documented
 
 ## Status

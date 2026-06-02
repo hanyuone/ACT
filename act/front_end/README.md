@@ -136,8 +136,8 @@ python -m act.front_end --list-downloads       # Show what's downloaded
 
 | Creator | Data Source | Models | Specs | Documentation |
 |---------|-------------|--------|-------|---------------|
-| **TorchVision** | 40 PyTorch datasets | 63 models | ε-perturbations | [torchvision/README.md](torchvision/README.md) |
-| **VNNLIB** | 26 VNN-COMP categories | ONNX models | VNNLIB files | [vnnlib/README.md](vnnlib/README.md) |
+| **TorchVision** | 40 PyTorch datasets | 63 models | ε-perturbations | [torchvision_loader/README.md](torchvision_loader/README.md) |
+| **VNNLIB** | 26 VNN-COMP categories | ONNX models | VNNLIB files | [vnnlib_loader/README.md](vnnlib_loader/README.md) |
 
 Both creators implement `BaseSpecCreator` and generate:
 ```python
@@ -171,7 +171,7 @@ python -m act.front_end --list --creator torchvision
 
 ## Domain-Specific CLIs
 
-### TorchVision CLI (`torchvision/cli.py`)
+### TorchVision CLI (`torchvision_loader/cli.py`)
 ```bash
 # TorchVision-specific features
 python -m act.front_end.torchvision_loader --models-for CIFAR10
@@ -184,12 +184,12 @@ python -m act.front_end.torchvision_loader --all-with-inference
 python -m act.front_end.torchvision_loader --download MNIST simple_cnn
 ```
 
-### VNNLIB CLI (`vnnlib/cli.py`)
+### VNNLIB CLI (`vnnlib_loader/cli.py`)
 ```bash
 # VNNLIB-specific features
 python -m act.front_end.vnnlib_loader --list
 python -m act.front_end.vnnlib_loader --info acasxu_2023
-python -m act.front_end.vnnlib_loader --download cifar100_2024 --max 10
+python -m act.front_end.vnnlib_loader --download cifar100_2024 --max-instances 10
 python -m act.front_end.vnnlib_loader --parse-vnnlib path/to/file.vnnlib
 ```
 
@@ -242,10 +242,10 @@ front_end/
 ├── creator_registry.py          # 🆕 Factory + auto-detection
 ├── spec_creator_base.py         # Base interface
 ├── specs.py                     # InputSpec/OutputSpec
-├── wrapper_layers.py            # InputLayer, InputSpecLayer, OutputSpecLayer
+├── verifiable_model.py          # Wrapper layers live here
 ├── model_synthesis.py           # Wrap models with specs
 │
-├── torchvision/                 # TorchVision Creator
+├── torchvision_loader/          # TorchVision Creator
 │   ├── __main__.py              # Entry point: python -m act.front_end.torchvision_loader
 │   ├── README.md
 │   ├── cli.py                   # Domain-specific CLI
@@ -253,7 +253,7 @@ front_end/
 │   ├── data_model_mapping.py    # 40 datasets, 63 models
 │   └── data_model_loader.py
 │
-└── vnnlib/                      # VNNLIB Creator  
+└── vnnlib_loader/               # VNNLIB Creator  
     ├── __main__.py              # 🆕 Entry point: python -m act.front_end.vnnlib_loader
     ├── README.md                # 🆕
     ├── cli.py                   # 🆕 Domain-specific CLI
@@ -275,22 +275,23 @@ creator = TorchVisionSpecCreator()
 results = creator.create_specs_for_data_model_pairs(...)
 
 # 2. Synthesize wrapped models
-from act.front_end.model_synthesis import model_synthesis
-wrapped_models, input_data = model_synthesis(spec_results=results)
+from act.front_end.model_synthesis import synthesize_models_from_specs
+wrapped_models = synthesize_models_from_specs(results)
 
 # 3. Convert to ACT Net
-from act.pipeline.verification.torch2act import torch_to_act_net
-act_net = torch_to_act_net(wrapped_model, input_data[model_id][0])
+from act.pipeline.verification.torch2act import TorchToACT
+# wrapped_model is one of the values in wrapped_models dict
+net = TorchToACT(wrapped_model).run()
 
 # 4. Verify
 from act.back_end.verifier import verify_once
-result = verify_once(act_net, solver=solver)
+result = verify_once(net, solver=solver)
 ```
 
 ## See Also
 
-- **TorchVision**: [torchvision/README.md](torchvision/README.md) - 40 datasets, 63 models
-- **VNNLIB**: [vnnlib/README.md](vnnlib/README.md) - 26 VNN-COMP categories
+- **TorchVision**: [torchvision_loader/README.md](torchvision_loader/README.md) - 40 datasets, 63 models
+- **VNNLIB**: [vnnlib_loader/README.md](vnnlib_loader/README.md) - 26 VNN-COMP categories
 - **Data**: [../data/torchvision/README.md](../../data/torchvision/README.md), [../data/vnnlib/README.md](../../data/vnnlib/README.md)
 - **Pipeline**: [../pipeline/README.md](../pipeline/README.md)
 
@@ -319,7 +320,7 @@ input_layer (InputLayer) → input_spec (InputSpecLayer) → model (any nn.Modul
 ```
 
 - `InputLayer(shape=(1,...), center=?)` — declares the input variable block (symbolic).
-- `InputSpecLayer(spec=InputSpec(...))` — input constraints (BOX, L∞ as BOX, or LIN_POLY) directly on input space.
+- `InputSpecLayer(spec=InputSpec(...))` — input constraints (BOX, LINF_BALL as BOX, or LIN_POLY) directly on input space.
 - `[optional nn.Flatten]` — reshaping only.
 - `Model` — learned layers (e.g., `nn.Linear`, `nn.ReLU`).
 - `OutputSpecLayer(spec=OutputSpec(...))` — final property (`ASSERT`) over outputs.
@@ -423,11 +424,11 @@ def verify_bab(net, solver: Solver,
   - `output_ids` from `ASSERT.in_vars`,
   - list of `INPUT_SPEC` layers,
   - final `ASSERT` layer.
-- Build **seed box** from `INPUT_SPEC` layers (`BOX` or `L∞`; `LIN_POLY` alone requires a seed policy → error).
+- Build **seed box** from `INPUT_SPEC` layers (`BOX` or `LINF_BALL`; `LIN_POLY` alone requires a seed policy → error).
 - Call `analyze(net, entry_id, seed)` → `(before, after, globalC)`.
-- Add all input specs to `globalC` (`BOX`/`L∞` as boxes; `LIN_POLY` tagged as inequalities).
+- Add all input specs to `globalC` (`BOX`/`LINF_BALL` as boxes; `LIN_POLY` tagged as inequalities).
 - `export_to_solver(globalC, solver, ...)` and `materialise_input_poly(...)` to push linear rows.
-- Add **negated** ASSERT to the solver (LINEAR_LE, TOP1_ROBUST, MARGIN_ROBUST, RANGE policy).
+- Add **negated** ASSERT to the solver (LINEAR_LE, TOP1_ROBUST, MARGIN_ROBUST, RANGE, UNSAFE_LINEAR policy).
 - Set a linear objective (max violation for robust kinds if requested).
 - Solve and interpret:
   - `INFEASIBLE` → `CERTIFIED`
@@ -445,7 +446,7 @@ def verify_bab(net, solver: Solver,
 
 ## ⚠️ Edge Cases & Policies
 
-- **Multiple INPUT_SPEC layers** supported — all added to constraints. First BOX/L∞ is used as the seed.
+- **Multiple INPUT_SPEC layers** supported — all added to constraints. First BOX/LINF_BALL is used as the seed.
 - **LIN_POLY-only** inputs: require a seed box or raise `ValueError` (unchanged policy).
 - **RANGE** negation is disjunctive; the default encodes a one-sided violation (≥ ub + ε). If needed, add a second pass or branching for the ≤ lb − ε side.
 - **Unsupported Torch modules** should raise `NotImplementedError` in `../pipeline/torch2act.py`.
@@ -458,15 +459,6 @@ def verify_bab(net, solver: Solver,
 # Convert (spec-free)
 from act.pipeline.verification.torch2act import TorchToACT
 net = TorchToACT(wrapped).run()
-
-# Solve once
-from verifier import verify_once, verify_bab
-res = verify_once(net, solver=my_solver, timelimit=30.0)
-print(res.status, res.model_stats)
-
-# Branch & bound
-res_bab = verify_bab(net, solver=my_solver, model_fn=lambda x: wrapped(x), max_depth=18, time_budget_s=120.0)
-print(res_bab.status, res_bab.model_stats)
 ```
 
 ---

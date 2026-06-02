@@ -25,8 +25,17 @@ cp /path/to/your/gurobi.lic ./modules/gurobi/gurobi.lic  # put gurobi.lic file i
 ```
 
 ## 3. Run ACT phases
+ACT uses a modular three-tier architecture. For detailed documentation on each module, see the [ACT README](act/README.md).
+
 ```
+# Pipeline CLI (testing and integration)
 python -m act.pipeline --help
+
+# Front-End CLI (data and model processing)
+python -m act.front_end --help
+
+# Back-End CLI (core verification and network generation)
+python -m act.back_end --help
 ```
 
 ## 4. Small Jupyter notebook demos

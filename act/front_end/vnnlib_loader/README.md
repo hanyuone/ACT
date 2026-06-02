@@ -25,7 +25,7 @@ A comprehensive framework for downloading, managing, and loading VNNLIB benchmar
 ## Module Structure
 
 ```
-act/front_end/vnnlib/
+act/front_end/vnnlib_loader/
 ├── __init__.py              # Package exports and imports
 ├── __main__.py              # Entry point for python -m execution
 ├── cli.py                   # Command-line interface
@@ -98,7 +98,7 @@ act/front_end/vnnlib/
 cd /path/to/ACT
 
 # Activate the ACT environment
-conda activate act-main
+conda activate act-py312
 
 # All dependencies should already be installed via setup.sh
 ```
@@ -312,18 +312,18 @@ Total Instances: 160
 # Load a specific instance from a category
 python -m act.front_end.vnnlib_loader --load acasxu_2023 0
 
-# Load with auto-download
-python -m act.front_end.vnnlib_loader --load cifar100_2024 5 --auto-download
+# Load a specific instance
+python -m act.front_end.vnnlib_loader --load cifar100_2024 5
 ```
 
 ### 6. Parse and Validate VNNLIB Files
 
 ```bash
 # Parse a VNNLIB file
-python -m act.front_end.vnnlib_loader --parse path/to/property.vnnlib
+python -m act.front_end.vnnlib_loader --parse-vnnlib path/to/property.vnnlib
 
 # Validate VNNLIB syntax
-python -m act.front_end.vnnlib_loader --validate path/to/property.vnnlib
+python -m act.front_end.vnnlib_loader --validate-vnnlib path/to/property.vnnlib
 
 # Show instance details
 python -m act.front_end.vnnlib_loader --instance-info acasxu_2023 0
@@ -377,7 +377,7 @@ python -m act.front_end.vnnlib_loader --type control
 ```bash
 # Download and parse a category
 python -m act.front_end.vnnlib_loader --download test
-python -m act.front_end.vnnlib_loader --parse data/vnnlib/test/vnnlib/prop_1.vnnlib
+python -m act.front_end.vnnlib_loader --parse-vnnlib data/vnnlib/test/vnnlib/prop_1.vnnlib
 ```
 
 ## Recommended Categories by Use Case
@@ -532,7 +532,7 @@ for category, instance_id, pytorch_model, input_tensors, spec_pairs in results:
     print(f"  Spec pairs: {len(spec_pairs)}")
     
     for i, (input_spec, output_spec) in enumerate(spec_pairs):
-        print(f"  Spec {i}: {input_spec.in_kind} → {output_spec.out_kind}")
+        print(f"  Spec {i}: {input_spec.kind} → {output_spec.kind}")
         # Use specs for verification
 ```
 
@@ -675,7 +675,7 @@ Input constraints define box bounds for each input variable:
 **ACT Representation:**
 ```python
 InputSpec(
-    in_kind=InKind.BOX,
+    kind=InKind.BOX,
     lb=torch.tensor([0.6, -0.5, -0.5]),
     ub=torch.tensor([0.6798577687, -0.4528301887, 0.5])
 )
@@ -709,15 +709,15 @@ Output constraints define safety properties as disjunctive linear inequalities:
 **ACT Representation:**
 ```python
 OutputSpec(
-    out_kind=OutKind.SAFETY,
-    # A·y ≤ b where A = [[1, -1, 0, 0, 0], [1, 0, -1, 0, 0], ...]
-    A=torch.tensor([
+    kind=OutKind.TOP1_ROBUST,
+    # c·y ≤ d where c = [[1, -1, 0, 0, 0], [1, 0, -1, 0, 0], ...]
+    c=torch.tensor([
         [1, -1, 0, 0, 0],   # Y_1 - Y_0 ≤ 0
         [1, 0, -1, 0, 0],   # Y_2 - Y_0 ≤ 0
         [1, 0, 0, -1, 0],   # Y_3 - Y_0 ≤ 0
         [1, 0, 0, 0, -1]    # Y_4 - Y_0 ≤ 0
     ]),
-    b=torch.zeros(4)
+    d=torch.zeros(4)
 )
 ```
 
@@ -780,8 +780,8 @@ The VNNLIB creator integrates seamlessly with ACT's verification pipeline:
 
 ```python
 from act.front_end.vnnlib_loader import VNNLibSpecCreator
-from act.front_end.model_synthesis import model_synthesis
-from act.pipeline.verification.torch2act import torch_to_act_net
+from act.front_end.model_synthesis import synthesize_models_from_specs
+from act.pipeline.verification.torch2act import TorchToACT
 from act.back_end.verifier import verify_once
 
 # 1. Create specs from VNNLIB benchmarks
@@ -792,15 +792,29 @@ results = creator.create_specs_for_data_model_pairs(
 )
 
 # 2. Synthesize wrapped models (InputSpecLayer + Model + OutputSpecLayer)
-wrapped_models, input_data = model_synthesis(spec_results=results)
+from act.front_end.model_synthesis import synthesize_models_from_specs
+wrapped_models = synthesize_models_from_specs(results)
+
+# 3. Convert to ACT Net representation
+from act.pipeline.verification.torch2act import TorchToACT
+for model_id, wrapped_model in wrapped_models.items():
+    # Convert PyTorch → ACT
+    net = TorchToACT(wrapped_model).run()
+    
+    # 4. Verify with ACT backend
+    result = verify_once(
+        net=net,
+        solver='gurobi',
+        timeout=300
+    )
+
+# 2. Synthesize wrapped models (InputSpecLayer + Model + OutputSpecLayer)
+wrapped_models, input_data = synthesize_models_from_specs(spec_results=results)
 
 # 3. Convert to ACT Net representation
 for model_id, wrapped_model in wrapped_models.items():
     # Convert PyTorch → ACT
-    act_net = torch_to_act_net(
-        model=wrapped_model,
-        input_sample=input_data[model_id][0]
-    )
+    act_net = TorchToACT(model=wrapped_model).run()
     
     # 4. Verify with ACT backend
     result = verify_once(
@@ -841,33 +855,29 @@ for category, instance_id, pytorch_model, input_tensors, spec_pairs in results:
 #### Step 2: Model Synthesis
 
 ```python
-from act.front_end.model_synthesis import model_synthesis
+from act.front_end.model_synthesis import synthesize_models_from_specs
 
 # Wrap models with spec layers
-wrapped_models, input_data = model_synthesis(spec_results=results)
+wrapped_models = synthesize_models_from_specs(results)
 
 # Each wrapped model: InputSpecLayer → PyTorchModel → OutputSpecLayer
 for model_id, wrapped_model in wrapped_models.items():
     print(f"Model ID: {model_id}")
     print(f"Layers: {list(wrapped_model.children())}")
-    print(f"Input data: {input_data[model_id][0].shape}")
 ```
 
 #### Step 3: Torch → ACT Conversion
 
 ```python
-from act.pipeline.verification.torch2act import torch_to_act_net
+from act.pipeline.verification.torch2act import TorchToACT
 
 # Convert each wrapped model to ACT representation
 for model_id, wrapped_model in wrapped_models.items():
-    act_net = torch_to_act_net(
-        model=wrapped_model,
-        input_sample=input_data[model_id][0]
-    )
+    net = TorchToACT(wrapped_model).run()
     
-    print(f"ACT Net: {len(act_net.layers)} layers")
-    print(f"Input vars: {act_net.layers[0].vars}")
-    print(f"Output vars: {act_net.layers[-1].vars}")
+    print(f"ACT Net: {len(net.layers)} layers")
+    print(f"Input vars: {net.layers[0].vars}")
+    print(f"Output vars: {net.layers[-1].vars}")
 ```
 
 #### Step 4: Verification
@@ -879,7 +889,7 @@ from act.back_end import VerifyStatus, VerifyResult
 
 # Single-shot verification
 result = verify_once(
-    net=act_net,
+    net=net,
     solver='gurobi'  # or 'torch_lp'
 )
 
@@ -890,7 +900,7 @@ elif result.status == VerifyStatus.FALSIFIED:
 elif result.status == VerifyStatus.UNKNOWN:
     # Refine with branch-and-bound
     result = verify_bab(
-        net=act_net,
+        net=net,
         solver='gurobi',
         max_depth=10,
         timeout=300
@@ -901,8 +911,8 @@ elif result.status == VerifyStatus.UNKNOWN:
 
 ```python
 from act.front_end.vnnlib_loader import VNNLibSpecCreator
-from act.front_end.model_synthesis import model_synthesis
-from act.pipeline.verification.torch2act import torch_to_act_net
+from act.front_end.model_synthesis import synthesize_models_from_specs
+from act.pipeline.verification.torch2act import TorchToACT
 from act.back_end.verifier import verify_once
 from act.back_end import VerifyStatus
 
@@ -922,7 +932,7 @@ for category in categories:
     )
     
     # Synthesize and verify
-    wrapped_models, input_data = model_synthesis(spec_results=results)
+    wrapped_models = synthesize_models_from_specs(results)
     
     certified = 0
     falsified = 0
@@ -930,8 +940,8 @@ for category in categories:
     
     for model_id, wrapped_model in wrapped_models.items():
         try:
-            act_net = torch_to_act_net(wrapped_model, input_data[model_id][0])
-            result = verify_once(act_net, solver='gurobi', timeout=60)
+            net = TorchToACT(wrapped_model).run()
+            result = verify_once(net, solver='gurobi', timeout=60)
             
             if result.status == VerifyStatus.CERTIFIED:
                 certified += 1
@@ -1084,10 +1094,10 @@ if not os.path.exists(instance_csv):
 
 ## See Also
 
-- **TorchVision Creator**: `act/front_end/torchvision/README.md`
-- **Unified CLI**: `act/front_end/README.md`
-- **Data Organization**: `data/vnnlib/README.md`
-- **Pipeline Testing**: `act/pipeline/README.md`
+- **TorchVision Creator**: `../torchvision_loader/README.md`
+- **Unified CLI**: `../README.md`
+- **Data Organization**: `../../../data/vnnlib/README.md`
+- **Pipeline Testing**: `../../pipeline/README.md`
 - **VNN-COMP Benchmarks**: https://github.com/VNN-COMP/vnncomp2025_benchmarks
 - **VNNLIB Format**: https://www.vnnlib.org/
 
