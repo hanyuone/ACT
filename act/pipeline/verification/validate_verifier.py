@@ -1086,6 +1086,8 @@ class VerificationValidator:
 
         spec_bounds = _get_input_bounds_from_act(act_net)
 
+        torch.manual_seed(42)
+
         for sample_idx in range(num_samples):
             input_tensor = self.factory.generate_test_input(name, "random")
             input_tensor = self._batchify_tensor(input_tensor, batch_size)
