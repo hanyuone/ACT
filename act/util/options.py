@@ -21,10 +21,6 @@
 #
 # Purpose:
 #   Global performance and debugging options for ACT.
-#   
-#   NOTE: The get_parser() function for external verifiers (ERAN/αβ-CROWN)
-#   has been moved to act/wrapper_exts/ext_runner.py to maintain clean
-#   separation between ACT native components and external tool wrappers.
 #
 #===----------------------------------------------------------------------===#
     

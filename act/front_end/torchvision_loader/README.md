@@ -24,7 +24,7 @@ A comprehensive framework for downloading, managing, and loading TorchVision dat
 ## Module Structure
 
 ```
-act/front_end/torchvision/
+act/front_end/torchvision_loader/
 ├── __init__.py              # Package exports and imports
 ├── __main__.py              # Entry point for python -m execution
 ├── cli.py                   # Command-line interface and test functions
@@ -56,7 +56,7 @@ act/front_end/torchvision/
 - Single dataset-model pair testing (`_test_single_dataset_model`)
 - Comprehensive test suite (`test_all_dataset_model_pairs`)
 - Detailed output formatting and reporting
-- All CLI commands (--list, --download, --load, etc.)
+- All CLI commands (--summary, --download, --load, etc.)
 
 **`model_definitions.py` (129 lines)**
 - Custom model architectures (SimpleCNN, LeNet5)
@@ -79,7 +79,7 @@ act/front_end/torchvision/
 cd /path/to/ACT
 
 # Activate the ACT environment
-conda activate act-main
+conda activate act-py312
 
 # All dependencies should already be installed via setup.sh
 ```
@@ -88,57 +88,47 @@ conda activate act-main
 
 ### Module Execution
 
-The CLI can be executed in two ways:
+The CLI can be executed as follows:
 
 ```bash
-# Method 1: Via package main (recommended)
-python -m act.front_end.torchvision_loader [OPTIONS]
-
-# Method 2: Direct CLI module execution
 python -m act.front_end.torchvision_loader [OPTIONS]
 ```
 
-Both methods are equivalent and provide the same functionality.
+Note: For common operations (list, search, download, info), prefer the unified CLI: `python -m act.front_end`.
 
-### 1. List Available Datasets
+### 1. Dataset Discovery
 
 ```bash
-# List all datasets
-python -m act.front_end.torchvision_loader --list
-
-# List datasets by category
+# Browse datasets by category (classification, detection, segmentation, video, optical_flow)
 python -m act.front_end.torchvision_loader --category classification
-python -m act.front_end.torchvision_loader --category detection
-python -m act.front_end.torchvision_loader --category segmentation
-python -m act.front_end.torchvision_loader --category video
-python -m act.front_end.torchvision_loader --category optical_flow
 
-# Search for datasets
-python -m act.front_end.torchvision_loader --search mnist
-python -m act.front_end.torchvision_loader --search cifar
+# Show detailed information for a specific dataset
+python -m act.front_end.torchvision_loader --dataset MNIST
+
+# Show all recommended models for a specific dataset
+python -m act.front_end.torchvision_loader --models-for MNIST
+
+# Show all datasets compatible with a specific model
+python -m act.front_end.torchvision_loader --datasets-for resnet18
 ```
 
-### 2. Get Dataset Details
+### 2. Compatibility and Preprocessing
 
 ```bash
-# Show detailed information about a specific dataset
-python -m act.front_end.torchvision_loader --dataset MNIST
-python -m act.front_end.torchvision_loader --dataset CIFAR10
-python -m act.front_end.torchvision_loader --dataset ImageNet
+# Validate dataset-model compatibility
+python -m act.front_end.torchvision_loader --validate MNIST resnet18
 
-# Show all compatible models for a dataset
-python -m act.front_end.torchvision_loader --models-for MNIST
-python -m act.front_end.torchvision_loader --models-for CIFAR10
+# Show preprocessing requirements for a specific dataset
+python -m act.front_end.torchvision_loader --show-preprocessing MNIST
 
-# Show all datasets compatible with a model
-python -m act.front_end.torchvision_loader --datasets-for resnet18
-python -m act.front_end.torchvision_loader --datasets-for efficientnet_b0
+# Show aggregated preprocessing requirements across all datasets
+python -m act.front_end.torchvision_loader --preprocessing-summary
 ```
 
 ### 3. Download Dataset-Model Pairs
 
 **⚠️ Pre-Download Validation**: All downloads are automatically validated before downloading!
-- Tests if model exists in `torchvision.models` (rejects custom models)
+- Tests if model is loadable (standard `torchvision.models` or custom models in `model_definitions.py`)
 - Validates dataset-model compatibility
 - Runs inference test for classification datasets
 - Raises `AssertionError` if validation fails
@@ -151,8 +141,8 @@ python -m act.front_end.torchvision_loader --download MNIST resnet18
 python -m act.front_end.torchvision_loader --download CIFAR10 resnet18
 python -m act.front_end.torchvision_loader --download FashionMNIST resnet18
 
-# Custom models are rejected (validation fails)
-# python -m act.front_end.torchvision_loader --download MNIST simple_cnn  # Will fail!
+# Custom models registered in model_definitions.py are supported
+python -m act.front_end.torchvision_loader --download MNIST simple_cnn
 ```
 
 **Download Specific Split**
@@ -649,22 +639,22 @@ Validation Results:
 ✓ Validation passed! Proceeding with download...
 ```
 
-**✗ Failed Validation (Custom Model):**
+**✗ Failed Validation (Incompatible Pair):**
 ```bash
-python -m act.front_end.torchvision_loader --download MNIST simple_cnn
+python -m act.front_end.torchvision_loader --download FlyingChairs resnet18
 ```
 ```
 ================================================================================
-PRE-DOWNLOAD VALIDATION: MNIST + simple_cnn
+PRE-DOWNLOAD VALIDATION: FlyingChairs + resnet18
 ================================================================================
 Validation Results:
-  • Testable (exists in torchvision.models): False
-  • Compatible (passes compatibility check): False
+  • Model Loadable: True
+  • Dataset-Model Compatible: False
 
-❌ VALIDATION FAILED: Model 'simple_cnn' is not available in torchvision.models.
-   Custom models cannot be pre-validated with inference tests.
+❌ VALIDATION FAILED: Dataset 'FlyingChairs' is incompatible with model 'resnet18'.
+   The pair failed compatibility validation checks.
 
-AssertionError: ❌ VALIDATION FAILED: Model 'simple_cnn' is not available...
+AssertionError: ❌ VALIDATION FAILED: Dataset 'FlyingChairs' is incompatible...
 ```
 
 ### Benefits
@@ -702,14 +692,14 @@ The framework automatically handles:
 
 ## Troubleshooting
 
-### Validation Failed: Model Not in torchvision.models
+### Validation Failed: Model Cannot Be Loaded
 ```bash
-# Error: Custom models (simple_cnn, lenet5) are rejected
-AssertionError: Model 'simple_cnn' is not available in torchvision.models
+# Error: Model not in torchvision.models or model_definitions.py
+AssertionError: Model 'unknown_model' cannot be loaded.
 
-# Solution: Use standard TorchVision models instead
+# Solution: Use supported models
 python -m act.front_end.torchvision_loader --download MNIST resnet18
-python -m act.front_end.torchvision_loader --download FashionMNIST efficientnet_b0
+python -m act.front_end.torchvision_loader --download FashionMNIST simple_cnn
 ```
 
 ### Validation Failed: Inference Test Failed
@@ -725,7 +715,7 @@ python -m act.front_end.torchvision_loader --show-preprocessing DATASET
 ### Dataset Not Found
 ```bash
 # Check if dataset exists
-python -m act.front_end.torchvision_loader --list | grep -i mnist
+python -m act.front_end.torchvision_loader --summary | grep -i mnist
 
 # Download it first (with validation)
 python -m act.front_end.torchvision_loader --download MNIST resnet18
@@ -756,11 +746,11 @@ rm -rf data/torchvision/MNIST
 
 | Command | Description |
 |---------|-------------|
-| `--list`, `-l` | List all available datasets |
 | `--category`, `-c` | Show datasets in specific category |
 | `--dataset`, `-d` | Show detailed information for a dataset |
-| `--search`, `-s` | Search for datasets by name |
 | `--summary` | Print complete mapping summary |
+| `--category`, `-c` | Show datasets in specific category |
+| `--dataset`, `-d` | Show detailed information for a dataset |
 | `--download DATASET MODEL` | Download dataset-model pair (with validation) |
 | `--split {train,test,both}` | Choose split to download (default: test) |
 | `--list-downloads` | List all downloaded pairs with sizes |
@@ -793,8 +783,10 @@ rm -rf data/torchvision/MNIST
 Copyright (C) 2025 SVF-tools/ACT
 License: AGPLv3+
 
-## References
+## See Also
 
-- TorchVision Documentation: https://pytorch.org/vision/stable/
-- ACT Framework: https://github.com/SVF-tools/ACT
-- PyTorch Models: https://pytorch.org/vision/stable/models.html
+- **VNNLIB Creator**: `../vnnlib_loader/README.md`
+- **Unified CLI**: `../README.md`
+- **Data Organization**: `../../../data/torchvision/README.md`
+- **Pipeline Testing**: `../../pipeline/README.md`
+- **PyTorch Models**: https://pytorch.org/vision/stable/models.html

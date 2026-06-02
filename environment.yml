@@ -18,7 +18,7 @@ dependencies:
   - ipykernel
   - ipywidgets  # Interactive trace explorer in Jupyter notebooks
   - matplotlib
-  - pyyaml  # Config loading (specs, models, abcrown)
+  - pyyaml  # Config loading (specs, models)
   - psutil  # Memory monitoring in pipeline
   - pip
   - pip:

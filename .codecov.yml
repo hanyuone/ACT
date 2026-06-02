@@ -44,7 +44,6 @@ ignore:
   - "act/pipeline/fuzzing/trace_reader.py"
   - "act/front_end/vnnlib_loader/cli.py"
   - "act/pipeline/verification/llm_probe.py"
-  - "act/wrapper_exts/"
   - "act/back_end/cli.py"
   - "act/front_end/cli.py"
   - "act/pipeline/cli.py"

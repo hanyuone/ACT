@@ -52,6 +52,29 @@ jupyter notebook ipynb/vnnlib_visualization.ipynb
 code ipynb/vnnlib_visualization.ipynb
 ```
 
+### `vnnlib_verifier.ipynb`
+
+**Purpose**: Demonstrates the end-to-end verification workflow using ACT's native verifiers on VNNLIB benchmarks.
+
+**Contents**:
+1. **Environment Setup**: Loading ACT modules and checking Gurobi license.
+2. **Benchmark Loading**: Using `VNNLibSpecCreator` to load models and properties.
+3. **Model Synthesis**: Creating `VerifiableModel` instances.
+4. **Formal Verification**: Running `verify_once` with different transfer function modes (Interval, HybridZ) and solvers (Gurobi, TorchLP).
+5. **Result Analysis**: Interpreting `VerifyStatus` and exploring counterexamples.
+
+**Key Features**:
+- Step-by-step formal verification tutorial.
+- Comparison between different verification precisions.
+- Automated benchmark property parsing.
+- Integration with Gurobi for MILP-based verification.
+
+**Usage**:
+```bash
+# Open in Jupyter
+jupyter notebook ipynb/vnnlib_verifier.ipynb
+```
+
 ### `vnnlib_fuzzer.ipynb` ⭐ NEW
 
 **Purpose**: End-to-end demonstration of ACTFuzzer on CIFAR-100 VNNLib benchmarks with integrated trace analysis.

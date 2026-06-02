@@ -22,7 +22,7 @@ The ACT JSON serialization system now provides a unified testing and demonstrati
 
 ### Run Test Suite (Default)
 ```bash
-cd /import/ravel/2/z3310488/scratch/ACT
+# From project root
 python act/back_end/serialization/test_serialization.py
 ```
 
@@ -64,26 +64,27 @@ python act/back_end/serialization/test_serialization.py --demo
 - 🛠️ **Step 6**: Advanced utilities (backup, metadata export)
 - 🔄 **Step 7**: Cross-device migration (CPU ↔ GPU)
 
-### Backwards Compatibility
-```bash
-# Original demo still works via wrapper
-python examples/serialization_demo.py
-```
-
 ## Architecture
 
 ### Unified Module Structure
 ```
-act/back_end/serialization/test_serialization.py
-├── create_test_network()           # Test network factory
-├── test_basic_serialization()      # Core functionality
-├── test_file_io()                  # File operations
-├── test_device_migration()         # GPU/CPU testing
-├── test_schema_validation()        # Registry compliance
-├── test_complex_metadata()         # Metadata preservation
-├── demo_serialization_system()     # Interactive demo
-├── run_all_tests()                 # Test runner
-└── main()                          # CLI entry point
+act/back_end/serialization/
+├── serialization.py                # NetSerializer with tensor encoding
+│   ├── class NetSerializer         # Core serialization logic
+│   ├── save_net_to_file()
+│   ├── load_net_from_file()
+│   ├── save_net_to_string()
+│   └── load_net_from_string()
+└── test_serialization.py           # Comprehensive test suite & demo
+    ├── create_test_network()       # Test network factory
+    ├── test_basic_serialization()  # Core functionality
+    ├── test_file_io()              # File operations
+    ├── test_device_migration()     # GPU/CPU testing
+    ├── test_schema_validation()    # Registry compliance
+    ├── test_complex_metadata()     # Metadata preservation
+    ├── demo_serialization_system() # Interactive demo
+    ├── run_all_tests()             # Test runner
+    └── main()                      # CLI entry point
 ```
 
 ### Integration Benefits
@@ -158,34 +159,6 @@ python act/back_end/serialization/test_serialization.py --demo
 - **File Generation**: Multiple output files for inspection
 - **Educational Value**: Complete workflow understanding
 - **Real-world Validation**: Actual file I/O and device migration
-
-## Migration Guide
-
-### From Old Demo System
-```python
-# Old approach
-from examples.serialization_demo import main
-main()
-
-# New unified approach
-from act.back_end.serialization.test_serialization import demo_serialization_system
-demo_serialization_system()
-
-# Or via CLI
-# python act/back_end/serialization/test_serialization.py --demo
-```
-
-### From Separate Testing
-```python
-# Old scattered testing
-from act.back_end.test_serialization import test_basic_serialization
-from examples.serialization_demo import main
-
-# New unified testing
-from act.back_end.serialization.test_serialization import run_all_tests, demo_serialization_system
-run_all_tests()    # Comprehensive test suite
-demo_serialization_system()  # Interactive demo
-```
 
 ## Future Enhancements
 

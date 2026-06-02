@@ -37,7 +37,7 @@ def setup_act_paths() -> str:
     act_root = os.path.dirname(os.path.dirname(current_file))
     
     # Add both act_root and its parent (project_root) to sys.path
-    # This ensures proper module imports from wrapper_exts and other modules
+    # This ensures proper module imports from other modules
     if act_root not in sys.path:
         sys.path.insert(0, act_root)
     
@@ -128,15 +128,6 @@ def get_modules_root() -> str:
     return os.path.join(get_project_root(), 'modules')
 
 
-def get_eran_tf_verify_path() -> str:
-    """Get the ERAN tf_verify directory path."""
-    return os.path.join(get_modules_root(), 'eran', 'tf_verify')
-
-
-def get_abcrown_path() -> str:
-    """Get the abCrown module directory path."""
-    return os.path.join(get_modules_root(), 'abcrown')
-
 
 def get_pipeline_log_dir() -> str:
     """Get the pipeline log directory path.
@@ -151,7 +142,7 @@ def get_path_relative_to_project(relative_path: str) -> str:
     """Get absolute path for a path relative to project root.
     
     Args:
-        relative_path: Path relative to project root (e.g., 'data', 'configs/eran_defaults.ini')
+        relative_path: Path relative to project root (e.g., 'data', 'configs/spec.yaml')
     
     Returns:
         Absolute path
