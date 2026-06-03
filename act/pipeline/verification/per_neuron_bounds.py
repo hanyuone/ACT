@@ -411,7 +411,8 @@ def compare_bounds_per_neuron(
         gap = torch.maximum(diff_low, diff_high)
         gap = torch.clamp(gap, min=0.0)
 
-        violations_mask = gap > 0
+        tol = 1e-5 + 1e-5 * torch.maximum(lb_flat.abs(), ub_flat.abs())
+        violations_mask = gap > tol
         num_violations = int(violations_mask.sum().item())
         violations_total += num_violations
 
@@ -447,9 +448,9 @@ def compare_bounds_per_neuron(
             if k > 0:
                 vals, idxs = torch.topk(gap, k=k)
                 for v, i in zip(vals.tolist(), idxs.tolist()):
-                    if v <= 0:
-                        continue
                     i = int(i)
+                    if v <= float(tol[i].item()):
+                        continue
                     candidates.append(
                         {
                             "layer_id": int(layer_id),
