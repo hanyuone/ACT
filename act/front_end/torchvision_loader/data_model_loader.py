@@ -21,7 +21,6 @@ from act.util.path_config import get_torchvision_data_root
 
 # Import from data_model_mapping
 from act.front_end.torchvision_loader.data_model_mapping import (
-    DATASET_MODEL_MAPPING,
     get_dataset_info,
     validate_dataset_model_compatibility,
     create_preprocessing_pipeline,
@@ -616,9 +615,11 @@ def load_dataset_model_pair(
     preprocessing = create_preprocessing_pipeline(dataset_name)
     
     # Load dataset
-    if "class_name" in DATASET_MODEL_MAPPING[dataset_name]:
+    dataset_info = get_dataset_info(dataset_name)
+
+    if "class_name" in dataset_info:
         import act.front_end.torchvision_loader.custom
-        dataset_class = getattr(act.front_end.torchvision_loader.custom, DATASET_MODEL_MAPPING[dataset_name]["class_name"])
+        dataset_class = getattr(act.front_end.torchvision_loader.custom, dataset_info["class_name"])
     else:
         import torchvision.datasets
         dataset_class = getattr(torchvision.datasets, dataset_name)
