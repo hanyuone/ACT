@@ -423,6 +423,19 @@ DATASET_MODEL_MAPPING: Dict[str, Dict[str, Any]] = {
         "num_classes": 8142,  # varies by year
         "category": "classification",
         "notes": "Species classification, highly imbalanced with long tail"
+    },
+
+    # ========== Datasets not in TorchVision ==========
+    "CUB200": {
+        "models": ["resnet18"],
+        "input_size": (3, 224, 224),
+        "num_classes": 200,
+        "category": "classification",
+        "preprocessing": {
+            "resize_to": (224, 224)
+        },
+        "notes": "Images of birds with 200 classes and 312 binary attributes.",
+        "class_name": "CUBDataset"
     }
 }
 
