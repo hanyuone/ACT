@@ -426,6 +426,11 @@ DATASET_MODEL_MAPPING: Dict[str, Dict[str, Any]] = {
     },
 
     # ========== Datasets not in TorchVision ==========
+    # Non-TorchVision datasets are configured declaratively via the "download"
+    # key: an archive URL whose extracted "image_root" follows the ImageFolder
+    # layout (one sub-directory per class). Optional "index_file"/"split_file"
+    # (image_id -> relative path / image_id -> is_train) select the dataset's
+    # official train/test split. No custom Dataset class is required.
     "CUB200": {
         "models": ["resnet18"],
         "input_size": (3, 224, 224),
@@ -434,8 +439,14 @@ DATASET_MODEL_MAPPING: Dict[str, Dict[str, Any]] = {
         "preprocessing": {
             "resize_to": (224, 224)
         },
-        "notes": "Images of birds with 200 classes and 312 binary attributes.",
-        "class_name": "CUBDataset"
+        "notes": "Caltech-UCSD Birds 200-2011; archive-distributed ImageFolder layout.",
+        "download": {
+            "url": "https://data.caltech.edu/records/65de6-vp158/files/CUB_200_2011.tgz",
+            "md5": "97eceeb196236b17998738112f37df78",
+            "image_root": "CUB_200_2011/images",
+            "index_file": "CUB_200_2011/images.txt",
+            "split_file": "CUB_200_2011/train_test_split.txt"
+        }
     }
 }
 
