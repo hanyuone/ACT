@@ -15,13 +15,14 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
 import tempfile
 import time
 import inspect
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, cast
+from typing import Any, Callable, Dict, List, Optional, Union, cast
 
 import torch
 
@@ -40,6 +41,8 @@ from act.back_end.bab.branching.branching import (
     RandomBranching,
     SplitDecision,
     _build_branching_strategy as _build_branching_strategy_impl,
+    _collect_neuron_candidates,
+    _multi_split_from_decision,
 )
 from act.back_end.bab.branching.bounding import (
     BoundingStrategy,
@@ -71,12 +74,270 @@ class DualSolveResult:
     solution: BatchLPSolution
     bounds_dict: Optional[Dict[int, Bounds]] = None
     nu_per_layer: Optional[Dict[int, torch.Tensor]] = None
+    row_slack: Optional[torch.Tensor] = None
+    """Per-spec-row slack ``[K, m]``; ``slack >= 0`` means the row is certified
+    (ALL-rows kinds). Consumed by the root spec-pruning presolve."""
+
+
+def _select_spec_rows(
+    state: Optional[Dict[int, torch.Tensor]],
+    keep_rows: torch.Tensor,
+) -> Optional[Dict[int, torch.Tensor]]:
+    """Slice the spec axis (dim 1 of ``[N, M, n]``) of per-layer dual state."""
+    if state is None:
+        return None
+    return {
+        lid: t.index_select(1, keep_rows.to(t.device)) if t.dim() >= 3 else t
+        for lid, t in state.items()
+    }
+
+
+def _presplit_root(
+    root: SubproblemBatch,
+    bounds_dict: Dict[int, Bounds],
+    nu_per_layer: Dict[int, torch.Tensor],
+    k: int,
+) -> Optional[SubproblemBatch]:
+    """Materialize the 2^k descendants of the root's top-k scored neurons.
+
+    Score = triangle relaxation area x |nu| (BaBSR essence); the layer with
+    the strongest top score wins. The 2^k sign assignments exactly partition
+    the root region (each unstable neuron is either >=0 or <=0), so replacing
+    the root by these children is sound.
+    """
+    best: Optional[tuple[int, torch.Tensor, torch.Tensor]] = None
+    for lid, nu in nu_per_layer.items():
+        b = bounds_dict.get(lid)
+        if b is None:
+            continue
+        lb = b.lb.flatten(start_dim=1)[0]
+        ub = b.ub.flatten(start_dim=1)[0]
+        n = min(lb.shape[-1], nu.shape[-1])
+        lb, ub = lb[:n], ub[:n]
+        amb = (lb < 0) & (ub > 0)
+        if not bool(amb.any().item()):
+            continue
+        area = (-lb * ub / (ub - lb).clamp(min=1e-12)).clamp(min=0)
+        score = area * nu.reshape(-1, nu.shape[-1])[:, :n].abs().sum(dim=0)
+        score = torch.where(amb, score, torch.zeros_like(score))
+        if best is None or float(score.max()) > float(best[1].max()):
+            best = (lid, score, lb)
+    if best is None:
+        return None
+    lid, score, _ = best
+    k = min(k, int((score > 0).sum().item()))
+    if k < 1:
+        return None
+    top_idx = torch.topk(score, k=k).indices
+    n_children = 2 ** k
+    n_layer = score.shape[-1]
+    m = root.incremental_alpha[next(iter(root.incremental_alpha))].shape[1] if root.incremental_alpha else 1
+
+    signs = torch.zeros(n_children, m, n_layer, device=root.lb.device, dtype=root.lb.dtype)
+    for j in range(n_children):
+        for bit, neuron in enumerate(top_idx.tolist()):
+            signs[j, :, neuron] = 1.0 if (j >> bit) & 1 else -1.0
+
+    def _rep(state: Optional[Dict[int, torch.Tensor]]) -> Optional[Dict[int, torch.Tensor]]:
+        if state is None:
+            return None
+        return {l: t.repeat(n_children, *([1] * (t.dim() - 1))) for l, t in state.items()}
+
+    merged_signs = _rep(root.split_signs) or {}
+    if lid in merged_signs:
+        merged_signs[lid] = merged_signs[lid] + signs
+    else:
+        merged_signs[lid] = signs
+    return SubproblemBatch(
+        lb=root.lb.repeat(n_children, 1),
+        ub=root.ub.repeat(n_children, 1),
+        depths=torch.full((n_children,), k, dtype=torch.long, device=root.lb.device),
+        incremental_alpha=_rep(root.incremental_alpha),
+        incremental_eta=_rep(root.incremental_eta),
+        split_signs=merged_signs,
+    )
+
+
+def _interval_refresh_bounds(
+    net: Net,
+    base: Dict[int, Bounds],
+    split_signs: Dict[int, torch.Tensor],
+) -> Optional[Dict[int, Bounds]]:
+    """Cheap batched IBP re-propagation of split phases, intersected with base.
+
+    Frozen root bounds lose the downstream effect of hardened splits; a plain
+    interval pass (no LinearBound A matrices, milliseconds per batch) restores
+    it. Every entry is intersected with the base bounds, so the result can
+    only tighten valid over-approximations (sound). Returns None when an
+    unsupported layer kind is encountered - the caller keeps the base dict.
+    """
+    from act.back_end.dual_tf.tf_forward import _fwd_conv2d_interval
+
+    out = dict(base)
+    vals: Dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for layer in net.layers:
+        k = layer.kind.upper() if isinstance(layer.kind, str) else layer.kind
+        lid = layer.id
+        if k == "ASSERT":
+            continue
+        if k in ("INPUT", "INPUT_SPEC"):
+            b = out.get(lid)
+            if b is None:
+                return None
+            vals[lid] = (b.lb.flatten(start_dim=1), b.ub.flatten(start_dim=1))
+            continue
+        preds = net.preds.get(lid, [])
+        try:
+            if k == "CONV2D":
+                plb, pub = vals[preds[0]]
+                lb, ub = _fwd_conv2d_interval(layer, plb, pub)
+                lb, ub = lb.flatten(start_dim=1), ub.flatten(start_dim=1)
+            elif k == "DENSE":
+                w = layer.params["weight"]
+                bias = layer.params.get("bias")
+                plb, pub = vals[preds[0]]
+                w_pos, w_neg = w.clamp(min=0), w.clamp(max=0)
+                lb = plb @ w_pos.T + pub @ w_neg.T
+                ub = pub @ w_pos.T + plb @ w_neg.T
+                if bias is not None:
+                    lb, ub = lb + bias, ub + bias
+            elif k == "ADD":
+                (alb, aub), (blb, bub) = vals[preds[0]], vals[preds[1]]
+                lb, ub = alb + blb, aub + bub
+            elif k in ("FLATTEN", "RESHAPE"):
+                lb, ub = vals[preds[0]]
+            elif k == "RELU":
+                lb, ub = vals[preds[0]]
+            else:
+                return None
+        except (KeyError, IndexError, ValueError):
+            return None
+
+        b = out.get(lid)
+        if b is not None:
+            lb = torch.maximum(lb, b.lb.flatten(start_dim=1))
+            ub = torch.minimum(ub, b.ub.flatten(start_dim=1))
+            ub = torch.maximum(ub, lb)
+        if k == "RELU":
+            s = split_signs.get(lid)
+            if s is not None:
+                sl = s[:, 0, :] if s.dim() == 3 else s
+                n = min(lb.shape[-1], sl.shape[-1])
+                sn = sl[..., :n].to(lb.device)
+                lb, ub = lb.clone(), ub.clone()
+                lb[..., :n] = torch.where(sn > 0, lb[..., :n].clamp(min=0.0), lb[..., :n])
+                ub[..., :n] = torch.where(sn < 0, ub[..., :n].clamp(max=0.0), ub[..., :n])
+                ub[..., :n] = torch.maximum(ub[..., :n], lb[..., :n])
+        if b is not None:
+            out[lid] = Bounds(lb.view_as(b.lb).clone(), ub.view_as(b.ub).clone())
+        if k == "RELU":
+            vals[lid] = (lb.clamp(min=0.0), ub.clamp(min=0.0))
+        else:
+            vals[lid] = (lb, ub)
+    return out
 
 
 def _want_babsr_neuron_branching(config: BaBConfig) -> bool:
     return (
-        getattr(config, "branching_method", "random") in ("babsr", "fsb")
+        getattr(config, "branching_method", "random") in ("babsr", "fsb", "gain")
         and getattr(config, "solver_tier", "lp") in ("dual_alpha", "dual_alpha_eta")
+    )
+
+
+def _gain_tested_decision(
+    branch_batch: SubproblemBatch,
+    net: Net,
+    assert_layer: Layer,
+    config: BaBConfig,
+    keep_rows: Optional[torch.Tensor],
+    root_bounds_dict: Optional[Dict[int, Bounds]],
+    bounds_dict: Optional[Dict[int, Bounds]],
+    nu_per_layer: Optional[Dict[int, torch.Tensor]],
+    input_shape: tuple,
+    n_candidates: int = 3,
+) -> Optional[SplitDecision]:
+    """Pick each lane's split by measured child bounds, not by score proxy.
+
+    BaBSR scores can rank a regression (-0.07) above the true best split
+    (+0.07); evaluating the top candidates' actual children with one cheap
+    non-optimized dual batch restores monotone progress (kfsb-style).
+    """
+    if bounds_dict is None or nu_per_layer is None:
+        return None
+    kb = branch_batch.batch_size
+    device = branch_batch.lb.device
+
+    cand = _collect_neuron_candidates(branch_batch, bounds_dict, nu_per_layer)
+    if cand is None:
+        return None
+    all_scores, all_layers, all_neurons = cand
+    n_c = min(n_candidates, all_scores.shape[1])
+    top = torch.topk(all_scores, k=n_c, dim=1).indices
+    top_layers = all_layers.gather(1, top)
+    top_neurons = all_neurons.gather(1, top)
+
+    rep_idx = torch.arange(kb, device=device).repeat_interleave(2 * n_c)
+
+    def _rep_state(state):
+        if state is None:
+            return None
+        return {l: t.index_select(0, rep_idx.to(t.device)) for l, t in state.items()}
+
+    m_specs = 1
+    if branch_batch.incremental_alpha:
+        m_specs = int(next(iter(branch_batch.incremental_alpha.values())).shape[1])
+    signs = _rep_state(branch_batch.split_signs) or {}
+    for lid_val in torch.unique(top_layers).tolist():
+        lid_int = int(lid_val)
+        layer = net.by_id[lid_int]
+        n_neurons = int(layer.out_vars[-1] - layer.out_vars[0] + 1)
+        if lid_int not in signs:
+            signs[lid_int] = torch.zeros(
+                2 * n_c * kb, m_specs, n_neurons, device=device, dtype=branch_batch.lb.dtype,
+            )
+        else:
+            signs[lid_int] = signs[lid_int].clone()
+        for lane in range(kb):
+            for c in range(n_c):
+                if int(top_layers[lane, c]) != lid_int:
+                    continue
+                row = lane * 2 * n_c + 2 * c
+                neuron = int(top_neurons[lane, c])
+                signs[lid_int][row, :, neuron] = 1.0
+                signs[lid_int][row + 1, :, neuron] = -1.0
+
+    probe = SubproblemBatch(
+        lb=branch_batch.lb.index_select(0, rep_idx),
+        ub=branch_batch.ub.index_select(0, rep_idx),
+        depths=branch_batch.depths.index_select(0, rep_idx),
+        incremental_alpha=_rep_state(branch_batch.incremental_alpha),
+        incremental_eta=_rep_state(branch_batch.incremental_eta),
+        split_signs=signs,
+    )
+    n_probe = probe.batch_size
+    probe_bounds = Bounds(
+        probe.lb.reshape(n_probe, *input_shape) if input_shape else probe.lb,
+        probe.ub.reshape(n_probe, *input_shape) if input_shape else probe.ub,
+    )
+    res = _dispatch_dual_solve(
+        net=net,
+        assert_layer=assert_layer,
+        batched_bounds=probe_bounds,
+        k_actual=n_probe,
+        batch=probe,
+        config=config,
+        optimize=False,
+        keep_rows=keep_rows,
+        root_bounds_dict=root_bounds_dict,
+    )
+    child_lbs = (-res.solution.max_viol).view(kb, n_c, 2)
+    pair_gain = child_lbs.min(dim=2).values
+    best_c = pair_gain.argmax(dim=1)
+    lane_idx = torch.arange(kb, device=device)
+    return SplitDecision(
+        kind="neuron",
+        layer_id=top_layers[lane_idx, best_c],
+        neuron_idx=top_neurons[lane_idx, best_c],
     )
 
 
@@ -129,22 +390,69 @@ def _split_from_decision(
                 return split_input(batch, fallback_dims)
             return split_input_nary(batch, fallback_dims, fanout)
 
-        layer = net.by_id[rep_lid]
-        n_neurons = int(layer.out_vars[-1] - layer.out_vars[0] + 1)
-        n_specs = (
-            int(batch.incremental_alpha[rep_lid].shape[1])
-            if batch.incremental_alpha is not None and rep_lid in batch.incremental_alpha
-            else 1
+        n_lanes = batch.batch_size
+        lids = layer_id_tensor.expand(n_lanes) if layer_id_tensor.numel() == 1 else layer_id_tensor
+        idxs = neuron_idx_tensor.expand(n_lanes) if neuron_idx_tensor.numel() == 1 else neuron_idx_tensor
+        if lids.numel() != n_lanes or idxs.numel() != n_lanes:
+            raise ValueError(
+                f"neuron decision has {lids.numel()}/{idxs.numel()} entries "
+                f"for batch size {n_lanes}"
+            )
+
+        # Per-lane split: lane i hardens ITS OWN (layer, neuron); collapsing
+        # to lane 0's choice makes the other K-1 lanes split an irrelevant
+        # neuron and stalls deep convergence.
+        device = batch.lb.device
+        parent_index = torch.arange(n_lanes, device=device).repeat(2)
+
+        def _gather(state: Optional[Dict[int, torch.Tensor]]) -> Optional[Dict[int, torch.Tensor]]:
+            if state is None:
+                return None
+            return {
+                l: t.index_select(0, parent_index.to(t.device)) for l, t in state.items()
+            }
+
+        m_specs = 1
+        if batch.incremental_alpha:
+            m_specs = int(next(iter(batch.incremental_alpha.values())).shape[1])
+        elif batch.split_signs:
+            m_specs = int(next(iter(batch.split_signs.values())).shape[1])
+
+        signs = _gather(batch.split_signs) or {}
+        for lid_val in torch.unique(lids).tolist():
+            lid_int = int(lid_val)
+            layer = net.by_id[lid_int]
+            n_neurons = int(layer.out_vars[-1] - layer.out_vars[0] + 1)
+            if lid_int not in signs:
+                signs[lid_int] = torch.zeros(
+                    2 * n_lanes, m_specs, n_neurons, device=device, dtype=batch.lb.dtype,
+                )
+            else:
+                signs[lid_int] = signs[lid_int].clone()
+            lane_sel = torch.where(lids == lid_val)[0]
+            neuron_sel = idxs[lane_sel].to(device=device, dtype=torch.long)
+            signs[lid_int][lane_sel, :, neuron_sel] = 1.0
+            signs[lid_int][lane_sel + n_lanes, :, neuron_sel] = -1.0
+
+        children = SubproblemBatch(
+            lb=batch.lb.index_select(0, parent_index),
+            ub=batch.ub.index_select(0, parent_index),
+            depths=batch.depths.index_select(0, parent_index) + 1,
+            incremental_alpha=_gather(batch.incremental_alpha),
+            incremental_eta=_gather(batch.incremental_eta),
+            split_signs=signs,
+            parent_margins=(
+                batch.parent_margins.index_select(0, parent_index)
+                if batch.parent_margins is not None
+                else None
+            ),
+            lower_bound=(
+                batch.lower_bound.index_select(0, parent_index)
+                if batch.lower_bound is not None
+                else None
+            ),
         )
-        on, off = split_neuron_subproblems(
-            batch,
-            layer_id=rep_lid,
-            neuron_idx=rep_idx,
-            n_neurons=n_neurons,
-            n_specs=n_specs,
-        )
-        parent_index = torch.arange(batch.batch_size, device=batch.lb.device).repeat(2)
-        return concat_children(on, off), parent_index
+        return children, parent_index
 
     raise ValueError(f"Unknown SplitDecision.kind: {decision.kind!r}")
 
@@ -452,13 +760,44 @@ def _dispatch_dual_solve(
     batch: SubproblemBatch,
     config: BaBConfig,
     optimize: bool,
+    keep_rows: Optional[torch.Tensor] = None,
+    root_bounds_dict: Optional[Dict[int, Bounds]] = None,
 ) -> DualSolveResult:
-    """Run one dual-family BaB bound pass and decode lane statuses."""
+    """Run one dual-family BaB bound pass and decode lane statuses.
+
+    ``keep_rows`` restricts the encoded spec to the given row indices
+    (ALL-rows kinds only). ``root_bounds_dict`` replaces the per-node forward
+    pass with the root box's bounds (input-layer entries overridden by each
+    lane's sub-box). Both are sound by bound monotonicity: certified rows and
+    per-layer bounds of an ancestor box remain valid on every descendant.
+    """
     from act.back_end.dual_tf.tf_forward import compute_forward_bounds
-    from act.back_end.solver.solver_dual import DualSolver
+    from act.back_end.solver.solver_dual import DualSolver, expand_bounds_dict
 
     solver_tier = getattr(config, "solver_tier", "lp")
-    bounds_dict_dual = compute_forward_bounds(net, batched_bounds.lb, batched_bounds.ub)
+    if root_bounds_dict is not None:
+        bounds_dict_dual = expand_bounds_dict(root_bounds_dict, k_actual)
+        lane_box = Bounds(batched_bounds.lb, batched_bounds.ub)
+        for layer in net.layers:
+            kind_up = layer.kind.upper() if isinstance(layer.kind, str) else layer.kind
+            if kind_up in ("INPUT", "INPUT_SPEC") and layer.id in bounds_dict_dual:
+                bounds_dict_dual[layer.id] = lane_box
+        if batch.split_signs:
+            refreshed = _interval_refresh_bounds(net, bounds_dict_dual, batch.split_signs)
+            if refreshed is not None:
+                bounds_dict_dual = refreshed
+            psr_mode = getattr(config, "per_subproblem_refine", "none")
+            if psr_mode != "none":
+                bounds_dict_dual = DualSolver().refine_intermediate_bounds_batched(
+                    net,
+                    bounds_dict_dual,
+                    split_signs=batch.split_signs,
+                    mode=psr_mode,
+                    rows_cap=getattr(config, "per_subproblem_refine_rows_cap", 64),
+                    optimize_iters=getattr(config, "per_subproblem_refine_iters", 0),
+                )
+    else:
+        bounds_dict_dual = compute_forward_bounds(net, batched_bounds.lb, batched_bounds.ub)
     out_kind_raw = assert_layer.params["kind"]
     if not isinstance(out_kind_raw, str):
         raise TypeError(f"ASSERT kind must be str, got {type(out_kind_raw).__name__}")
@@ -492,7 +831,6 @@ def _dispatch_dual_solve(
     n_out = int(output_bounds.lb.flatten(start_dim=1).shape[-1])
     encoded_spec = out_spec.encode_linear(B=k_actual, n_out=n_out, device=device, dtype=dtype)
     m_specs = int(encoded_spec["M"])
-    active_mask = torch.ones(k_actual, m_specs, dtype=torch.bool, device=device)
     dual = DualSolver()
 
     if out_spec.kind == OutKind.UNSAFE_LINEAR:
@@ -501,6 +839,17 @@ def _dispatch_dual_solve(
     else:
         c_rows = -cast(torch.Tensor, encoded_spec["C"]).contiguous()
         thresholds = -cast(torch.Tensor, encoded_spec["thresholds"]).contiguous()
+        if keep_rows is not None:
+            idx = keep_rows.to(device=device, dtype=torch.long)
+            c_rows = (
+                c_rows.view(k_actual, m_specs, n_out)
+                .index_select(1, idx)
+                .reshape(k_actual * int(idx.numel()), n_out)
+                .contiguous()
+            )
+            thresholds = thresholds.index_select(1, idx).contiguous()
+            m_specs = int(idx.numel())
+    active_mask = torch.ones(k_actual, m_specs, dtype=torch.bool, device=device)
 
     return_nu = _want_babsr_neuron_branching(config)
     supports_return_nu = "return_nu_per_layer" in inspect.signature(
@@ -509,6 +858,7 @@ def _dispatch_dual_solve(
 
     compute_certified_bound = cast(Any, dual.compute_certified_bound)
 
+    is_child_batch = bool(batch.depths.min().item() > 0) if batch.depths.numel() else False
     if optimize:
         dual_result = compute_certified_bound(
             net,
@@ -516,6 +866,10 @@ def _dispatch_dual_solve(
             c_rows,
             M=m_specs,
             optimize=True,
+            optimize_alpha=not (
+                getattr(config, "eta_only_children", False) and is_child_batch
+            ),
+            refresh_forward=root_bounds_dict is None,
             n_iters=config.dual_n_iters,
             lr_alpha=config.lr_alpha,
             lr_beta=config.lr_beta,
@@ -590,7 +944,32 @@ def _dispatch_dual_solve(
     )
     branch_bounds: Optional[Dict[int, Bounds]] = None
     branch_nu: Optional[Dict[int, torch.Tensor]] = None
-    if return_nu:
+    if return_nu and root_bounds_dict is not None:
+        # Heuristic-only consumer (BaBSR/FSB scores). The optimize path does
+        # not emit nu, and nu=None silently degrades neuron branching to
+        # input-axis splits - so run one grad-free backward at the converged
+        # alpha/eta to extract per-layer nu on the same (reused) bounds.
+        branch_bounds = bounds_dict_dual
+        branch_nu = getattr(dual_result, "nu_per_layer", None)
+        if branch_nu is None:
+            nu_pass = dual.compute_certified_bound(
+                net,
+                bounds_dict_dual,
+                c_rows,
+                M=m_specs,
+                alpha=getattr(dual_result, "alpha_state", None),
+                eta=(
+                    getattr(dual_result, "eta_state", None)
+                    if solver_tier == "dual_alpha_eta"
+                    else None
+                ),
+                split_signs=(
+                    batch.split_signs if solver_tier == "dual_alpha_eta" else None
+                ),
+                return_nu_per_layer=True,
+            )
+            branch_nu = nu_pass.nu_per_layer
+    elif return_nu:
         branch_bounds, branch_nu = dual.recompute_bounds_and_nu(
             net,
             bounds_dict_dual,
@@ -611,6 +990,7 @@ def _dispatch_dual_solve(
         solution=solution,
         bounds_dict=branch_bounds,
         nu_per_layer=branch_nu,
+        row_slack=slack.detach(),
     )
 
 
@@ -619,13 +999,52 @@ def _dispatch_dual_solve(
 # ---------------------------------------------------------------------------
 
 
+def _net_bound_elements(net: Net) -> int:
+    """Total bound-carrying variables; a proxy for per-lane memory cost."""
+    return sum(len(l.out_vars) for l in net.layers if getattr(l, "out_vars", None))
+
+
+def _auto_batch_budget_bytes(safety: float) -> float:
+    """Memory the auto sizer may use: min(safety*total, 90% of what this
+    process can reclaim), so it shares the GPU with other processes."""
+    free, total = torch.cuda.mem_get_info()
+    reclaimable = free + torch.cuda.memory_reserved()
+    return min(float(total) * safety, float(reclaimable) * 0.9)
+
+
+def _auto_initial_batch(net: Net, config: BaBConfig) -> int:
+    """Conservative first batch from net size; the loop recalibrates it from
+    the measured per-lane peak after the first real round."""
+    safety = float(getattr(config, "auto_batch_safety", 0.55))
+    cap = int(getattr(config, "auto_batch_cap", 2048))
+    floor = int(getattr(config, "auto_batch_floor", 8))
+    per_lane = 4.0 * max(1, _net_bound_elements(net)) * 256.0
+    k = int(_auto_batch_budget_bytes(safety) / per_lane)
+    return max(floor, min(cap, k))
+
+
+def _auto_recalibrate_batch(peak_bytes: float, max_k_seen: int, config: BaBConfig) -> int:
+    """Batch for the next round = budget / measured bytes-per-lane.
+
+    ``peak_bytes / max_k_seen`` over-estimates the marginal per-lane cost (it
+    folds in the one-time root/presolve peak), so the sizer errs toward fewer
+    lanes - safe against OOM while still ramping up on small nets with spare
+    memory."""
+    safety = float(getattr(config, "auto_batch_safety", 0.55))
+    cap = int(getattr(config, "auto_batch_cap", 2048))
+    floor = int(getattr(config, "auto_batch_floor", 8))
+    bpl = max(peak_bytes / max(1, max_k_seen), 1.0)
+    k = int(_auto_batch_budget_bytes(safety) / bpl)
+    return max(floor, min(cap, k))
+
+
 @torch.no_grad()
 def verify_bab_batched(
     net: Net,
     solver_factory: Callable[[], Solver],
     config: Optional[BaBConfig] = None,
     *,
-    max_batch_size: Optional[int] = None,
+    max_batch_size: Optional[Union[int, str]] = None,
     time_budget_s: Optional[float] = None,
     verbose: bool = False,
     _k_log: Optional[List[int]] = None,
@@ -664,10 +1083,20 @@ def verify_bab_batched(
     """
     if config is None:
         config = BaBConfig()
-    if max_batch_size is None:
-        max_batch_size = int(getattr(config, "bab_max_batch_size", 8))
-    if max_batch_size < 1:
-        raise ValueError(f"max_batch_size must be >= 1, got {max_batch_size}")
+    auto_batch = isinstance(max_batch_size, str) and max_batch_size == "auto"
+    if auto_batch:
+        effective_batch = (
+            _auto_initial_batch(net, config)
+            if torch.cuda.is_available()
+            else int(getattr(config, "auto_batch_cap", 512))
+        )
+    elif max_batch_size is None:
+        effective_batch = int(getattr(config, "bab_max_batch_size", 8))
+    else:
+        effective_batch = int(cast(int, max_batch_size))
+    if effective_batch < 1:
+        raise ValueError(f"max_batch_size must be >= 1, got {effective_batch}")
+    max_k_seen = 0
 
     budget_s = time_budget_s if time_budget_s is not None else 300.0
 
@@ -676,7 +1105,14 @@ def verify_bab_batched(
         from act.back_end.solver.solver_dual import DualSolver
 
         fsb_dual_solver = DualSolver()
-    brancher = _build_branching_strategy(config.branching_method, dual_solver=fsb_dual_solver)
+    # "gain" measures child bounds directly; its fallback (when no measured
+    # decision is available) is BaBSR — it reuses the dual ν scores and
+    # degrades to width-based only when ν/bounds are absent, which is strictly
+    # better than a random fallback.
+    brancher_method = (
+        "babsr" if config.branching_method == "gain" else config.branching_method
+    )
+    brancher = _build_branching_strategy(brancher_method, dual_solver=fsb_dual_solver)
     pool = _build_bounding(
         config.bounding_method,
         depth_weight=getattr(config, "bounding_depth_weight", 1.0),
@@ -696,6 +1132,16 @@ def verify_bab_batched(
     root_bounds = seed_from_input_specs(spec_layers)
     input_shape: tuple[int, ...] = tuple(root_bounds.lb.shape[1:])
 
+    per_lane_dim = int(root_bounds.lb[0].numel())
+    n_input_vars = len(get_input_ids(net))
+    if n_input_vars != per_lane_dim:
+        raise ValueError(
+            f"verify_bab_batched: INPUT layer declares {n_input_vars} variables "
+            f"but the per-lane input dim is {per_lane_dim}. The net was likely "
+            f"converted with a batched input shape (B baked into INPUT vars); "
+            f"synthesize per-instance (B=1) models before BaB."
+        )
+
     root_batch = SubproblemBatch.from_bounds(root_bounds)
     if provenance:
         n = root_batch.batch_size
@@ -709,6 +1155,82 @@ def verify_bab_batched(
             (n,), -1, device=root_batch.lb.device, dtype=torch.long
         )
         node_counter += n
+
+    # Root spec-pruning presolve (ALL-rows kinds, dual tiers): rows certified
+    # on the root box stay certified on every sub-box, so descendants only
+    # carry the unproven rows.
+    spec_keep_rows: Optional[torch.Tensor] = None
+    presolve_tier = getattr(config, "solver_tier", "lp")
+    root_fwd: Optional[Dict[int, Bounds]] = None
+    refine_mode = getattr(config, "intermediate_refine", "none")
+    if presolve_tier in ("dual", "dual_alpha", "dual_alpha_eta") and (
+        getattr(config, "reuse_root_bounds", False) or refine_mode != "none"
+    ):
+        from act.back_end.dual_tf.tf_forward import compute_forward_bounds
+        from act.back_end.solver.solver_dual import DualSolver
+
+        root_fwd = compute_forward_bounds(net, root_bounds.lb, root_bounds.ub)
+        if refine_mode != "none":
+            root_fwd = DualSolver().refine_intermediate_bounds(
+                net,
+                root_fwd,
+                mode=refine_mode,
+                blowup_ratio=getattr(config, "intermediate_refine_ratio", 10.0),
+            )
+    if (
+        presolve_tier in ("dual", "dual_alpha", "dual_alpha_eta")
+        and assert_layer.params.get("kind") != OutKind.UNSAFE_LINEAR
+    ):
+        presolve = _dispatch_dual_solve(
+            net=net,
+            assert_layer=assert_layer,
+            batched_bounds=Bounds(root_bounds.lb, root_bounds.ub),
+            k_actual=root_batch.batch_size,
+            batch=root_batch,
+            config=config,
+            optimize=presolve_tier in ("dual_alpha", "dual_alpha_eta"),
+            root_bounds_dict=root_fwd,
+        )
+        if presolve.row_slack is not None:
+            unproven = (presolve.row_slack < 0).any(dim=0)
+            total_rows = int(unproven.numel())
+            if not bool(unproven.any().item()):
+                return VerifyResult(
+                    VerifyStatus.CERTIFIED,
+                    metadata={
+                        "nodes": root_batch.batch_size,
+                        "pool_remaining": 0,
+                        "spec_rows_total": total_rows,
+                        "spec_rows_kept": 0,
+                        "resolved_by": "root_presolve",
+                    },
+                )
+            keep = torch.where(unproven)[0]
+            if int(keep.numel()) < total_rows:
+                spec_keep_rows = keep
+                root_batch.incremental_alpha = _select_spec_rows(
+                    root_batch.incremental_alpha, keep,
+                )
+                root_batch.incremental_eta = _select_spec_rows(
+                    root_batch.incremental_eta, keep,
+                )
+                root_batch.split_signs = _select_spec_rows(
+                    root_batch.split_signs, keep,
+                )
+        presplit_k = int(getattr(config, "presplit_levels", 0))
+        if (
+            presplit_k > 0
+            and root_batch.batch_size == 1
+            and presolve.bounds_dict is not None
+            and presolve.nu_per_layer is not None
+        ):
+            presplit = _presplit_root(
+                root_batch, presolve.bounds_dict, presolve.nu_per_layer, presplit_k,
+            )
+            if presplit is not None:
+                root_batch = presplit
+                node_counter += root_batch.batch_size
+
     pool.push(root_batch)
     any_dropped_frontier_cap = False
     if frontier_cap > 0 and len(pool) > frontier_cap:
@@ -725,7 +1247,7 @@ def verify_bab_batched(
             break
 
         remaining_nodes = config.max_nodes - processed
-        k_requested = min(len(pool), max_batch_size, remaining_nodes)
+        k_requested = min(len(pool), effective_batch, remaining_nodes)
         if k_requested <= 0:
             break
 
@@ -760,6 +1282,8 @@ def verify_bab_batched(
                 batch=batch,
                 config=config,
                 optimize=False,
+                keep_rows=spec_keep_rows,
+                root_bounds_dict=root_fwd,
             )
             solution = dual_solve_result.solution
         elif solver_tier in ("dual_alpha", "dual_alpha_eta"):
@@ -771,6 +1295,8 @@ def verify_bab_batched(
                 batch=batch,
                 config=config,
                 optimize=True,
+                keep_rows=spec_keep_rows,
+                root_bounds_dict=root_fwd,
             )
             solution = dual_solve_result.solution
             bounds_dict_for_branching = dual_solve_result.bounds_dict
@@ -781,6 +1307,14 @@ def verify_bab_batched(
             )
 
         node_lower_bound = (-solution.max_viol).detach()
+        if batch.lower_bound is not None:
+            # Bound inheritance: a child region is a subset of its parent, so
+            # the parent's certified lower bound stays valid; clamping removes
+            # per-subproblem optimization regressions (observed: re-optimized
+            # children reporting bounds below their parent's).
+            node_lower_bound = torch.maximum(
+                node_lower_bound, batch.lower_bound.to(node_lower_bound.device)
+            )
 
         sat_lane_idx = [
             i for i, s in enumerate(solution.statuses) if s == SolveStatus.SAT
@@ -901,16 +1435,51 @@ def verify_bab_batched(
                         full_branch_idx,
                         k_actual,
                     )
-                    scores = cast(Any, brancher).compute_scores(
-                        branch_batch,
-                        net,
-                        bounds_dict=bd_branch,
-                        nu_per_layer=nu_branch,
-                    )
-                    decision = cast(SplitDecision, cast(Any, brancher).select(scores))
-                    if decision.kind == "input_axis":
-                        decision.fanout = fanout
-                    children, parent_index = _split_from_decision(branch_batch, decision, net)
+                    multi = None
+                    multi_k = int(getattr(config, "multi_split_levels", 1))
+                    if config.branching_method == "gain" and multi_k > 1:
+                        # Adaptive split depth: fan out so children roughly
+                        # fill one bounding batch; n_branch lanes x 2^k <=
+                        # max_batch_size keeps the frontier from flooding
+                        # the pool.
+                        k_adaptive = max(
+                            1,
+                            min(
+                                multi_k,
+                                int(math.log2(max(2, effective_batch // max(1, branch_batch.batch_size)))),
+                            ),
+                        )
+                        if k_adaptive > 1:
+                            multi = _multi_split_from_decision(
+                                branch_batch, net, bd_branch, nu_branch, k_adaptive,
+                            )
+                    if multi is not None:
+                        children, parent_index = multi
+                    else:
+                        decision = None
+                        if config.branching_method == "gain":
+                            decision = _gain_tested_decision(
+                                branch_batch,
+                                net,
+                                assert_layer,
+                                config,
+                                spec_keep_rows,
+                                root_fwd,
+                                bd_branch,
+                                nu_branch,
+                                input_shape,
+                            )
+                        if decision is None:
+                            scores = cast(Any, brancher).compute_scores(
+                                branch_batch,
+                                net,
+                                bounds_dict=bd_branch,
+                                nu_per_layer=nu_branch,
+                            )
+                            decision = cast(SplitDecision, cast(Any, brancher).select(scores))
+                        if decision.kind == "input_axis":
+                            decision.fanout = fanout
+                        children, parent_index = _split_from_decision(branch_batch, decision, net)
                 else:
                     scores = brancher.compute_scores(branch_batch, net)
                     legacy_decision = cast(Any, brancher).select(scores)
@@ -959,16 +1528,27 @@ def verify_bab_batched(
 
         processed += k_actual
 
+        if auto_batch and torch.cuda.is_available():
+            max_k_seen = max(max_k_seen, k_actual)
+            effective_batch = _auto_recalibrate_batch(
+                torch.cuda.max_memory_allocated(), max_k_seen, config,
+            )
+
     pool_remaining = len(pool)
     elapsed_total = time.time() - start
     exhausted_time = elapsed_total >= budget_s
     exhausted_nodes = processed >= config.max_nodes
+
+    spec_rows_kept = (
+        int(spec_keep_rows.numel()) if spec_keep_rows is not None else None
+    )
 
     if not any_dropped_max_depth and not any_dropped_frontier_cap and pool_remaining == 0:
         return VerifyResult(
             VerifyStatus.CERTIFIED,
             metadata={
                 "nodes": processed,
+                "spec_rows_kept": spec_rows_kept,
                 "pool_remaining": 0,
                 "exhausted_budget_time": exhausted_time,
                 "exhausted_budget_nodes": exhausted_nodes,
@@ -981,6 +1561,7 @@ def verify_bab_batched(
         VerifyStatus.UNKNOWN,
         metadata={
             "nodes": processed,
+            "spec_rows_kept": spec_rows_kept,
             "pool_remaining": pool_remaining,
             "exhausted_budget_time": exhausted_time,
             "exhausted_budget_nodes": exhausted_nodes,

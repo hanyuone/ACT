@@ -102,6 +102,16 @@ jobs:
               --timeout 30 --bab-max-depth 8 --bab-max-subproblems 300
           done
 
+      # Dual-tier BaB: gain-tested branching with joint multi-neuron skips
+      # (verify_bab_batched solver_tier=dual_alpha_eta, multi_split_levels>1).
+      - name: BaB dual tier — gain + joint multi-neuron skip (ACT net)
+        run: |
+          cd ${{ github.workspace }}
+          coverage run -p -m act.back_end --verify \
+            --network "$ACT_NETS_DIR/mlp_plain_3x8_64x64_3962224133.json" \
+            --solver dual --bab --timeout 60 --bab-max-depth 10 --bab-max-subproblems 200 \
+            --device cpu --dtype float32
+
       - name: BaB solver tiers — dual / dual_alpha / dual_alpha_eta (acasxu)
         run: |
           cd ${{ github.workspace }}

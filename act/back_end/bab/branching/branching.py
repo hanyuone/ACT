@@ -14,14 +14,25 @@
 #     1. Input splitting  — bisect (or N-ary section) the input domain along a dim.
 #     2. Neuron splitting  — fix an unstable ReLU's activation phase (on/off).
 #
+#   Joint multi-neuron splitting (``_multi_split_from_decision``): split each lane's
+#   top-k BaBSR-scored neurons together into all 2^k sign combinations (one "skip"
+#   instead of k greedy single splits); gains are super-additive.
+#     * ``MultiNeuronSplitBranching`` — "Mining Verdict Boundaries for Neural Network
+#       Verification", Jiawei Ren, Guanqin Zhang, Zhenya Zhang, Yulei Sui, FM 2026.
+#
 #   Strategies (subclasses of ``BranchingStrategy``):
 #     * ``RandomBranching`` — uniform-random over eligible dims (width-weighted for
 #       input splits; masked to unstable neurons for neuron splits). Baseline.
-#     * ``BaBSRBranching`` — BaBSR score (|slope-gradient|·width) over candidate
-#       neurons from the dual ν/bounds; width-based fallback when α-gradients are
-#       unavailable.
+#     * ``BaBSRBranching`` — BaBSR score ``|bias_term + intercept_term|`` over candidate
+#       neurons from the dual ν/bounds (relaxation intercept ``(-l)·u/(u-l)`` weighted by
+#       ν, with the pre-activation-bias term). Intercept-only backup
+#       ``(-l)·u/(u-l)·clamp(-ν,0)``; width-based fallback when ν/bounds are absent.
+#       "Branch and Bound for Piecewise Linear Neural Network Verification",
+#       Bunel et al., JMLR 2020.
 #     * ``FSBBranching`` — Filtered Smart Branching; extends BaBSR by re-scoring the
 #       top candidates with the dual solver and picking the best bound improvement.
+#       "Improved Branch and Bound for Neural Network Verification via Lagrangian
+#       Decomposition", De Palma et al., 2021.
 #
 #   Result types: ``BranchingScores`` (per-dim / per-neuron scores) and
 #   ``SplitDecision`` (``input_axis`` / ``cut_dim`` + ``fanout`` for input splits;
@@ -617,3 +628,149 @@ def _build_branching_strategy(
             raise ValueError("FSB branching requires a dual_solver instance (inject via factory).")
         return FSBBranching(dual_solver=dual_solver, branching_candidates=branching_candidates)
     raise ValueError(f"Unknown branching method: {method!r}")
+
+
+# ---------------------------------------------------------------------------
+# Joint multi-neuron splitting (verdict-boundary)
+# ---------------------------------------------------------------------------
+
+
+def _collect_neuron_candidates(
+    branch_batch: SubproblemBatch,
+    bounds_dict: Dict[int, Bounds],
+    nu_per_layer: Dict[int, torch.Tensor],
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Per-lane BaBSR scores (area x |nu|) over all splittable neurons.
+
+    Returns ``(scores, layer_ids, neuron_ids)``, each ``[K, C]`` over the
+    concatenated candidate axis; stable or already-split neurons score -inf.
+    """
+    kb = branch_batch.batch_size
+    device = branch_batch.lb.device
+    cand_layers: List[torch.Tensor] = []
+    cand_neurons: List[torch.Tensor] = []
+    cand_scores: List[torch.Tensor] = []
+    for lid, nut in nu_per_layer.items():
+        b = bounds_dict.get(lid)
+        if b is None:
+            continue
+        lb = b.lb.flatten(start_dim=1)
+        ub = b.ub.flatten(start_dim=1)
+        if lb.shape[0] != kb:
+            continue
+        n = min(lb.shape[-1], nut.shape[-1])
+        amb = (lb[:, :n] < 0) & (ub[:, :n] > 0)
+        already = branch_batch.split_signs.get(lid) if branch_batch.split_signs else None
+        if already is not None:
+            amb &= already[:, 0, :n].to(device) == 0
+        area = (-lb[:, :n] * ub[:, :n] / (ub[:, :n] - lb[:, :n]).clamp(min=1e-12)).clamp(min=0)
+        nv = nut.reshape(kb, -1, nut.shape[-1])[:, :, :n].abs().sum(dim=1)
+        sc = torch.where(amb, area * nv, torch.full_like(area, float("-inf")))
+        cand_scores.append(sc)
+        cand_layers.append(torch.full((kb, n), lid, device=device, dtype=torch.long))
+        cand_neurons.append(
+            torch.arange(n, device=device, dtype=torch.long).expand(kb, n)
+        )
+    if not cand_scores:
+        return None
+    return (
+        torch.cat(cand_scores, dim=1),
+        torch.cat(cand_layers, dim=1),
+        torch.cat(cand_neurons, dim=1),
+    )
+
+
+def _multi_split_from_decision(
+    batch: SubproblemBatch,
+    net: Net,
+    bounds_dict: Optional[Dict[int, Bounds]],
+    nu_per_layer: Optional[Dict[int, torch.Tensor]],
+    k_levels: int,
+) -> Optional[Tuple[SubproblemBatch, torch.Tensor]]:
+    """Joint top-k neuron split: each lane emits all 2^k sign combinations.
+
+    Verdict-boundary multi-neuron splitting — "Mining Verdict Boundaries for
+    Neural Network Verification", Jiawei Ren, Guanqin Zhang, Zhenya Zhang,
+    Yulei Sui, FM 2026. Candidates are scored by the BaBSR heuristic
+    (``_collect_neuron_candidates``).
+
+    The 2^k children exactly partition each lane's region (every selected
+    neuron is constrained to >=0 or <=0 in both directions across the
+    combination set), so replacing the lane by its children is sound. Joint
+    splits are super-additive in bound gain versus greedy single splits.
+    Returns None when fewer than ``k_levels`` finite candidates exist in some
+    lane (caller falls back to single-split).
+    """
+    if bounds_dict is None or nu_per_layer is None:
+        return None
+    cand = _collect_neuron_candidates(batch, bounds_dict, nu_per_layer)
+    if cand is None:
+        return None
+    all_scores, all_layers, all_neurons = cand
+    finite_per_lane = torch.isfinite(all_scores).sum(dim=1)
+    k_eff = min(k_levels, int(finite_per_lane.min().item()))
+    if k_eff < 2:
+        return None
+    top = torch.topk(all_scores, k=k_eff, dim=1).indices
+    top_layers = all_layers.gather(1, top)
+    top_neurons = all_neurons.gather(1, top)
+
+    n_lanes = batch.batch_size
+    n_children = 2 ** k_eff
+    device = batch.lb.device
+    parent_index = torch.arange(n_lanes, device=device).repeat(n_children)
+
+    def _gather(state: Optional[Dict[int, torch.Tensor]]) -> Optional[Dict[int, torch.Tensor]]:
+        if state is None:
+            return None
+        return {
+            l: t.index_select(0, parent_index.to(t.device)) for l, t in state.items()
+        }
+
+    m_specs = 1
+    if batch.incremental_alpha:
+        m_specs = int(next(iter(batch.incremental_alpha.values())).shape[1])
+    elif batch.split_signs:
+        m_specs = int(next(iter(batch.split_signs.values())).shape[1])
+
+    signs = _gather(batch.split_signs) or {}
+    for lid_val in torch.unique(top_layers).tolist():
+        lid_int = int(lid_val)
+        layer = net.by_id[lid_int]
+        n_neurons = int(layer.out_vars[-1] - layer.out_vars[0] + 1)
+        if lid_int not in signs:
+            signs[lid_int] = torch.zeros(
+                n_children * n_lanes, m_specs, n_neurons,
+                device=device, dtype=batch.lb.dtype,
+            )
+        else:
+            signs[lid_int] = signs[lid_int].clone()
+        for bit in range(k_eff):
+            lane_sel = torch.where(top_layers[:, bit] == lid_val)[0]
+            if lane_sel.numel() == 0:
+                continue
+            neuron_sel = top_neurons[lane_sel, bit].to(device=device, dtype=torch.long)
+            for j in range(n_children):
+                sign_val = 1.0 if (j >> bit) & 1 else -1.0
+                rows = j * n_lanes + lane_sel
+                signs[lid_int][rows, :, neuron_sel] = sign_val
+
+    children = SubproblemBatch(
+        lb=batch.lb.index_select(0, parent_index),
+        ub=batch.ub.index_select(0, parent_index),
+        depths=batch.depths.index_select(0, parent_index) + k_eff,
+        incremental_alpha=_gather(batch.incremental_alpha),
+        incremental_eta=_gather(batch.incremental_eta),
+        split_signs=signs,
+        parent_margins=(
+            batch.parent_margins.index_select(0, parent_index)
+            if batch.parent_margins is not None
+            else None
+        ),
+        lower_bound=(
+            batch.lower_bound.index_select(0, parent_index)
+            if batch.lower_bound is not None
+            else None
+        ),
+    )
+    return children, parent_index

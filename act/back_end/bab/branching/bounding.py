@@ -20,8 +20,9 @@
 #     * ``GreedyOrder`` — best-first by lower bound (Oliva-Greedy, ``|lb|``).
 #     * ``SAOrder`` — simulated-annealing exploration (temperature-annealed; stochastically cools to greedy).
 #   ``GreedyOrder`` / ``SAOrder`` implement the Oliva order-leading exploration of the
-#   BaB tree — Zhang et al., "Efficient Neural Network Verification via Order Leading
-#   Exploration of Branch-and-Bound Trees", ECOOP 2025 (arXiv:2507.17453).
+#   BaB tree — "Efficient Neural Network Verification via Order Leading Exploration of
+#   Branch-and-Bound Trees", Guanqin Zhang, Kota Fukuda, Zhenya Zhang, H.M.N. Dilum
+#   Bandara, Shiping Chen, Jianjun Zhao, Yulei Sui, ECOOP 2025 (arXiv:2507.17453).
 #
 #   A bounding strategy maintains a *pool* of pending subproblems and
 #   decides which ones to process next.  All data flows through
@@ -258,14 +259,23 @@ class DepthLowerBoundOrder:
 
 
 class GreedyOrder(DepthLowerBoundOrder):
-    """Oliva-Greedy (Zhang et al., ECOOP 2025): best-first by lower bound (``|lb|``)."""
+    """Oliva-Greedy: best-first by lower bound (``|lb|``).
+
+    "Efficient Neural Network Verification via Order Leading Exploration of
+    Branch-and-Bound Trees", Guanqin Zhang, Kota Fukuda, Zhenya Zhang,
+    H.M.N. Dilum Bandara, Shiping Chen, Jianjun Zhao, Yulei Sui, ECOOP 2025.
+    """
 
     def __init__(self) -> None:
         super().__init__(depth_weight=0.0, bound_weight=1.0)
 
 
 class SAOrder:
-    """Oliva-SA (Zhang et al., ECOOP 2025): temperature-annealed exploration order.
+    """Oliva-SA: temperature-annealed exploration order.
+
+    "Efficient Neural Network Verification via Order Leading Exploration of
+    Branch-and-Bound Trees", Guanqin Zhang, Kota Fukuda, Zhenya Zhang,
+    H.M.N. Dilum Bandara, Shiping Chen, Jianjun Zhao, Yulei Sui, ECOOP 2025.
 
     ``temp = cooling_rate ** step`` cools each call, so selection explores early and
     converges to greedy (``|lb|`` best-first) as it cools.

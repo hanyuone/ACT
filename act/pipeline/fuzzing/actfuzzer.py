@@ -97,6 +97,10 @@ class FuzzingConfig:
     trace_storage: str
     trace_output: Optional[Path]
 
+    # Stop as soon as the first counterexample is found (for a fast pre-attack:
+    # total_time then measures time-to-first-counterexample). Default off.
+    stop_on_first_violation: bool = False
+
     def __post_init__(self):
         """Normalize output_dir to Path object."""
         if isinstance(self.output_dir, str):
@@ -386,6 +390,10 @@ class ACTFuzzer:
             # so every forward pass must use exactly N inputs.
             self._fuzz_iteration(iteration, batch_size)
             iteration += batch_size
+
+            if self.config.stop_on_first_violation and self.counterexamples:
+                print(f"✋ First counterexample at {time.time() - self.start_time:.3f}s; stopping")
+                break
 
             if iteration > 0 and iteration % self.config.report_interval < batch_size:
                 self._print_progress(iteration)

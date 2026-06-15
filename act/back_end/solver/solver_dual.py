@@ -135,6 +135,9 @@ class DualSolver(Solver):
         return_optimized: bool = False,
         per_class_alpha: bool = True,
         return_nu_per_layer: bool = False,
+        optimize_alpha: bool = True,
+        refresh_forward: bool = True,
+        start_lid: Optional[int] = None,
     ) -> DualResult:
         """Batched certified lower bound on c^T @ output (DAG-aware).
 
@@ -171,10 +174,13 @@ class DualSolver(Solver):
             (RELU, LRELU, SIGMOID, TANH, GELU). η ≥ 0 invariant (enforced by clamp).
         split_signs: Per-layer split direction. {-1: inactive, +1: active, 0: unsplit}.
             Same key set as eta.
-        η is applied at PRE-ACTIVATION (immediately BEFORE the activation handler
-        runs in the reverse-topological backward loop). This yields
-        nu_pre = slope · (nu_post − η · sign), equivalently a lifted KKT multiplier
-        β = slope · η ≥ 0 acting at the pre-activation. Sound for any η ≥ 0.
+        η is applied to the TRUE pre-activation variable (immediately AFTER the
+        activation handler in the reverse-topological backward loop):
+        nu_pre = slope · nu_post − η · sign, so the multiplier acts on the
+        affine pre-activation unscaled. Applying it before the handler would
+        scale η by the relaxation slope, forcing the effective multiplier to 0
+        on inactive-split (slope = 0) neurons and discarding the z ≤ 0
+        constraint's input-region information. Sound for any η ≥ 0.
         """
         if isinstance(split_signs, list):
             # KFSB path: accept K split hypotheses and return stacked margins
@@ -220,6 +226,8 @@ class DualSolver(Solver):
                 stacked_sce = torch.stack(cast(List[torch.Tensor], sce_values), dim=0)
             return DualResult(margins=torch.stack(margins, dim=0), sce=stacked_sce)
 
+        bounds_dict = self._harden_split_bounds(bounds_dict, split_signs)
+
         if optimize:
             bound, sce, alpha_state, eta_state = self._optimize_alpha_eta(
                 net,
@@ -235,6 +243,9 @@ class DualSolver(Solver):
                 split_signs=split_signs,
                 return_sce=return_sce,
                 per_class_alpha=per_class_alpha,
+                optimize_alpha=optimize_alpha,
+                refresh_forward=refresh_forward,
+                start_lid=start_lid,
             )
             if return_optimized:
                 return DualResult(
@@ -269,23 +280,30 @@ class DualSolver(Solver):
             for _ in range(self.n_iters):
                 pass
 
-            assert_layer = None
-            for layer in net.layers:
-                k = layer.kind.upper() if isinstance(layer.kind, str) else layer.kind
-                if k == LayerKind.ASSERT.value:
-                    assert_layer = layer
-                    break
-            if assert_layer is None:
-                raise ValueError("DualSolver.compute_certified_bound: net has no ASSERT layer")
+            if start_lid is not None:
+                # Interior start: c is a linear functional on layer
+                # ``start_lid``'s output; only its ancestors are visited by
+                # the backward loop (non-ancestors never enter nu_accum).
+                # Used by refine_intermediate_bounds.
+                output_lid = start_lid
+            else:
+                assert_layer = None
+                for layer in net.layers:
+                    k = layer.kind.upper() if isinstance(layer.kind, str) else layer.kind
+                    if k == LayerKind.ASSERT.value:
+                        assert_layer = layer
+                        break
+                if assert_layer is None:
+                    raise ValueError("DualSolver.compute_certified_bound: net has no ASSERT layer")
 
-            assert_preds = net.preds.get(assert_layer.id, [])
-            if len(assert_preds) != 1:
-                raise ValueError(
-                    f"DualSolver.compute_certified_bound: ASSERT layer {assert_layer.id} must have "
-                    f"exactly 1 predecessor, got {len(assert_preds)}"
-                )
+                assert_preds = net.preds.get(assert_layer.id, [])
+                if len(assert_preds) != 1:
+                    raise ValueError(
+                        f"DualSolver.compute_certified_bound: ASSERT layer {assert_layer.id} must have "
+                        f"exactly 1 predecessor, got {len(assert_preds)}"
+                    )
 
-            output_lid = assert_preds[0]
+                output_lid = assert_preds[0]
             nu_accum: Dict[int, torch.Tensor] = {output_lid: c.clone()}
             nu_snapshot: Dict[int, torch.Tensor] = {}
             obj = torch.zeros(B, dtype=c.dtype, device=c.device)
@@ -312,20 +330,6 @@ class DualSolver(Solver):
                         f"Supported kinds: {sorted(registry.keys())}"
                     )
 
-                if eta is not None and split_signs is not None and lid in eta:
-                    eta_l = eta[lid].to(device=nu_here.device, dtype=nu_here.dtype)
-                    signs_l = split_signs[lid].to(device=nu_here.device, dtype=nu_here.dtype)
-                    if eta_l.dim() == 3:
-                        eta_l = eta_l.reshape(-1, eta_l.shape[-1])
-                    if signs_l.dim() == 3:
-                        signs_l = signs_l.reshape(-1, signs_l.shape[-1])
-                    n_clip = min(nu_here.shape[-1], eta_l.shape[-1])
-                    nu_here = nu_here.clone()
-                    nu_here[..., :n_clip] = (
-                        nu_here[..., :n_clip]
-                        - eta_l[..., :n_clip] * signs_l[..., :n_clip]
-                    )
-
                 if return_nu_per_layer and k == LayerKind.RELU.value:
                     nu_snapshot[lid] = nu_here.detach().clone()
 
@@ -336,6 +340,32 @@ class DualSolver(Solver):
                     pred_nus, contrib = handler(
                         layer, nu_here, bounds_dict, preds, M, alpha=alpha.get(lid)
                     )
+
+                if eta is not None and split_signs is not None and lid in eta:
+                    # Split Lagrangian on the TRUE pre-activation variable:
+                    # nu_pre = D nu_post - eta * sign.
+                    # Applying it BEFORE the handler would scale eta by the
+                    # relaxation slope D - forcing beta = 0 on inactive-split
+                    # (D = 0) neurons, which silently discards the z <= 0
+                    # constraint's restriction of the input region (the only
+                    # channel carrying it: the y = 0 relaxation says nothing
+                    # about x). Sound for any eta >= 0: on the child region
+                    # sign * z >= 0, so -eta * sign * z <= 0 only lowers the
+                    # minimized Lagrangian below the true child minimum.
+                    eta_l = eta[lid].to(device=nu_here.device, dtype=nu_here.dtype)
+                    signs_l = split_signs[lid].to(device=nu_here.device, dtype=nu_here.dtype)
+                    if eta_l.dim() == 3:
+                        eta_l = eta_l.reshape(-1, eta_l.shape[-1])
+                    if signs_l.dim() == 3:
+                        signs_l = signs_l.reshape(-1, signs_l.shape[-1])
+                    pn = pred_nus[0]
+                    n_clip = min(pn.shape[-1], eta_l.shape[-1])
+                    pn = pn.clone()
+                    pn[..., :n_clip] = (
+                        pn[..., :n_clip]
+                        - eta_l[..., :n_clip] * signs_l[..., :n_clip]
+                    )
+                    pred_nus = [pn, *pred_nus[1:]]
 
                 if len(pred_nus) != len(preds):
                     raise ValueError(
@@ -427,6 +457,9 @@ class DualSolver(Solver):
         split_signs: Optional[Dict[int, torch.Tensor]] = None,
         return_sce: bool = False,
         per_class_alpha: bool = True,
+        optimize_alpha: bool = True,
+        refresh_forward: bool = True,
+        start_lid: Optional[int] = None,
     ) -> Tuple[
         torch.Tensor,
         Optional[torch.Tensor],
@@ -478,10 +511,25 @@ class DualSolver(Solver):
         input_lb = input_lb.to(device=device, dtype=dtype)
         input_ub = input_ub.to(device=device, dtype=dtype)
 
-        alphas: Dict[int, torch.nn.Parameter] = {}
+        ancestor_lids: Optional[set] = None
+        if start_lid is not None:
+            # Interior-start objectives only depend on ancestor layers; alpha
+            # parameters outside that cone receive no gradient and would crash
+            # the optimizer.
+            ancestor_lids = {start_lid}
+            stack = [start_lid]
+            while stack:
+                for p in net.preds.get(stack.pop(), []):
+                    if p not in ancestor_lids:
+                        ancestor_lids.add(p)
+                        stack.append(p)
+
+        alphas: Dict[int, torch.Tensor] = {}
         for layer in net.layers:
             k = layer.kind.upper() if isinstance(layer.kind, str) else layer.kind
             if k != LayerKind.RELU.value:
+                continue
+            if ancestor_lids is not None and layer.id not in ancestor_lids:
                 continue
             b = bounds_dict.get(layer.id)
             if b is None:
@@ -508,7 +556,10 @@ class DualSolver(Solver):
                     )
                 else:
                     alpha_init = alpha_init_bn.contiguous()
-            alphas[layer.id] = torch.nn.Parameter(alpha_init)
+            if optimize_alpha:
+                alphas[layer.id] = torch.nn.Parameter(alpha_init)
+            else:
+                alphas[layer.id] = alpha_init.detach()
 
         etas: Dict[int, torch.nn.Parameter] = {}
         if split_signs is not None:
@@ -532,17 +583,30 @@ class DualSolver(Solver):
 
         if not alphas and not etas:
             result = self.compute_certified_bound(
-                net, bounds_dict, c, M=M, return_sce=return_sce
+                net, bounds_dict, c, M=M, return_sce=return_sce,
+                start_lid=start_lid,
             )
             return result.margins.detach(), result.sce, {}, {}
 
         param_groups: List[Dict[str, object]] = []
-        alpha_params = list(alphas.values())
+        alpha_params = [a for a in alphas.values() if isinstance(a, torch.nn.Parameter)]
         eta_params = list(etas.values())
         if alpha_params:
             param_groups.append({"params": alpha_params, "lr": lr_alpha})
         if eta_params:
             param_groups.append({"params": eta_params, "lr": lr_beta})
+        if not param_groups:
+            result = self.compute_certified_bound(
+                net, bounds_dict, c, M=M, return_sce=return_sce,
+                alpha=cast(Dict[int, torch.Tensor], alphas) if alphas else None,
+                start_lid=start_lid,
+            )
+            return (
+                result.margins.detach(),
+                result.sce,
+                {lid: a.detach().clone() for lid, a in alphas.items()},
+                {},
+            )
         optimizer = torch.optim.Adam(param_groups)
         scheduler = (
             torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=lr_decay)
@@ -565,17 +629,23 @@ class DualSolver(Solver):
                 optimizer.zero_grad()
                 alpha_tensors = cast(Dict[int, torch.Tensor], alphas)
                 eta_tensors = cast(Dict[int, torch.Tensor], etas)
-                forward_alphas = {
-                    lid: a[:, 0, :] if a.dim() == 3 else a
-                    for lid, a in alpha_tensors.items()
-                }
-                fresh_bounds = compute_forward_bounds(
-                    net,
-                    input_lb,
-                    input_ub,
-                    post_activation=False,
-                    alphas=forward_alphas,
-                )
+                if refresh_forward:
+                    forward_alphas = {
+                        lid: a[:, 0, :] if a.dim() == 3 else a
+                        for lid, a in alpha_tensors.items()
+                    }
+                    fresh_bounds = compute_forward_bounds(
+                        net,
+                        input_lb,
+                        input_ub,
+                        post_activation=False,
+                        alphas=forward_alphas,
+                    )
+                else:
+                    # Fixed intermediate bounds (root-reuse mode): alpha/eta
+                    # only enter the backward pass; sound for any valid
+                    # bounds_dict.
+                    fresh_bounds = bounds_dict
                 result = self.compute_certified_bound(
                     net,
                     fresh_bounds,
@@ -586,6 +656,7 @@ class DualSolver(Solver):
                     alpha=alpha_tensors,
                     eta=eta_tensors,
                     split_signs=split_signs,
+                    start_lid=start_lid,
                 )
                 bound_bm = result.margins
                 sce = result.sce
@@ -627,11 +698,263 @@ class DualSolver(Solver):
                 alpha=cast(Dict[int, torch.Tensor], alphas),
                 eta=cast(Dict[int, torch.Tensor], etas),
                 split_signs=split_signs,
+                start_lid=start_lid,
             )
             best_bounds = result.margins
             best_sce = result.sce
 
         return best_bounds.detach(), best_sce, best_alpha_state, best_eta_state
+
+    def _harden_split_bounds(
+        self,
+        bounds_dict: Dict[int, Bounds],
+        split_signs: Optional[Dict[int, torch.Tensor]],
+    ) -> Dict[int, Bounds]:
+        """Fix split ReLU phases in the relaxation itself.
+
+        sign=+1 asserts pre-activation >= 0 (lb clamped to 0: the relaxation
+        collapses to the exact identity); sign=-1 asserts <= 0 (ub clamped to
+        0: exact zero). Applied alongside the eta Lagrangian term, the split
+        tightens the bound through both channels. Sound: clamping encodes
+        exactly the branch's split assumption.
+        """
+        if not split_signs or isinstance(split_signs, list):
+            return bounds_dict
+        out = dict(bounds_dict)
+        for lid, signs in split_signs.items():
+            b = out.get(lid)
+            if b is None:
+                continue
+            s = signs[:, 0, :] if signs.dim() == 3 else signs
+            if not bool((s != 0).any().item()):
+                continue
+            lb = b.lb.flatten(start_dim=1).clone()
+            ub = b.ub.flatten(start_dim=1).clone()
+            n = min(lb.shape[-1], s.shape[-1])
+            s_n = s[..., :n].to(device=lb.device)
+            lb[..., :n] = torch.where(s_n > 0, lb[..., :n].clamp(min=0.0), lb[..., :n])
+            ub[..., :n] = torch.where(s_n < 0, ub[..., :n].clamp(max=0.0), ub[..., :n])
+            # An infeasible branch (split contradicts a stable phase) yields a
+            # degenerate [x, x] interval; the branch represents an empty input
+            # region, so any bound for it is sound.
+            ub[..., :n] = torch.maximum(ub[..., :n], lb[..., :n])
+            out[lid] = Bounds(lb.view_as(b.lb), ub.view_as(b.ub))
+        return out
+
+    def refine_intermediate_bounds(
+        self,
+        net: Net,
+        bounds_dict: Dict[int, Bounds],
+        mode: str = "auto",
+        blowup_ratio: float = 10.0,
+        max_rows_per_call: int = 4096,
+        optimize_iters: int = 20,
+    ) -> Dict[int, Bounds]:
+        """Metric-driven backward refinement of selected pre-activation bounds.
+
+        Forward-mode concretization loses correlation at wide fan-in affine
+        layers; a backward pass from the affected layer to the input keeps it.
+        Selection is architecture-agnostic: an activation layer qualifies if it
+        has unstable neurons and (mode="auto") its mean pre-activation width
+        exceeds ``blowup_ratio`` x the median width of all activation layers;
+        mode="all" refines every unstable activation layer. Refined bounds are
+        intersected with the forward bounds (both are valid over-approximations,
+        so the intersection is sound). Layers are processed in topological
+        order so later refinements consume earlier ones.
+        """
+        if mode == "none":
+            return bounds_dict
+        if mode not in ("auto", "all", "tail"):
+            raise ValueError(
+                f"intermediate_refine mode must be none|auto|all|tail, got {mode!r}"
+            )
+
+        stats = []
+        for layer in net.layers:
+            k = layer.kind.upper() if isinstance(layer.kind, str) else layer.kind
+            if k != LayerKind.RELU.value or layer.id not in bounds_dict:
+                continue
+            b = bounds_dict[layer.id]
+            lb, ub = b.lb.flatten(start_dim=1), b.ub.flatten(start_dim=1)
+            unstable = int(((lb < 0) & (ub > 0)).sum().item())
+            stats.append((layer.id, unstable, float((ub - lb).mean().item())))
+        if not stats:
+            return bounds_dict
+
+        median_width = sorted(s[2] for s in stats)[len(stats) // 2]
+        threshold = max(median_width, 1e-9) * blowup_ratio
+        if mode == "tail":
+            unstable_lids = [lid for lid, unstable, _ in stats if unstable > 0]
+            selected = unstable_lids[-2:]
+        else:
+            selected = [
+                lid for lid, unstable, width in stats
+                if unstable > 0 and (mode == "all" or width > threshold)
+            ]
+        if not selected:
+            return bounds_dict
+
+        out = dict(bounds_dict)
+        for lid in selected:
+            preds = net.preds.get(lid, [])
+            if len(preds) != 1:
+                continue
+            pred_lid = preds[0]
+            b = out[lid]
+            lb0 = b.lb.flatten(start_dim=1)
+            ub0 = b.ub.flatten(start_dim=1)
+            if lb0.shape[0] != 1:
+                continue
+            n = lb0.shape[-1]
+            device, dtype = lb0.device, lb0.dtype
+            # Only unstable neurons need refinement: stable phases make the
+            # relaxation exact regardless of bound width, so querying them
+            # would spend backward rows for zero tightening.
+            amb_idx = torch.where((lb0[0] < 0) & (ub0[0] > 0))[0]
+            n_amb = int(amb_idx.numel())
+            if n_amb == 0:
+                continue
+            lb_new = torch.empty(n_amb, device=device, dtype=dtype)
+            ub_new = torch.empty(n_amb, device=device, dtype=dtype)
+            for s in range(0, n_amb, max_rows_per_call):
+                e = min(s + max_rows_per_call, n_amb)
+                eye = torch.zeros(e - s, n, device=device, dtype=dtype)
+                eye[torch.arange(e - s), amb_idx[s:e]] = 1.0
+                rows = torch.cat([eye, -eye], dim=0)
+                res = self.compute_certified_bound(
+                    net, out, rows.contiguous(), M=int(rows.shape[0]),
+                    start_lid=pred_lid,
+                    optimize=optimize_iters > 0,
+                    n_iters=optimize_iters,
+                    lr_alpha=0.25,
+                    lr_decay=0.98,
+                    per_class_alpha=True,
+                    refresh_forward=False,
+                )
+                lb_new[s:e] = res.margins[: e - s]
+                ub_new[s:e] = -res.margins[e - s:]
+            lb_ref = lb0[0].clone()
+            ub_ref = ub0[0].clone()
+            lb_ref[amb_idx] = torch.maximum(lb_ref[amb_idx], lb_new)
+            ub_ref[amb_idx] = torch.minimum(ub_ref[amb_idx], ub_new)
+            ub_ref = torch.maximum(ub_ref, lb_ref)
+            refined = Bounds(
+                lb_ref.view_as(b.lb[0]).unsqueeze(0).clone(),
+                ub_ref.view_as(b.ub[0]).unsqueeze(0).clone(),
+            )
+            out[lid] = refined
+            if pred_lid in out and out[pred_lid].lb.shape == refined.lb.shape:
+                out[pred_lid] = refined
+        return out
+
+    def refine_intermediate_bounds_batched(
+        self,
+        net: Net,
+        bounds_dict: Dict[int, Bounds],
+        split_signs: Optional[Dict[int, torch.Tensor]] = None,
+        mode: str = "tail",
+        rows_cap: int = 64,
+        optimize_iters: int = 0,
+        lane_chunk: int = 32,
+    ) -> Dict[int, Bounds]:
+        """K-lane per-subproblem sparse refinement of pre-activation bounds.
+
+        Batched counterpart of ``refine_intermediate_bounds`` for the BaB loop:
+        ``bounds_dict`` entries are ``[K, *shape]`` (one lane per subproblem).
+        Split constraints are applied by hardening the bounds FIRST (sign=+1
+        clamps lb to 0, sign=-1 clamps ub to 0); the backward pass then sees
+        the hardened relaxation slopes, which propagates each lane's splits
+        relationally to downstream layers - the tightening that the interval
+        refresh cannot provide. ``split_signs`` is NOT forwarded to
+        ``compute_certified_bound`` (its eta machinery is shaped for the final
+        spec's M, not the refine rows); hardening alone carries the split.
+
+        Rows are the per-neuron one-hot +/- queries for the UNION of unstable
+        neurons across lanes, capped at ``rows_cap`` by descending interval
+        width. Each refined bound is intersected per lane with the existing
+        bound (both are valid over-approximations: sound). Layers are visited
+        in topological order so later refinements consume earlier ones.
+        """
+        if mode == "none":
+            return bounds_dict
+        if mode not in ("tail", "all"):
+            raise ValueError(
+                f"per_subproblem_refine mode must be none|tail|all, got {mode!r}"
+            )
+
+        out = self._harden_split_bounds(bounds_dict, split_signs)
+
+        stats: List[tuple[int, int]] = []
+        for layer in net.layers:
+            k = layer.kind.upper() if isinstance(layer.kind, str) else layer.kind
+            if k != LayerKind.RELU.value or layer.id not in out:
+                continue
+            b = out[layer.id]
+            lb, ub = b.lb.flatten(start_dim=1), b.ub.flatten(start_dim=1)
+            n_unstable = int(((lb < 0) & (ub > 0)).any(dim=0).sum().item())
+            stats.append((layer.id, n_unstable))
+        unstable_lids = [lid for lid, n_unstable in stats if n_unstable > 0]
+        if not unstable_lids:
+            return out
+        selected = unstable_lids[-2:] if mode == "tail" else unstable_lids
+
+        for lid in selected:
+            preds = net.preds.get(lid, [])
+            if len(preds) != 1:
+                continue
+            pred_lid = preds[0]
+            b = out[lid]
+            lb0 = b.lb.flatten(start_dim=1)
+            ub0 = b.ub.flatten(start_dim=1)
+            k_lanes = lb0.shape[0]
+            n = lb0.shape[-1]
+            device, dtype = lb0.device, lb0.dtype
+            amb_union = ((lb0 < 0) & (ub0 > 0)).any(dim=0)
+            amb_idx = torch.where(amb_union)[0]
+            n_amb = int(amb_idx.numel())
+            if n_amb == 0:
+                continue
+            if n_amb > rows_cap:
+                width = (ub0 - lb0).amax(dim=0)[amb_idx]
+                amb_idx = amb_idx[torch.topk(width, k=rows_cap).indices]
+                n_amb = rows_cap
+            eye = torch.zeros(n_amb, n, device=device, dtype=dtype)
+            eye[torch.arange(n_amb), amb_idx] = 1.0
+            rows = torch.cat([eye, -eye], dim=0)
+            m_rows = int(rows.shape[0])
+            margins = torch.empty(k_lanes, m_rows, device=device, dtype=dtype)
+            for k0 in range(0, k_lanes, lane_chunk):
+                k1 = min(k0 + lane_chunk, k_lanes)
+                sub = {
+                    l: Bounds(bb.lb[k0:k1], bb.ub[k0:k1]) for l, bb in out.items()
+                }
+                c = rows.repeat(k1 - k0, 1).contiguous()
+                res = self.compute_certified_bound(
+                    net, sub, c, M=m_rows,
+                    start_lid=pred_lid,
+                    optimize=optimize_iters > 0,
+                    n_iters=optimize_iters,
+                    lr_alpha=0.25,
+                    lr_decay=0.98,
+                    per_class_alpha=True,
+                    refresh_forward=False,
+                )
+                margins[k0:k1] = res.margins.view(k1 - k0, m_rows)
+            lb_new = margins[:, :n_amb]
+            ub_new = -margins[:, n_amb:]
+            lb_ref = lb0.clone()
+            ub_ref = ub0.clone()
+            lb_ref[:, amb_idx] = torch.maximum(lb_ref[:, amb_idx], lb_new)
+            ub_ref[:, amb_idx] = torch.minimum(ub_ref[:, amb_idx], ub_new)
+            ub_ref = torch.maximum(ub_ref, lb_ref)
+            refined = Bounds(
+                lb_ref.view_as(b.lb).clone(),
+                ub_ref.view_as(b.ub).clone(),
+            )
+            out[lid] = refined
+            if pred_lid in out and out[pred_lid].lb.shape == refined.lb.shape:
+                out[pred_lid] = refined
+        return out
 
     def recompute_bounds_and_nu(
         self,

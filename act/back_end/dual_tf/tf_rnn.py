@@ -21,7 +21,7 @@ def forward_lstm(L, parent_boxes, parent_lins, parent_frames, preds,
                  post_activation, device, dtype):
     """LSTM forward bounds via linear relaxation through time. (Pending)
     Will require: gate bounds per timestep, weight_ih/weight_hh, seq_len,
-    hidden_size. See auto_LiRPA forward_bound.py for reference impl.
+    hidden_size.
     """
     raise NotImplementedError("forward for LSTM not implemented in dual_tf")
 

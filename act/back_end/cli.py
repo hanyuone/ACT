@@ -169,19 +169,34 @@ def _verify_one_net(
                 if "export_to_batch_problem" not in str(e):
                     raise
 
-        if any_unknown and backend_cfg.bab_enabled and not is_dual:
+        if any_unknown and backend_cfg.bab_enabled:
             # verify_bab_batched operates on a single-instance (B=1) net and
             # returns one VerifyResult. For multi-sample nets we slice per-lane
             # and dispatch one BaB call per still-UNKNOWN sample.
             from act.back_end.bab.bab import verify_bab_batched as _vbb
             from act.back_end.verifier import slice_net_to_sample
 
+            bab_cfg = backend_cfg.bab
+            if is_dual:
+                # Dual-tier BaB: optimized alpha/eta bounds with gain-tested
+                # joint multi-neuron (verdict-boundary) branching.
+                import dataclasses
+
+                bab_cfg = dataclasses.replace(
+                    bab_cfg,
+                    solver_tier="dual_alpha_eta",
+                    branching_method="gain",
+                    reuse_root_bounds=True,
+                    intermediate_refine="all",
+                    multi_split_levels=4,
+                )
+
             try:
                 results = [
                     _vbb(
                         slice_net_to_sample(net, i),
                         solver_factory=lambda: _make_solver(backend_cfg.solver),
-                        config=backend_cfg.bab,
+                        config=bab_cfg,
                         max_batch_size=backend_cfg.bab_max_batch_size,
                         time_budget_s=backend_cfg.timeout,
                     )

@@ -78,6 +78,74 @@ class BaBConfig:
     provenance_enabled: bool = False
     """Track logical BaB node ids and parent ids in TopKBounding."""
 
+    eta_only_children: bool = False
+    """Freeze alpha in child subproblems (depth > 0): children inherit the
+    parent's optimized alpha and refine only the split multipliers (eta).
+    Cuts the per-node Adam graph and, combined with reuse_root_bounds,
+    removes the per-iteration forward pass entirely."""
+
+    presplit_levels: int = 0
+    """Pre-split the root's top-k scored unstable neurons into all 2^k sign
+    combinations before the main loop (LEAPS-style leap: descendants are
+    materialized directly, intermediate tree levels are never bounded). The
+    combinations exactly partition the root region, so soundness is
+    unaffected. Requires a dual tier with neuron branching state."""
+
+    intermediate_refine: str = "none"
+    """Backward refinement of intermediate pre-activation bounds at the root:
+    'none' (off), 'auto' (refine activation layers whose mean width exceeds
+    intermediate_refine_ratio x the median - targets wide fan-in
+    concretization loss), 'all' (every unstable activation layer)."""
+
+    intermediate_refine_ratio: float = 10.0
+    """Width-blowup threshold multiplier for intermediate_refine='auto'."""
+
+    reuse_root_bounds: bool = False
+    """Reuse the root box's forward bounds for every descendant (dual tiers).
+
+    Sound by monotonicity: a child box is contained in the root box, so the
+    root's per-layer bounds remain valid over-approximations. Children only
+    override the INPUT/INPUT_SPEC bounds with their own sub-box; intermediate
+    ReLU relaxations stay at root tightness, with branching gains recovered by
+    the input-term concretization and the eta split multipliers. Eliminates
+    the per-node forward pass (the dominant time and memory cost)."""
+
+    per_subproblem_refine: str = "none"
+    """Per-subproblem sparse backward refinement of intermediate bounds in the
+    BaB loop (requires reuse_root_bounds): 'none' (off), 'tail' (last two
+    unstable activation layers), 'all' (every unstable activation layer). For
+    each child batch, the split-hardened bounds are re-tightened by a K-lane
+    backward pass over the unstable-neuron union only (stable phases are
+    exact, so refining them gains nothing), so splits propagate relationally
+    downstream instead of only through the interval refresh."""
+
+    per_subproblem_refine_iters: int = 0
+    """Adam iterations for per-subproblem refine rows (0 = single fixed-slope
+    backward, cheapest)."""
+
+    per_subproblem_refine_rows_cap: int = 64
+    """Max refined neurons per layer per batch (top-cap by interval width);
+    bounds the K x 2*cap backward cost."""
+
+    auto_batch_safety: float = 0.55
+    """Fraction of GPU memory the auto batch sizer (max_batch_size='auto') may
+    target; lowered on a shared GPU. The sizer also never exceeds 90% of the
+    currently-reclaimable memory (free + this process's reserved cache)."""
+
+    auto_batch_cap: int = 2048
+    """Hard upper bound on the auto-sized batch (also the CPU fallback)."""
+
+    auto_batch_floor: int = 8
+    """Lower bound on the auto-sized batch."""
+
+    multi_split_levels: int = 1
+    """Simultaneous neuron splits per branching step (gain branching only).
+    Each lane splits its top-k scored neurons jointly into all 2^k sign
+    combinations. Joint splits are super-additive: the bound gain of
+    constraining k neurons together exceeds the sum of the k individual
+    split gains, because the split multipliers are optimized jointly
+    against all constraints. 1 = single-split behavior."""
+
     verbose: bool = False
 
     @classmethod
