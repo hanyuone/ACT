@@ -179,7 +179,7 @@ class PGDMutation(MutationStrategy):
     def __init__(
         self,
         perturb_size: Union[float, torch.Tensor] = 8/255,
-        num_steps: int = 10,
+        num_steps: int = 50,
         step_size: Optional[float] = None,
         random_start: bool = True,
     ):
@@ -248,14 +248,19 @@ class PGDMutation(MutationStrategy):
             # label is a Tensor[B] int64, -1 = no label
             has_labels = label is not None and (label >= 0).any()
             if has_labels:
-                # Cross-entropy loss: maximize CE to flip prediction (adversarial attack)
+                # CW-style margin loss: maximize (max_{j != target} z_j - z_target).
+                # More directed than cross-entropy for TOP1/MARGIN robustness - its
+                # gradient does not vanish once the target probability is small, so
+                # it keeps climbing toward narrow, small-margin violations that an
+                # unbounded-CE ascent stalls before.
                 assert output.dim() >= 2, (
                     f"Model output should have batch dimension, got shape {output.shape}. "
                     f"Ensure model outputs include batch dimension."
                 )
-                # Replace -1 (no label) with 0 (won't affect gradient much in a batch)
-                target = label.clamp(min=0).to(output.device)
-                loss = F.cross_entropy(output, target)
+                target = label.clamp(min=0).to(output.device).view(-1, 1)
+                tgt_logit = output.gather(1, target).squeeze(1)
+                other = output.scatter(1, target, float("-inf"))
+                loss = (other.max(dim=1).values - tgt_logit).sum()
             else:
                 # If no label is provided, maximize output variance
                 loss = output.var()

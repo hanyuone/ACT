@@ -43,7 +43,8 @@ def compute_smooth_relaxation(
 
     Works element-wise on any broadcastable shape (including batched [B, n]).
     """
-    assert (l <= u).all(), "Invalid bounds: l > u"
+    from .tf_mlp import _repair_degenerate_interval
+    u = _repair_degenerate_interval(l, u, "smooth_relaxation")
     f_l, f_u = func(l), func(u)
     denom = (u - l).clamp(min=1e-12)
     k_chord = (f_u - f_l) / denom

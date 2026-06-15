@@ -30,6 +30,27 @@ from .tf_forward import (
     _box_lrelu, _intersect_boxes, _reset_forward_box,
 )
 
+_DEGENERATE_TOL_ABS = 1e-3
+_DEGENERATE_TOL_REL = 1e-3
+
+
+def _repair_degenerate_interval(l: torch.Tensor, u: torch.Tensor, where: str) -> torch.Tensor:
+    """Repair float32-rounding interval inversions (l slightly above u).
+
+    A deep float32 forward can invert a near-stable neuron's pre-activation
+    bounds by ~1e-6 - a degenerate (empty) interval that the harden/refine
+    paths already repair via ``ub = max(ub, lb)``. This applies the same clamp
+    at the backward consumption point so the kernel never sees l > u. An
+    inversion beyond the float tolerance is a genuine soundness bug and raises.
+    """
+    gap = l - u
+    tol = _DEGENERATE_TOL_ABS + _DEGENERATE_TOL_REL * torch.maximum(l.abs(), u.abs())
+    if bool((gap > tol).any()):
+        raise ValueError(
+            f"{where}: lb exceeds ub by {float(gap.max()):.3e} (beyond float tolerance)"
+        )
+    return torch.maximum(u, l)
+
 
 # Forward handlers: (L, parent_boxes, parent_lins, parent_frames, preds,
 #   post_activation, device, dtype) -> (stored, out, lin, frame).
@@ -306,7 +327,7 @@ def dual_relu_backward(nu: torch.Tensor, bounds: Bounds, M: int = 1,
         u_B = u_B[..., :n]
         if alpha is not None and alpha.shape[-1] != n:
             alpha = alpha[..., :n]
-    assert (l_B <= u_B).all(), "Invalid bounds: l > u"
+    u_B = _repair_degenerate_interval(l_B, u_B, "dual_relu_backward")
 
     v = v_flat.view(B, M, n)
     l = l_B.unsqueeze(1)
