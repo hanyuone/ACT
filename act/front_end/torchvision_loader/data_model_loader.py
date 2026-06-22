@@ -10,11 +10,11 @@ Copyright (C) 2025 SVF-tools/ACT
 License: AGPLv3+
 """
 
-from typing import Dict, Any, List, Optional
-import os
 import json
-import torch
 from pathlib import Path
+from typing import Any, List, Optional
+
+import torch
 
 # Import path configuration
 from act.util.path_config import get_torchvision_data_root
@@ -30,6 +30,161 @@ from act.front_end.torchvision_loader.data_model_mapping import (
 
 # Import custom model definitions
 from act.front_end.torchvision_loader.model_definitions import _get_custom_model_definition
+
+
+def _resolve_external_dataset(
+    dataset_info: dict[str, Any],
+    raw_dir: Path,
+    train: bool,
+    transform: Any = None,
+    download: bool = False,
+):
+    """Load a non-TorchVision dataset declared via the mapping's "download" key.
+
+    The archive's "image_root" must follow the ImageFolder layout (one
+    sub-directory per class). When "index_file" and "split_file" are present,
+    the dataset's official train/test split is applied via Subset.
+    """
+    from torch.utils.data import Subset
+    from torchvision.datasets import ImageFolder
+    from torchvision.datasets.utils import download_and_extract_archive
+
+    cfg = dataset_info["download"]
+    raw_dir = Path(raw_dir)
+    image_root = raw_dir / cfg["image_root"]
+
+    if not image_root.exists():
+        if not download:
+            raise FileNotFoundError(
+                f"Archive dataset not found at {image_root}; download it first."
+            )
+
+        download_and_extract_archive(
+            url=cfg["url"], download_root=str(raw_dir), md5=cfg.get("md5"),
+        )
+
+    dataset = ImageFolder(str(image_root), transform=transform)
+
+    if "index_file" in cfg and "split_file" in cfg:
+        dataset = Subset(
+            dataset, _official_split_indices(dataset, raw_dir, cfg, train),
+        )
+
+    return dataset
+
+
+def _official_split_indices(
+    dataset: Any, raw_dir: Path, cfg: dict[str, Any], train: bool,
+) -> list[int]:
+    """Deterministic official-split filter from index/split text files.
+
+    Both files are whitespace-separated: index_file maps image_id to a path
+    relative to image_root's parent; split_file maps image_id to 1 (train)
+    or 0 (test).
+    """
+    id_to_rel: dict[int, str] = {}
+
+    for line in (raw_dir / cfg["index_file"]).read_text().splitlines():
+        img_id, rel_path = line.split()
+
+        id_to_rel[int(img_id)] = rel_path
+
+    wanted = set()
+
+    for line in (raw_dir / cfg["split_file"]).read_text().splitlines():
+        img_id, is_train = line.split()
+
+        if bool(int(is_train)) == train and int(img_id) in id_to_rel:
+            wanted.add(id_to_rel[int(img_id)])
+
+    root = Path(dataset.root)
+
+    return [
+        idx for idx, (path, _) in enumerate(dataset.samples)
+        if Path(path).relative_to(root).as_posix() in wanted
+    ]
+
+
+def _download_dataset(
+    root_dir: str,
+    dataset_name: str,
+    dataset_info: dict[str, Any],
+    split: str,
+) -> tuple[list[str], list[str]]:
+    """
+    Downloads `split` for a given `dataset_name`. Its `dataset_info` is retrieved from
+    `get_dataset_info`.
+
+    Returns a list of splits downloaded, plus any errors encountered in the download process.
+    """
+    raw_dir = Path(root_dir) / dataset_name / "raw"
+    # We determine an "external" (non-TorchVision) dataset through the `download`
+    # key, which also contains information on where the raw images are, how to split
+    # training/testing sets after extraction.
+    is_external = "download" in dataset_info
+    
+    downloaded_splits = []
+    errors = []
+
+    if is_external:
+        # Archive datasets ship train+test in one archive: download
+        # once, then both splits are available regardless of `split`.
+        print(f"  • Downloading archive from {dataset_info['download']['url']} ...")
+        try:
+            for split_name in ('test', 'train'):
+                ds = _resolve_external_dataset(
+                    dataset_info, raw_dir,
+                    train=(split_name == 'train'),
+                    download=True,
+                )
+                downloaded_splits.append(split_name)
+                print(f"    ✓ {split_name.capitalize()} split: {len(ds)} samples")
+        except Exception as e:
+            error = f"External archive download failed: {e}"
+            errors.append(error)
+            print("    ⚠ " + error)
+    else:
+        import torchvision.datasets
+        dataset_class = getattr(torchvision.datasets, dataset_name, None)
+
+        if dataset_class is None:
+            error = f"Dataset {dataset_name} not found in torchvision.datasets"
+            errors.append(error)
+            print("    ⚠ " + error)
+            
+            return [], errors
+
+        if split in ['test', 'both']:
+            print(f"  • Downloading test split...")
+            try:
+                test_dataset = dataset_class(
+                    root=str(raw_dir),
+                    train=False,
+                    download=True
+                )
+                downloaded_splits.append('test')
+                print(f"    ✓ Test split: {len(test_dataset)} samples")
+            except Exception as e:
+                error = f"Test split failed: {e}"
+                errors.append(error)
+                print("    ⚠ " + error)
+
+        if split in ['train', 'both']:
+            print(f"  • Downloading train split...")
+            try:
+                train_dataset = dataset_class(
+                    root=str(raw_dir),
+                    train=True,
+                    download=True
+                )
+                downloaded_splits.append('train')
+                print(f"    ✓ Train split: {len(train_dataset)} samples")
+            except Exception as e:
+                error = f"Train split failed: {e}"
+                errors.append(error)
+                print("    ⚠ " + error)
+    
+    return downloaded_splits, errors
 
 
 def download_dataset_model_pair(
@@ -212,46 +367,13 @@ def download_dataset_model_pair(
         # Download dataset (only if not already present)
         if not dataset_exists:
             print(f"\n[1/3] Downloading dataset...")
-            
-            import torchvision.datasets
-            dataset_class = getattr(torchvision.datasets, dataset_name, None)
-            
-            if dataset_class is None:
-                return {
-                    'status': 'error',
-                    'message': f"Dataset {dataset_name} not found in torchvision.datasets"
-                }
-            
-            if split in ['test', 'both']:
-                print(f"  • Downloading test split...")
-                try:
-                    test_dataset = dataset_class(
-                        root=str(raw_dir),
-                        train=False,
-                        download=True
-                    )
-                    downloaded_splits.append('test')
-                    print(f"    ✓ Test split: {len(test_dataset)} samples")
-                except Exception as e:
-                    print(f"    ⚠ Test split failed: {e}")
-            
-            if split in ['train', 'both']:
-                print(f"  • Downloading train split...")
-                try:
-                    train_dataset = dataset_class(
-                        root=str(raw_dir),
-                        train=True,
-                        download=True
-                    )
-                    downloaded_splits.append('train')
-                    print(f"    ✓ Train split: {len(train_dataset)} samples")
-                except Exception as e:
-                    print(f"    ⚠ Train split failed: {e}")
-            
+
+            downloaded_splits, errors = _download_dataset(root_dir, dataset_name, dataset_info, split)
+
             if not downloaded_splits:
                 return {
                     'status': 'error',
-                    'message': f"Failed to download any splits for {dataset_name}"
+                    'message': f"Failed to download any splits for {dataset_name}, with errors: {"\n".join(errors)}"
                 }
         else:
             print(f"\n[1/3] Dataset already present, skipping download...")
@@ -611,17 +733,26 @@ def load_dataset_model_pair(
     preprocessing = create_preprocessing_pipeline(dataset_name)
     
     # Load dataset
-    import torchvision.datasets
-    dataset_class = getattr(torchvision.datasets, dataset_name)
+    dataset_info = get_dataset_info(dataset_name)
     is_train = (split == "train")
-    
+
     try:
-        dataset = dataset_class(
-            root=str(raw_dir),
-            train=is_train,
-            transform=preprocessing,
-            download=False  # Already downloaded
-        )
+        if "download" in dataset_info:
+            dataset = _resolve_external_dataset(
+                dataset_info, raw_dir,
+                train=is_train,
+                transform=preprocessing,
+                download=False,  # Already downloaded
+            )
+        else:
+            import torchvision.datasets
+            dataset_class = getattr(torchvision.datasets, dataset_name)
+            dataset = dataset_class(
+                root=str(raw_dir),
+                train=is_train,
+                transform=preprocessing,
+                download=False  # Already downloaded
+            )
         print(f"  ✓ Loaded {len(dataset)} samples")
     except Exception as e:
         raise RuntimeError(f"Failed to load dataset: {e}")
