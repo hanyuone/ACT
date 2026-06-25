@@ -812,6 +812,20 @@ def load_dataset_model_pair(
         spec.loader.exec_module(custom_module)
         model = custom_module.model
         print(f"  ✓ Loaded custom model from {model_path.name}")
+
+    # Load weights, if they're downloaded
+    weights_path = dataset_dir / "weights" / f"{model_name}.pt"
+
+    if weights_path.exists():
+        from act.util.device_manager import get_default_device
+
+        print(f"Weights file for model detected, loading weights...")
+
+        with open(weights_path, "rb") as weights_file:
+            state_dict = torch.load(weights_file, map_location=get_default_device())
+            model.load_state_dict(state_dict, strict=False)
+
+        print(f"  ✓ Loaded weights for model {model_path.name}")
     
     model.eval()  # Set to evaluation mode by default
     
