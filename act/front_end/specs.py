@@ -413,6 +413,19 @@ class OutKind(str, Enum):
     RANGE = "RANGE"
     UNSAFE_LINEAR = "UNSAFE_LINEAR"
 
+    # Concept output spec kinds
+    CONCEPT_CONFIDENCE = "CONFIDENCE"
+    CONCEPT_TOP_N = "TOP_N"
+    CONCEPT_TOP_IN_CATEGORY = "TOP_IN_CATEGORY"
+
+    def is_concept(self) -> bool:
+        return self in [
+            OutKind.CONCEPT_CONFIDENCE,
+            OutKind.CONCEPT_TOP_N,
+            OutKind.CONCEPT_TOP_IN_CATEGORY
+        ]
+
+
 @dataclass
 class OutputSpec:
     SLICEABLE_PARAM_KEYS: ClassVar[tuple[str, ...]] = (
@@ -890,6 +903,7 @@ class OutputSpec:
         """
         z = y.reshape(y.shape[0], -1)
         batch_size = z.shape[0]
+
         if rows is not None:
             rows = rows.to(device=z.device, dtype=torch.long).reshape(-1)
             if rows.numel() != batch_size:
@@ -1009,3 +1023,46 @@ class OutputSpec:
             severity >= 0 if self.kind in self.CLOSED_KINDS else severity > 0
         )
         return violated, severity
+
+    @staticmethod
+    def batch(out_specs: Sequence["OutputSpec"], out_kind: OutKind) -> "OutputSpec":
+        # Merge output specs: y_true and margin
+        y_true = torch.cat([s.y_true for s in out_specs], dim=0) if all(s.y_true is not None for s in out_specs) else None
+        # Use default dtype - device is automatically handled by device_manager
+        margins = torch.cat([
+            s.margin if s.margin is not None else torch.tensor([0.0])
+            for s in out_specs
+        ], dim=0) if any(s.margin is not None for s in out_specs) else None
+    
+        def _batch_attr(attr):
+            """Batch a field that only exists for certain output spec kinds (e.g. c/d for LINEAR_LE, lb/ub for RANGE). Returns None if this kind doesn't use the field."""
+            vals = [getattr(s, attr, None) for s in out_specs]
+            return torch.stack(vals) if all(v is not None for v in vals) else None
+        
+        if out_kind in (OutKind.UNSAFE_LINEAR, OutKind.LINEAR_LE):
+            c_vec = out_specs[0].c
+            if c_vec is not None:
+                c_ref = c_vec.detach().cpu().reshape(-1).numpy().tobytes()
+                assert all(
+                    s.c is not None
+                    and s.c.shape == c_vec.shape
+                    and s.c.detach().cpu().reshape(-1).numpy().tobytes() == c_ref
+                    for s in out_specs
+                ), f"{out_kind.name}: grouped lanes must share one c matrix"
+
+            d_all = [s.d for s in out_specs]
+
+            if (
+                len(d_all) > 1
+                and all(t is not None for t in d_all)
+                and all(t.shape == d_all[0].shape for t in d_all)
+                and not all(torch.equal(t, d_all[0]) for t in d_all)
+            ):
+                d_vec = torch.stack(d_all)
+            else:
+                d_vec = d_all[0]
+        else:
+            c_vec, d_vec = _batch_attr('c'), _batch_attr('d')
+    
+        out_lb, out_ub = _batch_attr('lb'), _batch_attr('ub')
+        return OutputSpec(kind=out_kind, y_true=y_true, margin=margins, c=c_vec, d=d_vec, lb=out_lb, ub=out_ub)

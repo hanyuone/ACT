@@ -300,9 +300,9 @@ class BaseSpecCreator(ABC):
     
     def _create_spec_combinations(
         self,
-        input_specs: List[InputSpec],
-        output_specs: List[OutputSpec]
-    ) -> List[Tuple[InputSpec, OutputSpec]]:
+        input_specs: Sequence[InputSpec],
+        output_specs: Sequence[OutputSpec]
+    ) -> list[tuple[InputSpec, OutputSpec]]:
         """Create spec combinations based on strategy"""
         strategy = self.config.get('combination_strategy', 'balanced')
         

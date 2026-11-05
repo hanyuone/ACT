@@ -673,7 +673,9 @@ class OutputSpecLayer(nn.Module):
         supported = (
             OutKind.LINEAR_LE, OutKind.UNSAFE_LINEAR,
             OutKind.TOP1_ROBUST, OutKind.MARGIN_ROBUST, OutKind.RANGE,
+            OutKind.CONCEPT_CONFIDENCE, OutKind.CONCEPT_TOP_N, OutKind.CONCEPT_TOP_IN_CATEGORY,
         )
+        
         if self.kind not in supported:
             raise ValueError(
                 f"OutputSpecLayer: unsupported kind {self.kind!r}; "

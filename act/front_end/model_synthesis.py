@@ -32,6 +32,7 @@ import torch.nn as nn
 from typing import Dict, Any, List, Literal, Tuple, Optional
 
 # Import ACT components
+from act.front_end.concept.output_spec import ConceptOutputSpec
 from act.front_end.specs import InputSpec, OutputSpec, InKind, OutKind
 from act.front_end.spec_creator_base import LabeledInputTensor, SpecTuple
 from act.front_end.verifiable_model import (
@@ -201,14 +202,6 @@ def _merge_specs_to_batch(
     else:
         raise NotImplementedError(f"Batching for {in_kind} not implemented")
     
-    # Merge output specs: y_true and margin
-    y_true = torch.cat([s.y_true for s in out_specs], dim=0) if all(s.y_true is not None for s in out_specs) else None
-    # Use default dtype - device is automatically handled by device_manager
-    margins = torch.cat([
-        s.margin if s.margin is not None else torch.tensor([0.0])
-        for s in out_specs
-    ], dim=0) if any(s.margin is not None for s in out_specs) else None
-    
     # Create batched spec objects
     batched_lt = LabeledInputTensor(tensor=tensor, label=labels)
     if in_kind == InKind.LP_EMBEDDING:
@@ -224,34 +217,11 @@ def _merge_specs_to_batch(
         )
     else:
         batched_in = InputSpec(kind=in_kind, lb=lb, ub=ub, center=center, eps=eps)
-    def _batch_attr(attr):
-        """Batch a field that only exists for certain output spec kinds (e.g. c/d for LINEAR_LE, lb/ub for RANGE). Returns None if this kind doesn't use the field."""
-        vals = [getattr(s, attr, None) for s in out_specs]
-        return torch.stack(vals) if all(v is not None for v in vals) else None
-    if out_kind in (OutKind.UNSAFE_LINEAR, OutKind.LINEAR_LE):
-        c_vec = out_specs[0].c
-        if c_vec is not None:
-            c_ref = c_vec.detach().cpu().reshape(-1).numpy().tobytes()
-            assert all(
-                s.c is not None
-                and s.c.shape == c_vec.shape
-                and s.c.detach().cpu().reshape(-1).numpy().tobytes() == c_ref
-                for s in out_specs
-            ), f"{out_kind.name}: grouped lanes must share one c matrix"
-        d_all = [s.d for s in out_specs]
-        if (
-            len(d_all) > 1
-            and all(t is not None for t in d_all)
-            and all(t.shape == d_all[0].shape for t in d_all)
-            and not all(torch.equal(t, d_all[0]) for t in d_all)
-        ):
-            d_vec = torch.stack(d_all)
-        else:
-            d_vec = d_all[0]
+
+    if out_kind.is_concept():
+        batched_out = ConceptOutputSpec.batch(out_specs, out_kind)
     else:
-        c_vec, d_vec = _batch_attr('c'), _batch_attr('d')
-    out_lb, out_ub = _batch_attr('lb'), _batch_attr('ub')
-    batched_out = OutputSpec(kind=out_kind, y_true=y_true, margin=margins, c=c_vec, d=d_vec, lb=out_lb, ub=out_ub)
+        batched_out = OutputSpec.batch(out_specs, out_kind)
     
     return batched_lt, batched_in, batched_out
 
