@@ -1,0 +1,21 @@
+name: slcbm-extras
+channels:
+  - conda-forge
+  - conda-pypi
+  - nodefaults
+dependencies:
+  - seaborn
+  - pip
+  - pip:
+    # Not available in `conda` channels
+    - clip-openai
+    - pyautoattack
+    # Depend on `pytorch`
+    - pytorchcv
+    - captum
+    - kornia
+    - open-clip-torch
+    - git+https://github.com/fra31/auto-attack
+    - git+https://github.com/Uzukidd/ASGT-module@c708c4f
+    - git+https://github.com/hanyuone/pcbm-module@903029c
+    - git+https://github.com/uzukidd/RIVAL10@9ac1acd

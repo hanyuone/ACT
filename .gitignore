@@ -1,6 +1,7 @@
 .vscode
 __pycache__
 .DS_Store
+
 data/*
 models/*
 !data/*.py
@@ -11,8 +12,6 @@ models/*
 gurobi/gurobi.lic
 modules/gurobi/gurobi.lic
 verifier/out.txt
-ipynb/*
-!ipynb/*.ipynb
 Abstract-Constraint-Transformer.wiki/
 act/pipeline/log/*
 act/back_end/examples/nets/*
