@@ -1,19 +1,25 @@
-from collections import OrderedDict
 import logging
+from collections import OrderedDict
 
-from torch import Tensor
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-
 from act.front_end.concept.input_spec import ConceptInputSpec
-from act.front_end.concept.output_spec import ConceptOutputSpec, Confidence, TopInCategory, TopN
-from act.front_end.spec_creator_base import BaseSpecCreator, LabeledInputTensor, SpecTuple
+from act.front_end.concept.output_spec import (
+    Confidence,
+    TopInCategory,
+    TopN,
+)
+from act.front_end.spec_creator_base import (
+    BaseSpecCreator,
+    LabeledInputTensor,
+    SpecTuple,
+)
 from act.front_end.specs import OutKind, OutputSpec
 from act.util.device_manager import get_default_device
-
+from torch import Tensor, nn
+from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
+
 
 class ConceptSpecCreator(BaseSpecCreator):
     """
@@ -22,14 +28,14 @@ class ConceptSpecCreator(BaseSpecCreator):
 
     # TODO: remove function once YAML integration implemented
     def __init__(
-            self,
-            spec_kinds: list[OutKind],
-            epsilons: list[float],
-            # Output spec type-specific
-            confidence_threshold: float = 0.95,
-            ranking_threshold: int = 5,
-            categories: list[list[int]] = [],
-        ):
+        self,
+        spec_kinds: list[OutKind],
+        epsilons: list[float],
+        # Output spec type-specific
+        confidence_threshold: float = 0.95,
+        ranking_threshold: int = 5,
+        categories: list[list[int]] = [],
+    ):
         """
         ### Params
         - `spec_kinds`: A list of specification types to generate when creating
@@ -44,7 +50,9 @@ class ConceptSpecCreator(BaseSpecCreator):
         assert len(spec_kinds) > 0, "Number of spec kinds cannot be empty"
 
         is_concept = [st.is_concept() for st in spec_kinds]
-        assert all(i == is_concept[0] for i in is_concept), "All spec kinds must be concept- or class-level"
+        assert all(i == is_concept[0] for i in is_concept), (
+            "All spec kinds must be concept- or class-level"
+        )
 
         self.is_concept_level = is_concept[0]
         self.spec_types = spec_kinds
@@ -55,7 +63,9 @@ class ConceptSpecCreator(BaseSpecCreator):
         self.ranking_threshold = ranking_threshold
         self.categories = categories
 
-    def _create_input_specs(self, sample: Tensor, mask: Tensor) -> list[ConceptInputSpec]:
+    def _create_input_specs(
+        self, sample: Tensor, mask: Tensor
+    ) -> list[ConceptInputSpec]:
         input_specs: list[ConceptInputSpec] = []
 
         for eps in self.epsilons:
@@ -63,7 +73,9 @@ class ConceptSpecCreator(BaseSpecCreator):
 
         return input_specs
 
-    def _create_output_specs(self, num_elements: int, label: Tensor) -> list[OutputSpec]:
+    def _create_output_specs(
+        self, num_elements: int, label: Tensor
+    ) -> list[OutputSpec]:
         """
         ### Params
         - `label`: [batch_size]
@@ -89,17 +101,20 @@ class ConceptSpecCreator(BaseSpecCreator):
                             label.item() in self.categories[i]
                             for i in range(len(self.categories))
                         ].index(True)
-                        
+
                         top_elements[0, category_index] = label.item()
                         is_top[0, category_index] = True
-                        
-                        output_specs.append(TopInCategory(num_elements, self.categories, top_elements, is_top))
 
+                        output_specs.append(
+                            TopInCategory(
+                                num_elements, self.categories, top_elements, is_top
+                            )
+                        )
         else:
             for spec_type in self.spec_types:
                 match spec_type:
                     case OutKind.TOP1_ROBUST:
-                        output_specs.append(OutputSpec(spec_type, label))
+                        output_specs.append(OutputSpec(kind=spec_type, y_true=label))
 
         return output_specs
 
@@ -134,7 +149,7 @@ class ConceptSpecCreator(BaseSpecCreator):
 
             pairs = self._create_spec_combinations(input_specs, output_specs)
             spec_pairs.extend(pairs)
-        
+
         if not spec_pairs:
             raise RuntimeError(f"No valid specs generated for {dl_key} + {model_key}")
 
@@ -167,7 +182,15 @@ class ConceptSpecCreator(BaseSpecCreator):
         for dl_key, (dataloader, num_elements) in dataloaders.items():
             for model_key, model in models.items():
                 print(f"Generating specs for {dl_key}, {model_key}")
-                result = self._dataset_model_spec(dl_key, model_key, dataloader, model, num_elements, num_samples, start_index)
+                result = self._dataset_model_spec(
+                    dl_key,
+                    model_key,
+                    dataloader,
+                    model,
+                    num_elements,
+                    num_samples,
+                    start_index,
+                )
                 results.append(result)
 
         return results
