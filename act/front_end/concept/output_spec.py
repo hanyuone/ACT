@@ -40,7 +40,14 @@ class ConceptOutputSpec(OutputSpec):
                 top_elements = torch.cat([o.top_elements for o in out_specs])
                 is_top = torch.cat([o.is_top for o in out_specs])
 
-                return TopInCategory(num_elements, category_indices, top_elements, is_top)
+                spec = TopInCategory(num_elements, category_indices, top_elements, is_top)
+
+                # TODO: temporary, replace when we think up better way of setting up `y_true`
+                if out_specs[0].y_true is not None:
+                    y_true: Tensor = torch.cat([o.y_true for o in out_specs])
+                    spec.y_true = y_true
+
+                return spec
             case _: raise ValueError("OutKind must be a concept spec kind to be batched into ConceptOutputSpec")
 
 
