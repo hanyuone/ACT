@@ -8,14 +8,16 @@ from act.front_end.specs import OutKind, OutputSpec
 
 class ConceptOutputSpec(OutputSpec):
     @staticmethod
-    def batch(out_specs: Sequence["ConceptOutputSpec"], out_kind: OutKind) -> OutputSpec:
+    def batch(out_specs: Sequence[OutputSpec], out_kind: OutKind) -> OutputSpec:
         match out_kind:
             case OutKind.CONCEPT_CONFIDENCE:
-                # Confidence spec is RANGE under the hood, pass to superclass's implementation
-                for o in out_specs:
-                    o.kind = OutKind.RANGE
+                out_specs = cast(Sequence[Confidence], out_specs)
+                num_elements = out_specs[0].num_elements
 
-                return OutputSpec.batch(out_specs, OutKind.RANGE)
+                y_true: Tensor = torch.cat([o.y_true for o in out_specs])
+                threshold = torch.cat([o.threshold for o in out_specs])
+
+                return Confidence(num_elements, y_true, threshold)
             case OutKind.CONCEPT_TOP_N:
                 out_specs = cast(Sequence[TopN], out_specs)
 
@@ -23,9 +25,9 @@ class ConceptOutputSpec(OutputSpec):
                 assert all(o.num_elements == num_elements for o in out_specs), "Cannot batch top-N specs that have different numbers of elements"
 
                 y_true: Tensor = torch.cat([o.y_true for o in out_specs])
-                top_n = torch.cat([o.top_n for o in out_specs])
+                threshold = torch.cat([o.threshold for o in out_specs])
 
-                return TopN(num_elements, y_true, top_n)
+                return TopN(num_elements, y_true, threshold)
             case OutKind.CONCEPT_TOP_IN_CATEGORY:
                 out_specs = cast(Sequence[TopInCategory], out_specs)
 
@@ -61,16 +63,29 @@ class Confidence(ConceptOutputSpec):
         - `y_true` [B]: The concepts we want to be affected by thresholds.
         - `threshold` [B]: The confidence thresholds of each individual concept.
         """
-        if not (0 <= threshold <= 1):
+        if not ((0 <= threshold).all() and (threshold <= 1).all()):
             raise ValueError("Confidence threshold must be in [0, 1]")
 
-        # `Confidence` is an `OutKind.RANGE`
-        lb = torch.zeros((num_elements))
-        lb[cast(int, y_true.item())] = threshold
+        self.num_elements = num_elements
+        self.threshold = threshold
 
-        ub = torch.ones((num_elements))
+        super().__init__(OutKind.CONCEPT_CONFIDENCE, y_true=y_true)
 
-        super().__init__(OutKind.CONCEPT_CONFIDENCE, lb=lb, ub=ub, y_true=y_true)
+    def severity(self, y: Tensor, rows: Optional[Tensor] = None) -> Tensor:
+        assert self.y_true is not None
+
+        if rows == None:
+            y_true = self.y_true
+            threshold = self.threshold
+        else:
+            y_true = self.y_true[rows]
+            threshold = self.threshold[rows]
+
+        batch_size = y.shape[0]
+        lb = torch.zeros((batch_size, self.num_elements))
+        lb.scatter_(dim=1, index=y_true.unsqueeze(1), src=threshold.unsqueeze(1))
+
+        return (lb - y).max(dim=1, keepdim=False).values
 
 
 class TopN(ConceptOutputSpec):
@@ -85,11 +100,9 @@ class TopN(ConceptOutputSpec):
             raise ValueError("`top_n` must be smaller than number of elements")
 
         self.num_elements = num_elements
-        # Specs can be *batched*
-        self.y_true = y_true
-        self.top_n = threshold
+        self.threshold = threshold
 
-        super().__init__(OutKind.CONCEPT_TOP_N, y_true=self.y_true)
+        super().__init__(OutKind.CONCEPT_TOP_N, y_true=y_true)
 
     def severity(self, y: Tensor, rows: Optional[Tensor] = None) -> Tensor:
         """
@@ -107,13 +120,13 @@ class TopN(ConceptOutputSpec):
 
         if rows == None:
             y_true = self.y_true
-            top_n = self.top_n
+            threshold = self.threshold
         else:
             y_true = self.y_true[rows]
-            top_n = self.top_n[rows]
+            threshold = self.threshold[rows]
 
         # 1. Get `top_n`-th item from `y`
-        sorted = y.sort(dim=1, descending=True)[0].gather(dim=1, index=top_n.unsqueeze(dim=1))
+        sorted = y.sort(dim=1, descending=True)[0].gather(dim=1, index=threshold.unsqueeze(dim=1))
 
         # 2. Calculate difference
         y_true_confidences = y.gather(dim=1, index=y_true.unsqueeze(dim=1))

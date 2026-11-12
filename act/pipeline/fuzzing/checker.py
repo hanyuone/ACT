@@ -177,10 +177,13 @@ class PropertyChecker:
     def _label_targets(self) -> Optional[torch.Tensor]:
         """Flattened y_true labels, or None when the spec kind carries no label."""
         assert self.spec is not None
-        if self.spec.kind not in (OutKind.TOP1_ROBUST, OutKind.MARGIN_ROBUST):
+
+        if self.spec.kind not in (OutKind.TOP1_ROBUST, OutKind.MARGIN_ROBUST, OutKind.CONCEPT_CONFIDENCE, OutKind.CONCEPT_TOP_N, OutKind.CONCEPT_TOP_IN_CATEGORY):
             return None
+        
         if self.spec.y_true is None:
             raise ValueError(f"{self.spec.kind} requires an OutputSpec with y_true")
+        
         return self.spec.y_true.reshape(-1)
     
     def _build_results(
