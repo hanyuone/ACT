@@ -105,11 +105,13 @@ class ConceptSpecCreator(BaseSpecCreator):
                         top_elements[0, category_index] = label.item()
                         is_top[0, category_index] = True
 
-                        output_specs.append(
-                            TopInCategory(
-                                num_elements, self.categories, top_elements, is_top
-                            )
+                        top_in_category = TopInCategory(
+                            num_elements, self.categories, top_elements, is_top
                         )
+                        # Manually set `top_in_category` for now
+                        top_in_category.y_true = label
+
+                        output_specs.append(top_in_category)
         else:
             for spec_type in self.spec_types:
                 match spec_type:

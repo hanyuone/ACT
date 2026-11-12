@@ -70,7 +70,7 @@ class Confidence(ConceptOutputSpec):
 
         ub = torch.ones((num_elements))
 
-        super().__init__(OutKind.CONCEPT_CONFIDENCE, lb=lb, ub=ub)
+        super().__init__(OutKind.CONCEPT_CONFIDENCE, lb=lb, ub=ub, y_true=y_true)
 
 
 class TopN(ConceptOutputSpec):
