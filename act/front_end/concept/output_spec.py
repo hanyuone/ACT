@@ -1,54 +1,17 @@
-from typing import Any, Optional, Sequence, cast
+from typing import Self, Sequence, cast
 
 from torch import Tensor
 import torch
 
-from act.front_end.specs import OutKind, OutputSpec
+from act.front_end.specs import BaseOutputSpec, OutputSpec
 
 
-class ConceptOutputSpec(OutputSpec):
-    @staticmethod
-    def batch(out_specs: Sequence[OutputSpec], out_kind: OutKind) -> OutputSpec:
-        match out_kind:
-            case OutKind.CONCEPT_CONFIDENCE:
-                out_specs = cast(Sequence[Confidence], out_specs)
-                num_elements = out_specs[0].num_elements
+class ConceptOutputSpec(BaseOutputSpec[Tensor]):
+    def violation(self, y: Tensor, rows: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        severity = self.severity(y, rows=rows)
+        violated = severity > 0
 
-                y_true: Tensor = torch.cat([o.y_true for o in out_specs])
-                threshold = torch.cat([o.threshold for o in out_specs])
-
-                return Confidence(num_elements, y_true, threshold)
-            case OutKind.CONCEPT_TOP_N:
-                out_specs = cast(Sequence[TopN], out_specs)
-
-                num_elements = out_specs[0].num_elements
-                assert all(o.num_elements == num_elements for o in out_specs), "Cannot batch top-N specs that have different numbers of elements"
-
-                y_true: Tensor = torch.cat([o.y_true for o in out_specs])
-                threshold = torch.cat([o.threshold for o in out_specs])
-
-                return TopN(num_elements, y_true, threshold)
-            case OutKind.CONCEPT_TOP_IN_CATEGORY:
-                out_specs = cast(Sequence[TopInCategory], out_specs)
-
-                num_elements = out_specs[0].num_elements
-                assert all(o.num_elements == num_elements for o in out_specs), "Cannot batch top-N specs that have different numbers of elements"
-
-                category_indices = out_specs[0].category_indices
-                assert all(o.category_indices == category_indices for o in out_specs), "Cannot batch top-N specs that have different numbers of elements"
-
-                top_elements = torch.cat([o.top_elements for o in out_specs])
-                is_top = torch.cat([o.is_top for o in out_specs])
-
-                spec = TopInCategory(num_elements, category_indices, top_elements, is_top)
-
-                # TODO: temporary, replace when we think up better way of setting up `y_true`
-                if out_specs[0].y_true is not None:
-                    y_true: Tensor = torch.cat([o.y_true for o in out_specs])
-                    spec.y_true = y_true
-
-                return spec
-            case _: raise ValueError("OutKind must be a concept spec kind to be batched into ConceptOutputSpec")
+        return violated, severity
 
 
 class Confidence(ConceptOutputSpec):
@@ -65,7 +28,7 @@ class Confidence(ConceptOutputSpec):
         threshold: Tensor,
     ):
         """
-        ### Params
+        Args:
         - `num_elements`: The number of concepts.
         - `y_true` [B]: The concepts we want to be affected by thresholds.
         - `threshold` [B]: The confidence thresholds of each individual concept.
@@ -74,11 +37,13 @@ class Confidence(ConceptOutputSpec):
             raise ValueError("Confidence threshold must be in [0, 1]")
 
         self.num_elements = num_elements
+        self.y_true = y_true
         self.threshold = threshold
 
-        super().__init__(OutKind.CONCEPT_CONFIDENCE, y_true=y_true)
+    def get_kind(self) -> str:
+        return "CONFIDENCE"
 
-    def severity(self, y: Tensor, rows: Optional[Tensor] = None) -> Tensor:
+    def severity(self, y: Tensor, rows: Tensor | None = None) -> Tensor:
         assert self.y_true is not None
 
         if rows == None:
@@ -94,11 +59,20 @@ class Confidence(ConceptOutputSpec):
 
         return (lb - y).max(dim=1, keepdim=False).values
 
+    @classmethod
+    def batch(cls, out_specs: Sequence[Self], out_kind: str) -> Self:
+        num_elements = out_specs[0].num_elements
+        
+        y_true: Tensor = torch.cat([cast(Tensor, o.y_true) for o in out_specs])
+        threshold = torch.cat([o.threshold for o in out_specs])
+        
+        return cls(num_elements, y_true, threshold)
+
 
 class TopN(ConceptOutputSpec):
     def __init__(self, num_elements: int, y_true: Tensor, threshold: Tensor):
         """
-        ### Params
+        Args:
         - `num_elements`: The number of concepts.
         - `y_true` [B]: The "correct" concepts we want to be in the top-N.
         - `threshold` [B]: The rank we want our correct concepts to be within.
@@ -107,11 +81,13 @@ class TopN(ConceptOutputSpec):
             raise ValueError("`top_n` must be smaller than number of elements")
 
         self.num_elements = num_elements
+        self.y_true = y_true
         self.threshold = threshold
 
-        super().__init__(OutKind.CONCEPT_TOP_N, y_true=y_true)
+    def get_kind(self) -> str:
+        return "TOP_N"
 
-    def severity(self, y: Tensor, rows: Optional[Tensor] = None) -> Tensor:
+    def severity(self, y: Tensor, rows: Tensor | None = None) -> Tensor:
         """
         Formula for the severity of a `TopRanked` violation:
 
@@ -139,6 +115,16 @@ class TopN(ConceptOutputSpec):
         y_true_confidences = y.gather(dim=1, index=y_true.unsqueeze(dim=1))
         return (sorted - y_true_confidences).squeeze(dim=1)
 
+    @classmethod
+    def batch(cls, out_specs: Sequence[Self], out_kind: str) -> Self:
+        num_elements = out_specs[0].num_elements
+        assert all(o.num_elements == num_elements for o in out_specs), "Cannot batch top-N specs that have different numbers of elements"
+        
+        y_true: Tensor = torch.cat([cast(Tensor, o.y_true) for o in out_specs])
+        threshold = torch.cat([o.threshold for o in out_specs])
+        
+        return cls(num_elements, y_true, threshold)
+
 
 class TopInCategory(ConceptOutputSpec):
     def __init__(
@@ -149,7 +135,7 @@ class TopInCategory(ConceptOutputSpec):
             is_top: Tensor,
         ):
         """
-        ### Params
+        Args:
         - `num_elements`: The number of concepts in the dataset.
         - `category_indices`: A collection of lists, with each inner list representing all concepts
           to do with a certain category
@@ -165,9 +151,10 @@ class TopInCategory(ConceptOutputSpec):
         self.top_elements = top_elements
         self.is_top = is_top
 
-        super().__init__(OutKind.CONCEPT_TOP_IN_CATEGORY)
+    def get_kind(self) -> str:
+        return "TOP_IN_CATEGORY"
 
-    def severity(self, y: Tensor, rows: Optional[Tensor] = None) -> Tensor:
+    def severity(self, y: Tensor, rows: Tensor | None = None) -> Tensor:
         """
         Each category uses the Carlini-Wagner metric, and the results of all
         categories are then averaged using the arithmetic mean.
@@ -209,3 +196,50 @@ class TopInCategory(ConceptOutputSpec):
         num_categories = is_top.sum(dim=1)
         diff_sums = (difference * is_top).sum(dim=1)
         return diff_sums / num_categories
+
+    @classmethod
+    def batch(cls, out_specs: Sequence[Self], out_kind: str) -> Self:
+        num_elements = out_specs[0].num_elements
+        assert all(o.num_elements == num_elements for o in out_specs), "Cannot batch top-N specs that have different numbers of elements"
+
+        category_indices = out_specs[0].category_indices
+        assert all(o.category_indices == category_indices for o in out_specs), "Cannot batch top-N specs that have different numbers of elements"
+
+        top_elements = torch.cat([o.top_elements for o in out_specs])
+        is_top = torch.cat([o.is_top for o in out_specs])
+
+        spec = cls(num_elements, category_indices, top_elements, is_top)
+
+        # TODO: temporary, replace when we think up better way of setting up `y_true`
+        if out_specs[0].y_true is not None:
+            y_true: Tensor = torch.cat([cast(Tensor, o.y_true) for o in out_specs])
+            spec.y_true = y_true
+
+        return spec
+
+
+class CombinedOutputSpec(BaseOutputSpec[tuple[Tensor, Tensor]]):
+    def __init__(self, concept_spec: ConceptOutputSpec, class_spec: OutputSpec):
+        self.concept_spec = concept_spec
+        self.class_spec = class_spec
+
+    def get_kind(self) -> str:
+        return f"COMBINED_{self.concept_spec.get_kind()}_{self.class_spec.get_kind()}"
+
+    def severity(self, y: tuple[Tensor, Tensor], rows: Tensor | None = None) -> Tensor:
+        concept_preds, class_preds = y
+
+        concept_severity = self.concept_spec.severity(concept_preds, rows)
+        class_severity = self.class_spec.severity(class_preds, rows)
+
+        return torch.max(concept_severity, class_severity)
+
+    @classmethod
+    def batch(cls, out_specs: Sequence[Self], out_kind: str) -> Self:
+        concept_specs = [o.concept_spec for o in out_specs]
+        class_specs = [o.class_spec for o in out_specs]
+
+        return cls(
+            concept_specs[0].__class__.batch(concept_specs, out_kind),
+            OutputSpec.batch(class_specs, out_kind)
+        )

@@ -11,7 +11,7 @@ class ConceptInputSpec(InputSpec):
     
     def __init__(self, image: Tensor, saliency_map: Tensor, eps: float):
         """
-        ### Params
+        Args:
         - `image`: The image we want to generate an input spec for
         - `saliency_map`: Saliency map of the image for a specific concept, determines
           where we perturb

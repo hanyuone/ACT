@@ -32,8 +32,7 @@ import torch.nn as nn
 from typing import Dict, Any, List, Literal, Tuple, Optional
 
 # Import ACT components
-from act.front_end.concept.output_spec import ConceptOutputSpec
-from act.front_end.specs import InputSpec, OutputSpec, InKind, OutKind
+from act.front_end.specs import BaseOutputSpec, InputSpec, OutputSpec, InKind, OutKind
 from act.front_end.spec_creator_base import LabeledInputTensor, SpecTuple
 from act.front_end.verifiable_model import (
     InputLayer,
@@ -76,13 +75,13 @@ def _assert_same_center_shape(in_specs: List[InputSpec]) -> None:
         f"InputSpec.center shape mismatch: {[s.center.shape if s.center is not None else None for s in in_specs]}"
 
 
-def _merge_specs_to_batch(
+def _merge_specs_to_batch[O: BaseOutputSpec](
     lts: List[LabeledInputTensor],
     in_specs: List[InputSpec],
-    out_specs: List[OutputSpec],
+    out_specs: List[O],
     in_kind: InKind,
     out_kind: OutKind,
-) -> Tuple[LabeledInputTensor, InputSpec, OutputSpec]:
+) -> Tuple[LabeledInputTensor, InputSpec, O]:
     """
     Merge multiple single-sample specs into batched specs for efficient verification.
     
@@ -218,11 +217,7 @@ def _merge_specs_to_batch(
     else:
         batched_in = InputSpec(kind=in_kind, lb=lb, ub=ub, center=center, eps=eps)
 
-    if out_kind.is_concept():
-        batched_out = ConceptOutputSpec.batch(out_specs, out_kind)
-    else:
-        batched_out = OutputSpec.batch(out_specs, out_kind)
-    
+    batched_out = O.batch(out_specs, out_kind)
     return batched_lt, batched_in, batched_out
 
 

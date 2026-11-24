@@ -13,11 +13,12 @@
 #===---------------------------------------------------------------------===#
 
 from __future__ import annotations
+from abc import abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 import math
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional, Protocol, Self, TypeVar
 import torch
 
 ScalarTensor = torch.Tensor | float | int
@@ -406,6 +407,30 @@ def normalize_input_geometry(
     return geometry
 
 
+class BaseOutputSpec[T](Protocol):
+    """
+    A generic output spec class, designed for use with outputs not limited
+    to just one tensor.
+    """
+    @abstractmethod
+    def get_kind(self) -> str:
+        ...
+
+    @abstractmethod
+    def severity(self, y: T, rows: torch.Tensor | None = None) -> torch.Tensor:
+        ...
+
+    @abstractmethod
+    def violation(self, y: T, rows: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        ...
+
+    @classmethod
+    @abstractmethod
+    def batch(cls, out_specs: Sequence[Self], out_kind: str) -> Self:
+        """Combine specs of this concrete type into one batched spec."""
+        ...
+
+
 class OutKind(str, Enum):
     LINEAR_LE   = "LINEAR_LE"
     TOP1_ROBUST = "TOP1_ROBUST"
@@ -427,7 +452,7 @@ class OutKind(str, Enum):
 
 
 @dataclass
-class OutputSpec:
+class OutputSpec(BaseOutputSpec[torch.Tensor]):
     SLICEABLE_PARAM_KEYS: ClassVar[tuple[str, ...]] = (
         "y_true", "margin", "c", "d", "lb", "ub", "C", "thresholds"
     )
@@ -853,6 +878,9 @@ class OutputSpec:
             d_rows = d
         return slack - d_rows
 
+    def get_kind(self) -> str:
+        return self.kind
+
     def severity(
         self,
         y: torch.Tensor,
@@ -1024,8 +1052,8 @@ class OutputSpec:
         )
         return violated, severity
 
-    @staticmethod
-    def batch(out_specs: Sequence["OutputSpec"], out_kind: OutKind) -> "OutputSpec":
+    @classmethod
+    def batch(cls, out_specs: Sequence[Self], out_kind: str) -> Self:
         # Merge output specs: y_true and margin
         y_true = torch.cat([s.y_true for s in out_specs], dim=0) if all(s.y_true is not None for s in out_specs) else None
         # Use default dtype - device is automatically handled by device_manager
@@ -1049,9 +1077,9 @@ class OutputSpec:
                     and s.c.detach().cpu().reshape(-1).numpy().tobytes() == c_ref
                     for s in out_specs
                 ), f"{out_kind.name}: grouped lanes must share one c matrix"
-
+    
             d_all = [s.d for s in out_specs]
-
+    
             if (
                 len(d_all) > 1
                 and all(t is not None for t in d_all)
@@ -1065,4 +1093,5 @@ class OutputSpec:
             c_vec, d_vec = _batch_attr('c'), _batch_attr('d')
     
         out_lb, out_ub = _batch_attr('lb'), _batch_attr('ub')
-        return OutputSpec(kind=out_kind, y_true=y_true, margin=margins, c=c_vec, d=d_vec, lb=out_lb, ub=out_ub)
+        
+        return cls(kind=out_kind, y_true=y_true, margin=margins, c=c_vec, d=d_vec, lb=out_lb, ub=out_ub)
