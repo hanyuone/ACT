@@ -1,9 +1,16 @@
-from typing import Self, Sequence, cast
+from enum import Enum
+from typing import Any, Self, Sequence, cast
 
 from torch import Tensor
 import torch
 
-from act.front_end.specs import BaseOutputSpec, OutputSpec
+from act.front_end.specs import BaseOutputSpec, OutKind, OutputSpec
+
+
+class ConceptOutKind(str, Enum):
+    CONFIDENCE = "CONFIDENCE"
+    TOP_N = "TOP_N"
+    TOP_IN_CATEGORY = "TOP_IN_CATEGORY"
 
 
 class ConceptOutputSpec(BaseOutputSpec[Tensor]):
@@ -12,6 +19,21 @@ class ConceptOutputSpec(BaseOutputSpec[Tensor]):
         violated = severity > 0
 
         return violated, severity
+
+    def encode_linear(self, B: int, n_out: int, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
+        raise NotImplementedError()
+
+    @classmethod
+    def batch(cls, out_specs: Sequence[Self], out_kind: str) -> Self:
+        assert out_kind is ConceptOutKind
+
+        match out_kind:
+            case ConceptOutKind.CONFIDENCE:
+                return Confidence._batch(out_specs)
+            case ConceptOutKind.TOP_N:
+                return TopN._batch(out_specs)
+            case ConceptOutKind.TOP_IN_CATEGORY:
+                return TopInCategory._batch(out_specs)
 
 
 class Confidence(ConceptOutputSpec):
@@ -60,7 +82,7 @@ class Confidence(ConceptOutputSpec):
         return (lb - y).max(dim=1, keepdim=False).values
 
     @classmethod
-    def batch(cls, out_specs: Sequence[Self], out_kind: str) -> Self:
+    def _batch(cls, out_specs: Sequence[Self]) -> Self:
         num_elements = out_specs[0].num_elements
         
         y_true: Tensor = torch.cat([cast(Tensor, o.y_true) for o in out_specs])
@@ -116,7 +138,7 @@ class TopN(ConceptOutputSpec):
         return (sorted - y_true_confidences).squeeze(dim=1)
 
     @classmethod
-    def batch(cls, out_specs: Sequence[Self], out_kind: str) -> Self:
+    def _batch(cls, out_specs: Sequence[Self]) -> Self:
         num_elements = out_specs[0].num_elements
         assert all(o.num_elements == num_elements for o in out_specs), "Cannot batch top-N specs that have different numbers of elements"
         
@@ -198,7 +220,7 @@ class TopInCategory(ConceptOutputSpec):
         return diff_sums / num_categories
 
     @classmethod
-    def batch(cls, out_specs: Sequence[Self], out_kind: str) -> Self:
+    def _batch(cls, out_specs: Sequence[Self]) -> Self:
         num_elements = out_specs[0].num_elements
         assert all(o.num_elements == num_elements for o in out_specs), "Cannot batch top-N specs that have different numbers of elements"
 
@@ -224,7 +246,7 @@ class CombinedOutputSpec(BaseOutputSpec[tuple[Tensor, Tensor]]):
         self.class_spec = class_spec
 
     def get_kind(self) -> str:
-        return f"COMBINED_{self.concept_spec.get_kind()}_{self.class_spec.get_kind()}"
+        return f"COMBINED-{self.concept_spec.get_kind()}-{self.class_spec.get_kind()}"
 
     def severity(self, y: tuple[Tensor, Tensor], rows: Tensor | None = None) -> Tensor:
         concept_preds, class_preds = y
@@ -234,12 +256,30 @@ class CombinedOutputSpec(BaseOutputSpec[tuple[Tensor, Tensor]]):
 
         return torch.max(concept_severity, class_severity)
 
+    def violation(self, y: tuple[Tensor, Tensor], rows: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        severity = self.severity(y, rows)
+        violated = severity > 0
+        
+        return violated, severity
+
+    def encode_linear(self, B: int, n_out: int, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
+        raise NotImplementedError()
+
+    @staticmethod
+    def _get_child_out_kinds(out_kind: str) -> tuple[ConceptOutKind, OutKind] | None:
+        _, concept_out_kind, class_out_kind = out_kind.split("-")
+        return ConceptOutKind(concept_out_kind), OutKind(class_out_kind)
+
     @classmethod
     def batch(cls, out_specs: Sequence[Self], out_kind: str) -> Self:
         concept_specs = [o.concept_spec for o in out_specs]
         class_specs = [o.class_spec for o in out_specs]
 
+        out_kinds = cls._get_child_out_kinds(out_kind)
+        assert out_kinds is not None
+        concept_out_kind, class_out_kind = out_kinds
+
         return cls(
-            concept_specs[0].__class__.batch(concept_specs, out_kind),
-            OutputSpec.batch(class_specs, out_kind)
+            ConceptOutputSpec.batch(concept_specs, concept_out_kind),
+            OutputSpec.batch(class_specs, class_out_kind)
         )

@@ -424,6 +424,16 @@ class BaseOutputSpec[T](Protocol):
     def violation(self, y: T, rows: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         ...
 
+    @abstractmethod
+    def encode_linear(
+        self,
+        B: int,
+        n_out: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> dict[str, Any]:
+        ...
+
     @classmethod
     @abstractmethod
     def batch(cls, out_specs: Sequence[Self], out_kind: str) -> Self:
@@ -437,18 +447,6 @@ class OutKind(str, Enum):
     MARGIN_ROBUST = "MARGIN_ROBUST"
     RANGE = "RANGE"
     UNSAFE_LINEAR = "UNSAFE_LINEAR"
-
-    # Concept output spec kinds
-    CONCEPT_CONFIDENCE = "CONFIDENCE"
-    CONCEPT_TOP_N = "TOP_N"
-    CONCEPT_TOP_IN_CATEGORY = "TOP_IN_CATEGORY"
-
-    def is_concept(self) -> bool:
-        return self in [
-            OutKind.CONCEPT_CONFIDENCE,
-            OutKind.CONCEPT_TOP_N,
-            OutKind.CONCEPT_TOP_IN_CATEGORY
-        ]
 
 
 @dataclass
@@ -1054,6 +1052,8 @@ class OutputSpec(BaseOutputSpec[torch.Tensor]):
 
     @classmethod
     def batch(cls, out_specs: Sequence[Self], out_kind: str) -> Self:
+        assert out_kind is OutKind
+        
         # Merge output specs: y_true and margin
         y_true = torch.cat([s.y_true for s in out_specs], dim=0) if all(s.y_true is not None for s in out_specs) else None
         # Use default dtype - device is automatically handled by device_manager

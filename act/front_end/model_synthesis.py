@@ -80,7 +80,7 @@ def _merge_specs_to_batch[O: BaseOutputSpec](
     in_specs: List[InputSpec],
     out_specs: List[O],
     in_kind: InKind,
-    out_kind: OutKind,
+    out_kind: str,
 ) -> Tuple[LabeledInputTensor, InputSpec, O]:
     """
     Merge multiple single-sample specs into batched specs for efficient verification.
@@ -226,7 +226,7 @@ def _merge_specs_to_batch[O: BaseOutputSpec](
 # -----------------------------------------------------------------------------
 
 def _build_batched_model(
-    gkey: Tuple[str, str, "InKind", "OutKind"],
+    gkey: Tuple[str, str, "InKind", str],
     grouped_specs: List[Tuple["LabeledInputTensor", "InputSpec", "OutputSpec", str]],
     pytorch_model: nn.Module
 ) -> "VerifiableModel":
@@ -325,9 +325,9 @@ def synthesize_models_and_seeds_from_specs(
         for idx, (in_spec, out_spec) in enumerate(spec_pairs):
             lt = labeled_tensors[min(idx // sps if sps > 0 else 0, len(labeled_tensors) - 1)]
             cd_sig: Any = None
-            if out_spec.kind in (OutKind.UNSAFE_LINEAR, OutKind.LINEAR_LE) and out_spec.c is not None:
+            if out_spec.get_kind() in (OutKind.UNSAFE_LINEAR, OutKind.LINEAR_LE) and out_spec.c is not None:
                 merge_d = (
-                    cd_group == "shape" and out_spec.kind is OutKind.UNSAFE_LINEAR
+                    cd_group == "shape" and out_spec.get_kind() is OutKind.UNSAFE_LINEAR
                 )
                 if out_spec.d is None:
                     d_sig: Any = None
@@ -340,7 +340,7 @@ def synthesize_models_and_seeds_from_specs(
                     out_spec.c.detach().cpu().reshape(-1).numpy().tobytes(),
                     d_sig,
                 )
-            gkey = (data_source, mid, in_spec.kind, out_spec.kind, cd_sig)
+            gkey = (data_source, mid, in_spec.kind, out_spec.get_kind(), cd_sig)
             if _is_fixed_model_input(lt, in_spec):
                 gkey += (result_index, idx)
             groups[gkey].append((lt, in_spec, out_spec, f"{data_source}:{model_name}:s{idx}"))

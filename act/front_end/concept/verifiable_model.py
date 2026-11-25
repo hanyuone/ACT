@@ -10,12 +10,11 @@ class ConceptVerifiableModel(VerifiableModel):
         input_layer: InputLayer,
         input_spec: InputSpecLayer,
         model: nn.Module,
-        concept_output_spec: OutputSpecLayer,
-        class_output_spec: OutputSpecLayer
+        output_spec: OutputSpecLayer,
     ):
         """
-        ### Arguments
-        - `model`: concept-based model, returns (class_preds, concept_preds)
+        Args:
+        - `model`: concept-based model, returns `(concept_preds, class_preds)`
         """
         self.input_layer = input_layer
         self.input_spec = input_spec
