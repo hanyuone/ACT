@@ -1,8 +1,9 @@
+from collections.abc import Sequence
 from enum import Enum
-from typing import Any, Self, Sequence, cast
+from typing import Any, Self, cast
 
-from torch import Tensor
 import torch
+from torch import Tensor
 
 from act.front_end.specs import BaseOutputSpec, OutKind, OutputSpec
 
@@ -20,7 +21,9 @@ class ConceptOutputSpec(BaseOutputSpec[Tensor]):
 
         return violated, severity
 
-    def encode_linear(self, B: int, n_out: int, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
+    def encode_linear(
+        self, B: int, n_out: int, device: torch.device, dtype: torch.dtype
+    ) -> dict[str, Any]:
         raise NotImplementedError()
 
     @classmethod
@@ -34,6 +37,8 @@ class ConceptOutputSpec(BaseOutputSpec[Tensor]):
                 return TopN._batch(out_specs)
             case ConceptOutKind.TOP_IN_CATEGORY:
                 return TopInCategory._batch(out_specs)
+            case _:
+                raise ValueError("Should not be possible")
 
 
 class Confidence(ConceptOutputSpec):
@@ -41,6 +46,7 @@ class Confidence(ConceptOutputSpec):
     Defines a specification that only "passes" when certain concepts we specify exist,
     with existence defined by a confidence value between 0 and 1.
     """
+
     concepts: Tensor
 
     def __init__(
@@ -87,10 +93,10 @@ class Confidence(ConceptOutputSpec):
     @classmethod
     def _batch(cls, out_specs: Sequence[Self]) -> Self:
         num_elements = out_specs[0].num_elements
-        
+
         y_true: Tensor = torch.cat([cast(Tensor, o.y_true) for o in out_specs])
         threshold = torch.cat([o.threshold for o in out_specs])
-        
+
         return cls(num_elements, y_true, threshold)
 
 
@@ -137,7 +143,9 @@ class TopN(ConceptOutputSpec):
             threshold = self.threshold[rows]
 
         # 1. Get `top_n`-th item from `y`
-        sorted = y.sort(dim=1, descending=True)[0].gather(dim=1, index=threshold.unsqueeze(dim=1))
+        sorted = y.sort(dim=1, descending=True)[0].gather(
+            dim=1, index=threshold.unsqueeze(dim=1)
+        )
 
         # 2. Calculate difference
         y_true_confidences = y.gather(dim=1, index=y_true.unsqueeze(dim=1))
@@ -146,22 +154,24 @@ class TopN(ConceptOutputSpec):
     @classmethod
     def _batch(cls, out_specs: Sequence[Self]) -> Self:
         num_elements = out_specs[0].num_elements
-        assert all(o.num_elements == num_elements for o in out_specs), "Cannot batch top-N specs that have different numbers of elements"
-        
+        assert all(o.num_elements == num_elements for o in out_specs), (
+            "Cannot batch top-N specs that have different numbers of elements"
+        )
+
         y_true: Tensor = torch.cat([cast(Tensor, o.y_true) for o in out_specs])
         threshold = torch.cat([o.threshold for o in out_specs])
-        
+
         return cls(num_elements, y_true, threshold)
 
 
 class TopInCategory(ConceptOutputSpec):
     def __init__(
-            self,
-            num_elements: int,
-            category_indices: list[list[int]],
-            top_elements: Tensor,
-            is_top: Tensor,
-        ):
+        self,
+        num_elements: int,
+        category_indices: list[list[int]],
+        top_elements: Tensor,
+        is_top: Tensor,
+    ):
         """
         Args:
         - `num_elements`: The number of concepts in the dataset.
@@ -172,7 +182,9 @@ class TopInCategory(ConceptOutputSpec):
         - `is_top` [B, Cat]: A bool tensor where each individual tensor contains which
           categories are actually counted as the top.
         """
-        assert len(category_indices) == top_elements.shape[1], "Each category must have a top element"
+        assert len(category_indices) == top_elements.shape[1], (
+            "Each category must have a top element"
+        )
 
         self.num_elements = num_elements
         self.category_indices = category_indices
@@ -234,10 +246,14 @@ class TopInCategory(ConceptOutputSpec):
     @classmethod
     def _batch(cls, out_specs: Sequence[Self]) -> Self:
         num_elements = out_specs[0].num_elements
-        assert all(o.num_elements == num_elements for o in out_specs), "Cannot batch top-N specs that have different numbers of elements"
+        assert all(o.num_elements == num_elements for o in out_specs), (
+            "Cannot batch top-N specs that have different numbers of elements"
+        )
 
         category_indices = out_specs[0].category_indices
-        assert all(o.category_indices == category_indices for o in out_specs), "Cannot batch top-N specs that have different numbers of elements"
+        assert all(o.category_indices == category_indices for o in out_specs), (
+            "Cannot batch top-N specs that have different numbers of elements"
+        )
 
         top_elements = torch.cat([o.top_elements for o in out_specs])
         is_top = torch.cat([o.is_top for o in out_specs])
@@ -280,13 +296,17 @@ class CombinedOutputSpec(BaseOutputSpec[tuple[Tensor, Tensor]]):
 
         return torch.max(concept_severity, class_severity)
 
-    def violation(self, y: tuple[Tensor, Tensor], rows: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def violation(
+        self, y: tuple[Tensor, Tensor], rows: Tensor | None = None
+    ) -> tuple[Tensor, Tensor]:
         severity = self.severity(y, rows)
         violated = severity > 0
 
         return violated, severity
 
-    def encode_linear(self, B: int, n_out: int, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
+    def encode_linear(
+        self, B: int, n_out: int, device: torch.device, dtype: torch.dtype
+    ) -> dict[str, Any]:
         raise NotImplementedError()
 
     @staticmethod
@@ -305,5 +325,5 @@ class CombinedOutputSpec(BaseOutputSpec[tuple[Tensor, Tensor]]):
 
         return cls(
             ConceptOutputSpec.batch(concept_specs, concept_out_kind),
-            OutputSpec.batch(class_specs, class_out_kind)
+            OutputSpec.batch(class_specs, class_out_kind),
         )

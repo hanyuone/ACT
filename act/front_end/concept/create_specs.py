@@ -2,6 +2,9 @@ import logging
 from collections import OrderedDict
 
 import torch
+from torch import Tensor, nn
+from torch.utils.data import DataLoader
+
 from act.front_end.concept.input_spec import ConceptInputSpec
 from act.front_end.concept.output_spec import (
     ConceptOutKind,
@@ -17,8 +20,6 @@ from act.front_end.spec_creator_base import (
 )
 from act.front_end.specs import OutKind, OutputSpec
 from act.util.device_manager import get_default_device
-from torch import Tensor, nn
-from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
 

@@ -6,4 +6,3 @@ class ConceptVerifiableModel(VerifiableModel[CombinedOutputSpec]):
     """
     A wrapper for `VerifiableModel` that contains type annotations for each layer.
     """
-    pass

@@ -9,30 +9,32 @@ License: AGPLv3+
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple, Any, cast
+
+import json
 import os
 import time
-import json
-import torch
-import torch.nn as nn
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, cast
 
-from act.front_end.specs import InputSpec, OutputSpec
+import torch
+from torch import nn
+
 from act.front_end.spec_creator_base import LabeledInputTensor
+from act.front_end.specs import InputSpec, OutputSpec
 from act.front_end.verifiable_model import (
     InputLayer,
     InputSpecLayer,
     OutputSpecLayer,
     VerifiableModel,
 )
-from act.pipeline.fuzzing.mutations import MutationEngine
-from act.pipeline.fuzzing.coverage import CoverageTracker
-from act.pipeline.fuzzing.corpus import SeedCorpus, FuzzingSeed
 from act.pipeline.fuzzing.checker import BaseCE, BasePropertyChecker, PropertyChecker
-from act.util.path_config import get_pipeline_log_dir
+from act.pipeline.fuzzing.corpus import FuzzingSeed, SeedCorpus
+from act.pipeline.fuzzing.coverage import CoverageTracker
+from act.pipeline.fuzzing.mutations import MutationEngine
 from act.util.device_manager import get_default_device
 from act.util.format_utils import rule
+from act.util.path_config import get_pipeline_log_dir
 
 
 @dataclass
@@ -237,9 +239,9 @@ class BaseFuzzer:
     def __init__(
         self,
         wrapped_model: nn.Module,
-        initial_seeds: List[LabeledInputTensor],
+        initial_seeds: list[LabeledInputTensor],
         property_checker: BasePropertyChecker,
-        config: Optional[FuzzingConfig] = None,
+        config: FuzzingConfig | None = None,
     ):
         """
         Initialize the shared fuzzer engine.
@@ -603,8 +605,8 @@ class ACTFuzzer(BaseFuzzer):
     def __init__(
         self,
         wrapped_model: nn.Module,
-        initial_seeds: List[LabeledInputTensor],
-        config: Optional[FuzzingConfig] = None,
+        initial_seeds: list[LabeledInputTensor],
+        config: FuzzingConfig | None = None,
     ):
         self.output_spec = cast(OutputSpec, self._extract_spec(OutputSpecLayer))
 

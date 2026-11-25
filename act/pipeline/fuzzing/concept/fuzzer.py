@@ -14,9 +14,9 @@ class ConceptFuzzer(BaseFuzzer):
     ):
         output_spec = model.output_spec.spec
         assert output_spec is CombinedOutputSpec
-        
+
         property_checker = ConceptPropertyChecker(output_spec)
-        
+
         super().__init__(
             wrapped_model=model,
             initial_seeds=initial_seeds,

@@ -1,5 +1,5 @@
-from torch import Tensor
 import torch
+from torch import Tensor
 
 from act.front_end.specs import InKind, InputSpec
 
@@ -8,7 +8,7 @@ class ConceptInputSpec(InputSpec):
     @staticmethod
     def invert_mask(mask: Tensor) -> Tensor:
         return 1 - mask
-    
+
     def __init__(self, image: Tensor, saliency_map: Tensor, eps: float):
         """
         Args:
@@ -27,9 +27,5 @@ class ConceptInputSpec(InputSpec):
         self.ub = torch.clamp(image + change, 0.0, 1.0)
 
         super().__init__(
-            kind=InKind.BOX,
-            lb=self.lb,
-            ub=self.ub,
-            center=self.center,
-            eps=self.eps
+            kind=InKind.BOX, lb=self.lb, ub=self.ub, center=self.center, eps=self.eps
         )
