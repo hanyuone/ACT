@@ -19,7 +19,7 @@ import time
 import torch
 
 from act.pipeline.fuzzing.trace_storage import create_storage, TraceStorage
-from act.pipeline.fuzzing.checker import Counterexample
+from act.pipeline.fuzzing.checker import BaseCE
 from act.util.format_utils import rule
 
 
@@ -127,7 +127,7 @@ class ExecutionTracer:
         iteration: int,
         timestamp: float,
         mutation_strategy: str,
-        violation: Optional[Counterexample],
+        violation: Optional[BaseCE],
         coverage: float,
         coverage_delta: float,
         energy: float,

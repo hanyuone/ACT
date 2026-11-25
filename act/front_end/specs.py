@@ -407,7 +407,7 @@ def normalize_input_geometry(
     return geometry
 
 
-class BaseOutputSpec[T](Protocol):
+class BaseOutputSpec[Y](Protocol):
     """
     A generic output spec class, designed for use with outputs not limited
     to just one tensor.
@@ -417,11 +417,15 @@ class BaseOutputSpec[T](Protocol):
         ...
 
     @abstractmethod
-    def severity(self, y: T, rows: torch.Tensor | None = None) -> torch.Tensor:
+    def get_y_true(self) -> Y | None:
         ...
 
     @abstractmethod
-    def violation(self, y: T, rows: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def severity(self, y: Y, rows: torch.Tensor | None = None) -> torch.Tensor:
+        ...
+
+    @abstractmethod
+    def violation(self, y: Y, rows: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         ...
 
     @abstractmethod
@@ -879,6 +883,9 @@ class OutputSpec(BaseOutputSpec[torch.Tensor]):
     def get_kind(self) -> str:
         return self.kind
 
+    def get_y_true(self) -> torch.Tensor | None:
+        return self.y_true
+
     def severity(
         self,
         y: torch.Tensor,
@@ -1053,7 +1060,7 @@ class OutputSpec(BaseOutputSpec[torch.Tensor]):
     @classmethod
     def batch(cls, out_specs: Sequence[Self], out_kind: str) -> Self:
         assert out_kind is OutKind
-        
+
         # Merge output specs: y_true and margin
         y_true = torch.cat([s.y_true for s in out_specs], dim=0) if all(s.y_true is not None for s in out_specs) else None
         # Use default dtype - device is automatically handled by device_manager

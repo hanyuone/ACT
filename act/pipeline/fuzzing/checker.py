@@ -10,7 +10,7 @@ License: AGPLv3+
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TYPE_CHECKING, Optional, List, Tuple, cast
+from typing import Any, TYPE_CHECKING, Optional, List, Protocol, Self, Sequence, Tuple, cast
 import time
 import torch
 
@@ -23,8 +23,24 @@ if TYPE_CHECKING:
 INPUT_FEASIBILITY_ATTR = "_act_input_satisfied_per_sample"
 
 
+class BaseCE(Protocol):
+    def summary(self) -> str:
+        ...
+        
+    def to_dict(self) -> dict[str, object]:
+        ...
+
+    def save(self, path: str | Path) -> None:
+        """Save counterexample to disk."""
+        torch.save(self.to_dict(), path)
+
+    @classmethod
+    def load(cls, path: str | Path) -> Self:
+        ...
+
+
 @dataclass
-class Counterexample:
+class Counterexample(BaseCE):
     """
     Counterexample with full details.
     
@@ -80,11 +96,12 @@ class Counterexample:
         """Save counterexample to disk."""
         torch.save(self.to_dict(), path)
 
-    @staticmethod
-    def load(path: str | Path) -> Counterexample:
+    @classmethod
+    def load(cls, path: str | Path) -> Counterexample:
         """Load counterexample from disk."""
         data = cast(dict[str, Any], torch.load(path, weights_only=True))
-        return Counterexample(
+
+        return cls(
             input=data["input"],
             output=data["output"],
             seed_input=data["seed_input"],
@@ -100,7 +117,17 @@ class Counterexample:
 # Property Checking
 # =============================================================================
 
-class PropertyChecker:
+class BasePropertyChecker[T]:
+    def check(
+        self,
+        inputs: torch.Tensor,
+        outputs: T,
+        seeds: FuzzingSeed
+    ) -> tuple[torch.Tensor, Sequence[BaseCE]]:
+        ...
+
+
+class PropertyChecker(BasePropertyChecker[torch.Tensor]):
     """
     Vectorized property checker for violation detection.
     
@@ -126,8 +153,8 @@ class PropertyChecker:
         self,
         inputs: torch.Tensor,
         outputs: torch.Tensor,
-        seeds: 'FuzzingSeed'
-    ) -> Tuple[torch.Tensor, List[Counterexample]]:
+        seeds: FuzzingSeed
+    ) -> tuple[torch.Tensor, list[Counterexample]]:
         """
         Check B samples for violations in parallel.
         
@@ -178,7 +205,7 @@ class PropertyChecker:
         """Flattened y_true labels, or None when the spec kind carries no label."""
         assert self.spec is not None
 
-        if self.spec.kind not in (OutKind.TOP1_ROBUST, OutKind.MARGIN_ROBUST, OutKind.CONCEPT_CONFIDENCE, OutKind.CONCEPT_TOP_N, OutKind.CONCEPT_TOP_IN_CATEGORY):
+        if self.spec.kind not in (OutKind.TOP1_ROBUST, OutKind.MARGIN_ROBUST):
             return None
         
         if self.spec.y_true is None:

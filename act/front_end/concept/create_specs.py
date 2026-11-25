@@ -4,6 +4,8 @@ from collections import OrderedDict
 import torch
 from act.front_end.concept.input_spec import ConceptInputSpec
 from act.front_end.concept.output_spec import (
+    ConceptOutKind,
+    ConceptOutputSpec,
     Confidence,
     TopInCategory,
     TopN,
@@ -29,7 +31,7 @@ class ConceptSpecCreator(BaseSpecCreator):
     # TODO: remove function once YAML integration implemented
     def __init__(
         self,
-        spec_kinds: list[OutKind],
+        concept_spec_kinds: list[ConceptOutKind],
         epsilons: list[float],
         # Output spec type-specific
         confidence_threshold: float = 0.95,
@@ -37,25 +39,22 @@ class ConceptSpecCreator(BaseSpecCreator):
         categories: list[list[int]] = [],
     ):
         """
-        ### Params
-        - `spec_kinds`: A list of specification types to generate when creating
+        Args:
+        - `concept_spec_kinds`: A list of specification types to generate when creating
           specs. Must be all concept-level or all class-level.
         - `epsilons`: List of epsilon values for input-spec mask perturbations.
+        - `confidence_threshold` (`CONFIDENCE` only): The confidence value that a concept
+          has to have to pass.
+        - `ranking_threshold` (`TOP_N` only): The rank that a concept has to be above to pass.
+        - `categories` (`TOP_IN_CATEGORY` only): A list of disjoint sets of concepts, with
+          each set being a "category" that all categories within belongs to.
 
         ### Errors
         This function errors if `spec_kinds` are not all concept-level or all class-level.
         """
         super().__init__()
 
-        assert len(spec_kinds) > 0, "Number of spec kinds cannot be empty"
-
-        is_concept = [st.is_concept() for st in spec_kinds]
-        assert all(i == is_concept[0] for i in is_concept), (
-            "All spec kinds must be concept- or class-level"
-        )
-
-        self.is_concept_level = is_concept[0]
-        self.spec_types = spec_kinds
+        self.spec_types = concept_spec_kinds
 
         self.epsilons = epsilons
 
@@ -75,50 +74,48 @@ class ConceptSpecCreator(BaseSpecCreator):
 
     def _create_output_specs(
         self, num_elements: int, label: Tensor
-    ) -> list[OutputSpec]:
+    ) -> list[tuple[ConceptOutputSpec, OutputSpec]]:
         """
-        ### Params
+        Args:
         - `label`: [batch_size]
         """
-        output_specs: list[OutputSpec] = []
+        concept_output_specs: list[ConceptOutputSpec] = []
+        class_output_specs: list[OutputSpec] = []
 
-        if self.is_concept_level:
-            for spec_type in self.spec_types:
-                match spec_type:
-                    case OutKind.CONCEPT_CONFIDENCE:
-                        threshold = torch.tensor([self.confidence_threshold])
-                        output_specs.append(Confidence(num_elements, label, threshold))
-                    case OutKind.CONCEPT_TOP_N:
-                        threshold = torch.tensor([self.ranking_threshold])
-                        output_specs.append(TopN(num_elements, label, threshold))
-                    case OutKind.CONCEPT_TOP_IN_CATEGORY:
-                        num_categories = len(self.categories)
+        for spec_type in self.spec_types:
+            match spec_type:
+                case ConceptOutKind.CONFIDENCE:
+                    threshold = torch.tensor([self.confidence_threshold])
+                    concept_output_specs.append(Confidence(num_elements, label, threshold))
+                case ConceptOutKind.TOP_N:
+                    threshold = torch.tensor([self.ranking_threshold])
+                    concept_output_specs.append(TopN(num_elements, label, threshold))
+                case ConceptOutKind.TOP_IN_CATEGORY:
+                    num_categories = len(self.categories)
 
-                        top_elements = torch.zeros((1, num_categories), dtype=torch.int)
-                        is_top = torch.zeros((1, num_categories), dtype=torch.bool)
+                    top_elements = torch.zeros((1, num_categories), dtype=torch.int)
+                    is_top = torch.zeros((1, num_categories), dtype=torch.bool)
 
-                        category_index = [
-                            label.item() in self.categories[i]
-                            for i in range(len(self.categories))
-                        ].index(True)
+                    category_index = [
+                        label.item() in self.categories[i]
+                        for i in range(len(self.categories))
+                    ].index(True)
 
-                        top_elements[0, category_index] = label.item()
-                        is_top[0, category_index] = True
+                    top_elements[0, category_index] = label.item()
+                    is_top[0, category_index] = True
 
-                        top_in_category = TopInCategory(
-                            num_elements, self.categories, top_elements, is_top
-                        )
-                        # Manually set `top_in_category` for now
-                        top_in_category.y_true = label
+                    top_in_category = TopInCategory(
+                        num_elements, self.categories, top_elements, is_top
+                    )
+                    # Manually set `top_in_category` for now
+                    top_in_category.y_true = label
 
-                        output_specs.append(top_in_category)
-        else:
-            for spec_type in self.spec_types:
-                match spec_type:
-                    case OutKind.TOP1_ROBUST:
-                        output_specs.append(OutputSpec(kind=spec_type, y_true=label))
+                    concept_output_specs.append(top_in_category)
 
-        return output_specs
+        # Currently only supporting TOP1_ROBUST as class spec
+        class_output_specs.append(OutputSpec(kind=OutKind.TOP1_ROBUST, y_true=label))
+
+        return [(con, cls) for con in concept_output_specs for cls in class_output_specs]
 
     def _dataset_model_spec(
         self,
@@ -149,7 +146,7 @@ class ConceptSpecCreator(BaseSpecCreator):
             input_specs = self._create_input_specs(images, masks)
             output_specs = self._create_output_specs(num_elements, targets)
 
-            pairs = self._create_spec_combinations(input_specs, output_specs)
+            pairs = [(i, o[0], o[1]) for i in input_specs for o in output_specs]
             spec_pairs.extend(pairs)
 
         if not spec_pairs:
@@ -171,7 +168,7 @@ class ConceptSpecCreator(BaseSpecCreator):
         concept-level or class-level output specs, which can be specified in the
         `spec_types` provided.
 
-        # Arguments
+        Args:
         - `datasets`: A list of datasets with output `(image, mask, labels)`. If generating
           concept-level specs, provide *concept* ground-truth labels, otherwise provide
           *class* ground-truth labels.

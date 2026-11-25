@@ -29,7 +29,7 @@ from act.front_end.verifiable_model import (
 from act.pipeline.fuzzing.mutations import MutationEngine
 from act.pipeline.fuzzing.coverage import CoverageTracker
 from act.pipeline.fuzzing.corpus import SeedCorpus, FuzzingSeed
-from act.pipeline.fuzzing.checker import Counterexample, PropertyChecker
+from act.pipeline.fuzzing.checker import BaseCE, BasePropertyChecker, PropertyChecker
 from act.util.path_config import get_pipeline_log_dir
 from act.util.device_manager import get_default_device
 from act.util.format_utils import rule
@@ -171,7 +171,7 @@ class FuzzingReport:
 
     total_iterations: int
     total_time: float
-    counterexamples: List[Counterexample]
+    counterexamples: List[BaseCE]
     neuron_coverage: float
     total_mutations: int
     seeds_explored: int
@@ -207,7 +207,7 @@ class FuzzingReport:
         print(f"✅ Report saved to {os.path.relpath(output_dir)}")
 
 
-class ACTFuzzer:
+class BaseFuzzer:
     """
     Inference-based whitebox fuzzer for neural network verification.
 
@@ -238,16 +238,19 @@ class ACTFuzzer:
         self,
         wrapped_model: nn.Module,
         initial_seeds: List[LabeledInputTensor],
+        property_checker: BasePropertyChecker,
         config: Optional[FuzzingConfig] = None,
     ):
         """
-        Initialize ACTFuzzer.
+        Initialize the shared fuzzer engine.
 
         Args:
             wrapped_model: VerifiableModel from model_synthesis.
                           Contains InputSpecLayer and OutputSpecLayer with batched specs
                           sized for N VNNLib instances.
             initial_seeds: List of LabeledInputTensor from spec creators
+            property_checker: Checker implementing ``check(inputs, outputs, seeds)``
+                and returning a per-lane violation mask with counterexamples.
             config: Fuzzing configuration (uses from_yaml() defaults if None)
 
         Initialization Steps:
@@ -311,12 +314,15 @@ class ACTFuzzer:
             pgd_restarts=self.config.pgd_restarts,
             pgd_restarts_binarized=self.config.pgd_restarts_binarized,
         )
+
         self.coverage_tracker = CoverageTracker(
             model=self.model,
             threshold=self.config.activation_threshold,
             strategy=self.config.coverage_strategy,
         )
-        self.property_checker = PropertyChecker(self.output_spec)
+
+        self.property_checker = property_checker
+
         self.seed_corpus = SeedCorpus(
             initial_seeds=initial_seeds, strategy=self.config.seed_selection_strategy
         )
@@ -336,13 +342,13 @@ class ACTFuzzer:
             if self.config.trace_output is not None:
                 trace_output = self.config.trace_output
             else:
-                if not hasattr(ACTFuzzer, "_trace_counter"):
-                    ACTFuzzer._trace_counter = 0
+                if not hasattr(BaseFuzzer, "_trace_counter"):
+                    BaseFuzzer._trace_counter = 0
                 ext = self._get_trace_ext()
                 trace_output = (
-                    self.config.output_dir / f"traces_{ACTFuzzer._trace_counter}.{ext}"
+                    self.config.output_dir / f"traces_{BaseFuzzer._trace_counter}.{ext}"
                 )
-                ACTFuzzer._trace_counter += 1
+                BaseFuzzer._trace_counter += 1
 
             self.tracer = ExecutionTracer(
                 level=self.config.trace_level,
@@ -360,7 +366,7 @@ class ACTFuzzer:
             self.tracer = None  # No overhead when disabled
 
         # Statistics
-        self.counterexamples: List[Counterexample] = []
+        self.counterexamples: List[BaseCE] = []
         self.iterations = 0
         self.start_time = 0.0
         self.never_activated_neurons: List[Tuple[str, int]] = []
@@ -590,6 +596,24 @@ class ACTFuzzer:
 
         return report
 
+
+class ACTFuzzer(BaseFuzzer):
+    """Fuzzer configured with ACT's standard OutputSpec property checker."""
+
+    def __init__(
+        self,
+        wrapped_model: nn.Module,
+        initial_seeds: List[LabeledInputTensor],
+        config: Optional[FuzzingConfig] = None,
+    ):
+        self.output_spec = cast(OutputSpec, self._extract_spec(OutputSpecLayer))
+
+        super().__init__(
+            wrapped_model=wrapped_model,
+            initial_seeds=initial_seeds,
+            config=config,
+            property_checker=PropertyChecker(self.output_spec),
+        )
 
 def pgd_preattack(wrapped_model, seeds, budget, scale=0.5):
     """Anisotropic-PGD pre-attack (the FALSIFY path of the VNN-COMP runner);

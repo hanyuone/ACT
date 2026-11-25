@@ -86,7 +86,7 @@ from act.back_end.layer_schema import LayerKind, REGISTRY
 from act.back_end.layer_util import create_layer
 
 
-class VerifiableModel(nn.Module):
+class VerifiableModel[O: BaseOutputSpec](nn.Module):
     """
     verification wrapper for PyTorch models.
     
@@ -118,7 +118,7 @@ class VerifiableModel(nn.Module):
     # Class-level strict mode setting (shared across all instances)
     _strict_mode: bool = False
     
-    def __init__(self, *, input_layer, input_spec, model, output_spec):
+    def __init__(self, *, input_layer: InputLayer, input_spec: InputSpecLayer, model: nn.Module, output_spec: OutputSpecLayer[O]):
         super().__init__()
         self.input_layer = input_layer
         self.input_spec = input_spec

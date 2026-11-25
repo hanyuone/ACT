@@ -65,6 +65,9 @@ class Confidence(ConceptOutputSpec):
     def get_kind(self) -> str:
         return "CONFIDENCE"
 
+    def get_y_true(self) -> Tensor | None:
+        return self.y_true
+
     def severity(self, y: Tensor, rows: Tensor | None = None) -> Tensor:
         assert self.y_true is not None
 
@@ -108,6 +111,9 @@ class TopN(ConceptOutputSpec):
 
     def get_kind(self) -> str:
         return "TOP_N"
+
+    def get_y_true(self) -> Tensor | None:
+        return self.y_true
 
     def severity(self, y: Tensor, rows: Tensor | None = None) -> Tensor:
         """
@@ -173,8 +179,14 @@ class TopInCategory(ConceptOutputSpec):
         self.top_elements = top_elements
         self.is_top = is_top
 
+        # NOTE: strictly speaking, `TOP_IN_CATEGORY` does not have one true value
+        self.y_true = None
+
     def get_kind(self) -> str:
         return "TOP_IN_CATEGORY"
+
+    def get_y_true(self) -> Tensor | None:
+        return self.y_true
 
     def severity(self, y: Tensor, rows: Tensor | None = None) -> Tensor:
         """
@@ -248,6 +260,18 @@ class CombinedOutputSpec(BaseOutputSpec[tuple[Tensor, Tensor]]):
     def get_kind(self) -> str:
         return f"COMBINED-{self.concept_spec.get_kind()}-{self.class_spec.get_kind()}"
 
+    def get_y_true(self) -> tuple[Tensor, Tensor] | None:
+        concept_y_true = self.concept_spec.get_y_true()
+        class_y_true = self.class_spec.get_y_true()
+
+        if concept_y_true is None:
+            return None
+
+        if class_y_true is None:
+            return None
+
+        return concept_y_true, class_y_true
+
     def severity(self, y: tuple[Tensor, Tensor], rows: Tensor | None = None) -> Tensor:
         concept_preds, class_preds = y
 
@@ -259,7 +283,7 @@ class CombinedOutputSpec(BaseOutputSpec[tuple[Tensor, Tensor]]):
     def violation(self, y: tuple[Tensor, Tensor], rows: Tensor | None = None) -> tuple[Tensor, Tensor]:
         severity = self.severity(y, rows)
         violated = severity > 0
-        
+
         return violated, severity
 
     def encode_linear(self, B: int, n_out: int, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
