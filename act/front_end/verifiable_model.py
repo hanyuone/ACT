@@ -79,7 +79,8 @@ import torch.nn as nn
 from typing import Dict, Any, Optional, List, Tuple, Union
 
 # Import ACT components
-from act.front_end.specs import InputGeometry, InputSpec, OutputSpec, InKind, OutKind
+from act.front_end.concept.output_spec import CombinedOutputSpec, ConceptOutKind
+from act.front_end.specs import BaseOutputSpec, InputGeometry, InputSpec, OutputSpec, InKind, OutKind
 from act.front_end.spec_creator_base import LabeledInputTensor
 from act.back_end.layer_schema import LayerKind, REGISTRY
 from act.back_end.layer_util import create_layer
@@ -641,7 +642,7 @@ class InputSpecLayer(nn.Module):
             return (x, True, f"⚠️ INPUT: Unknown kind {self.kind}")
 
 
-class OutputSpecLayer(nn.Module):
+class OutputSpecLayer[O: BaseOutputSpec](nn.Module):
     """
     Batched output property checker (TOP1_ROBUST, MARGIN_ROBUST, etc.).
     
@@ -659,10 +660,10 @@ class OutputSpecLayer(nn.Module):
     Forward:
         y (N, ...) → (y, satisfied (N,), explanation str)
     """
-    def __init__(self, spec: Optional[OutputSpec] = None, **kwargs):
+    def __init__(self, spec: Optional[O] = None, **kwargs):
         super().__init__()
         self.spec = spec or OutputSpec(**kwargs)
-        self.kind = self.spec.kind
+        self.kind = self.spec.get_kind()
         self._validate_schema()
 
     def _validate_schema(self):
@@ -673,14 +674,19 @@ class OutputSpecLayer(nn.Module):
         supported = (
             OutKind.LINEAR_LE, OutKind.UNSAFE_LINEAR,
             OutKind.TOP1_ROBUST, OutKind.MARGIN_ROBUST, OutKind.RANGE,
-            OutKind.CONCEPT_CONFIDENCE, OutKind.CONCEPT_TOP_N, OutKind.CONCEPT_TOP_IN_CATEGORY,
+            ConceptOutKind.CONFIDENCE, ConceptOutKind.TOP_N, ConceptOutKind.TOP_IN_CATEGORY
         )
+
+        if self.kind in supported:
+            return
+
+        if self.kind.startswith("COMBINED") and CombinedOutputSpec._get_child_out_kinds(self.kind) is not None:
+            return
         
-        if self.kind not in supported:
-            raise ValueError(
-                f"OutputSpecLayer: unsupported kind {self.kind!r}; "
-                f"expected one of {supported}"
-            )
+        raise ValueError(
+            f"OutputSpecLayer: unsupported kind {self.kind!r}; "
+            f"expected one of {supported} or a combined concept-class output spec"
+        )
 
     def to_act_layers(
         self,
@@ -731,6 +737,6 @@ class OutputSpecLayer(nn.Module):
         violated, _severity = self.spec.violation(y)
         satisfied = ~violated
         n_ok = satisfied.sum().item()
-        kind_label = self.spec.kind.removesuffix("_ROBUST")
+        kind_label = self.kind.removesuffix("_ROBUST")
         explanation = f"✅ OUTPUT {kind_label}: {n_ok}/{batch_size} satisfied"
         return (y, satisfied, explanation)
