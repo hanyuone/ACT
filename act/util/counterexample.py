@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from act.front_end.specs import InKind, InputGeometry, OutputSpec
+from act.front_end.specs import BaseOutputSpec, InKind, InputGeometry, OutputSpec
 
 if TYPE_CHECKING:
     from act.back_end.core import Bounds, Layer, Net
@@ -117,7 +117,7 @@ def check_input_specs_batched(
 
 
 def output_violations(
-    outputs: torch.Tensor, spec: OutputSpec, *, rows: torch.Tensor | None = None,
+    outputs: torch.Tensor, spec: BaseOutputSpec, *, rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-lane (violated, severity); non-finite outputs never count as violations."""
     violated, severity = spec.violation(outputs, rows=rows)
