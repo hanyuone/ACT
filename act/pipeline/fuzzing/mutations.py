@@ -71,15 +71,16 @@ License: AGPLv3+
 """
 
 from __future__ import annotations
-from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
-import torch
-import torch.nn as nn
-import numpy as np
 
-from act.front_end.specs import InputSpec, InKind, OutKind, OutputSpec
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
+
+import numpy as np
+import torch
+from torch import nn
+
+from act.front_end.specs import InKind, InputSpec, OutKind, OutputSpec
 from act.front_end.verifiable_model import VerifiableModel
-from act.pipeline.fuzzing.checker import INPUT_FEASIBILITY_ATTR
 from act.util.device_manager import get_default_device
 
 if TYPE_CHECKING:
@@ -88,7 +89,12 @@ if TYPE_CHECKING:
 
 LOGIT_GUIDED_KINDS = frozenset({OutKind.TOP1_ROBUST})
 
+PERTURB_MODES = ("adaptive_scalar", "adaptive_perdim", "fixed")
+MUTATION_STRATEGIES = ("gradient", "pgd", "activation", "boundary", "random")
+
 SIGN_STE_TIGHT_EPS = 0.1
+# Alternating half-space/box sweeps that pull LIN_POLY mutations back toward feasibility.
+POLYTOPE_PROJECTION_SWEEPS = 20
 SIGN_STE_LOOSE_EPS = 5.0
 
 # A distance in pre-activation units, not a numerical tolerance: it says how
@@ -672,55 +678,26 @@ class MutationEngine:
         )
         self.input_spec = input_spec
         self.device = get_default_device()
-        self.perturb_mode = perturb_mode
-        self.perturb_scale = perturb_scale
-        
-        valid_perturb_modes = {"adaptive_scalar", "adaptive_perdim", "fixed"}
-        if self.perturb_mode not in valid_perturb_modes:
-            raise ValueError(
-                f"Unknown perturb_mode: {self.perturb_mode}. "
-                "Valid options: 'adaptive_scalar', 'adaptive_perdim', 'fixed'"
-            )
 
-        # Adaptive modes replace this placeholder with the dynamic per-seed
-        # schedule before the selected strategy is used. Fixed mode retains its
-        # range-aware baseline; without an InputSpec, 0.01 remains the fallback.
-        perturb_size = (
-            self._compute_fixed_perturb_size()
-            if self.perturb_mode == "fixed" or self.input_spec is None
-            else 0.0
-        )
-        
-        # Initialize strategies with computed perturb_size
         self.strategies = {
             "gradient": FGSMMutation(
                 self.output_spec,
-                perturb_size=perturb_size,
+                perturb_size=0.0,
                 logit_sink=self.logit_sink,
             ),
             "pgd": PGDMutation(
                 self.output_spec,
-                perturb_size=perturb_size,
+                perturb_size=0.0,
                 restarts=pgd_restarts,
                 restarts_binarized=pgd_restarts_binarized,
                 logit_sink=self.logit_sink,
             ),
-            "activation": ActivationMutation(perturb_size=perturb_size),
-            "boundary": BoundaryMutation(perturb_size=perturb_size),
-            "random": RandomMutation(perturb_size=perturb_size),
+            "activation": ActivationMutation(perturb_size=0.0),
+            "boundary": BoundaryMutation(perturb_size=0.0),
+            "random": RandomMutation(perturb_size=0.0),
         }
-
-        # Validate and normalize weights
-        unknown = set(weights.keys()) - set(self.strategies.keys())
-        if unknown:
-            raise ValueError(
-                f"Unknown mutation strategy keys in weights: {sorted(unknown)}. "
-                f"Valid options: {sorted(self.strategies.keys())}"
-            )
-        total = sum(float(v) for v in weights.values())
-        if total <= 0.0:
-            raise ValueError(f"Mutation weights must sum to > 0. Got total={total}.")
-        self.weights = {k: float(v) / total for k, v in weights.items()}
+        self.set_perturbation(perturb_mode, perturb_scale)
+        self.set_weights(weights)
         
         # Statistics
         self.total_mutations = 0
@@ -736,6 +713,38 @@ class MutationEngine:
         self._setup_hooks()
         self._setup_feasibility_hooks()
     
+    def set_weights(self, weights: Dict[str, float]) -> None:
+        """Validate and normalize the strategy selection weights."""
+        unknown = set(weights.keys()) - set(MUTATION_STRATEGIES)
+        if unknown:
+            raise ValueError(
+                f"Unknown mutation strategy keys in weights: {sorted(unknown)}. "
+                f"Valid options: {sorted(MUTATION_STRATEGIES)}"
+            )
+        total = sum(float(v) for v in weights.values())
+        if total <= 0.0:
+            raise ValueError(f"Mutation weights must sum to > 0. Got total={total}.")
+        self.weights = {k: float(v) / total for k, v in weights.items()}
+
+    def set_perturbation(self, mode: str, scale: float) -> None:
+        """Set how perturbation sizes are computed (see FuzzingConfig.perturb_mode)."""
+        if mode not in PERTURB_MODES:
+            raise ValueError(f"Unknown perturb_mode: {mode}. Valid options: {list(PERTURB_MODES)}")
+        self.perturb_mode = mode
+        self.perturb_scale = scale
+        # Adaptive modes set each strategy's size per seed in mutate(). Fixed
+        # mode keeps a range-aware baseline; without an InputSpec, 0.01.
+        if mode == "fixed" or self.input_spec is None:
+            size = self._compute_fixed_perturb_size()
+            for strategy in self.strategies.values():
+                strategy.perturb_size = size
+
+    def set_pgd_restarts(self, restarts: int, restarts_binarized: int) -> None:
+        """Set PGD random starts per mutation (ordinary and binarized networks)."""
+        pgd = cast(PGDMutation, self.strategies["pgd"])
+        pgd.restarts = max(int(restarts), 1)
+        pgd.restarts_binarized = max(int(restarts_binarized), 1)
+
     @staticmethod
     def _resolve_attack_target(
         model: nn.Module,
@@ -919,7 +928,7 @@ class MutationEngine:
                 module.register_forward_hook(make_hook(name))
 
     def _setup_feasibility_hooks(self) -> None:
-        """Carry lane rows and input feasibility through the fuzzer inference."""
+        """Carry lane rows through the fuzzer inference."""
         def inject_rows(module, args, kwargs):
             rows = self._pending_rows
             if rows is None:
@@ -931,28 +940,7 @@ class MutationEngine:
             kwargs["rows"] = rows
             return args, kwargs
 
-        def attach_feasibility(module, args, kwargs, output):
-            if not self._feasibility_forward_active:
-                return None
-            self._feasibility_forward_active = False
-            if not isinstance(output, dict):
-                raise RuntimeError(
-                    "VerifiableModel.forward must return input feasibility metadata"
-                )
-            model_output = output.get("output")
-            input_satisfied = output.get("input_satisfied_per_sample")
-            if not isinstance(model_output, torch.Tensor) or not isinstance(
-                input_satisfied, torch.Tensor
-            ):
-                raise RuntimeError(
-                    "VerifiableModel.forward did not return a per-sample input "
-                    "feasibility mask"
-                )
-            setattr(model_output, INPUT_FEASIBILITY_ATTR, input_satisfied)
-            return None
-
         self.model.register_forward_pre_hook(inject_rows, with_kwargs=True)
-        self.model.register_forward_hook(attach_feasibility, with_kwargs=True)
                 
     def mutate(self, seeds: 'FuzzingSeed') -> torch.Tensor:
         """
@@ -1062,7 +1050,8 @@ class MutationEngine:
             preserving the L∞ distance invariant across mutation chains.
         
         **LIN_POLY (InKind.LIN_POLY)**:
-            Not yet implemented — returns tensor unchanged.
+            Pulls points toward A·x <= b and into the polytope's enclosing box
+            (see ``_project_polytope``).
         
         Args:
             tensor: Mutated input tensor [B, ...] to project
@@ -1086,23 +1075,7 @@ class MutationEngine:
                 lb = self.input_spec.lb.to(tensor.device)
                 ub = self.input_spec.ub.to(tensor.device)
             
-            # bounds: use seeds.original_index to gather correct bounds
-            if lb.shape[0] > 1 and seeds is not None:
-                indices = seeds.original_index.to(lb.device)
-                assert bool((indices < lb.shape[0]).all()), (
-                    f"original_index out of range for InputSpec bounds: "
-                    f"max={int(indices.max().item())} >= {lb.shape[0]} rows"
-                )
-                lb = lb[indices]  # (B, ...) vectorized gather
-                ub = ub[indices]
-            elif lb.shape[0] == 1 and B > 1:
-                lb = lb.expand(B, *lb.shape[1:])
-                ub = ub.expand(B, *ub.shape[1:])
-            else:
-                lb = lb[:B]
-                ub = ub[:B]
-            
-            return torch.clamp(tensor, lb, ub)
+            return torch.clamp(tensor, self._lane_rows(lb, B, seeds), self._lane_rows(ub, B, seeds))
         
         elif self.input_spec.kind == InKind.LINF_BALL:
             eps = self.input_spec.eps
@@ -1129,10 +1102,57 @@ class MutationEngine:
             )
         
         elif self.input_spec.kind == InKind.LIN_POLY:
-            # TODO: Implement quadratic programming projection
-            return tensor
+            return self._project_polytope(tensor, seeds)
         
         return tensor
+
+    @staticmethod
+    def _lane_rows(value: torch.Tensor, B: int, seeds: 'Optional[FuzzingSeed]') -> torch.Tensor:
+        """Rows of a batched InputSpec tensor for B mutated lanes, by each seed's origin."""
+        if value.shape[0] > 1 and seeds is not None:
+            indices = seeds.original_index.to(value.device)
+            assert bool((indices < value.shape[0]).all()), (
+                f"original_index out of range for InputSpec bounds: "
+                f"max={int(indices.max().item())} >= {value.shape[0]} rows"
+            )
+            return value[indices]  # (B, ...) vectorized gather
+        if value.shape[0] == 1 and B > 1:
+            return value.expand(B, *value.shape[1:])
+        return value[:B]
+
+    def _project_polytope(self, tensor: torch.Tensor, seeds: 'Optional[FuzzingSeed]') -> torch.Tensor:
+        """Pull points toward ``A·x <= b`` and into the polytope's enclosing box, if any.
+
+        Alternating projections onto each violated half-space and the box. This
+        is not the Euclidean projection, but every step only moves a point toward
+        feasibility; a point still outside after the sweeps fails the exact
+        InputSpecLayer check and never becomes a counterexample.
+        """
+        spec = self.input_spec
+        assert spec is not None and spec.A is not None and spec.b is not None
+        B = tensor.shape[0]
+        coef = spec.A.to(device=tensor.device, dtype=tensor.dtype)
+        rhs = spec.b.to(device=tensor.device, dtype=tensor.dtype)
+        if coef.dim() == 3:  # per-lane rows [N, m, n]
+            coef, rhs = self._lane_rows(coef, B, seeds), self._lane_rows(rhs, B, seeds)
+        box = None
+        if spec.lb is not None and spec.ub is not None:
+            box = tuple(
+                self._lane_rows(bound.to(tensor), B, seeds).reshape(B, -1)
+                for bound in (spec.lb, spec.ub)
+            )
+        x = tensor.reshape(B, -1)
+        for _sweep in range(POLYTOPE_PROJECTION_SWEEPS):
+            if box is not None:
+                x = torch.minimum(torch.maximum(x, box[0]), box[1])
+            for i in range(coef.shape[-2]):
+                row = coef[..., i, :]
+                excess = (x * row).sum(-1) - rhs[..., i]
+                step = excess.clamp_min(0) / (row * row).sum(-1).clamp_min(1e-12)
+                x = x - step.unsqueeze(-1) * row
+        if box is not None:
+            x = torch.minimum(torch.maximum(x, box[0]), box[1])
+        return x.reshape(tensor.shape)
     
     def get_activation_map(self) -> Dict[str, torch.Tensor]:
         """Get activations from last inference."""

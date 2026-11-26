@@ -456,9 +456,9 @@ class OutKind(str, Enum):
 @dataclass
 class OutputSpec(BaseOutputSpec[torch.Tensor]):
     SLICEABLE_PARAM_KEYS: ClassVar[tuple[str, ...]] = (
-        "y_true", "margin", "c", "d", "lb", "ub", "C", "thresholds"
+        "y_true", "margin", "c", "d", "strict", "lb", "ub", "C", "thresholds"
     )
-    # Kinds whose unsafe set is closed, so severity == 0 already violates.
+    # Closed unsafe relaxations; UNSAFE_LINEAR may have strict concrete rows.
     CLOSED_KINDS: ClassVar[frozenset[OutKind]] = frozenset(
         {OutKind.TOP1_ROBUST, OutKind.MARGIN_ROBUST, OutKind.UNSAFE_LINEAR}
     )
@@ -470,6 +470,8 @@ class OutputSpec(BaseOutputSpec[torch.Tensor]):
     margin: Optional[torch.Tensor] = None
     lb: Optional[torch.Tensor] = None
     ub: Optional[torch.Tensor] = None
+    # UNSAFE_LINEAR rows: [N] shared or [B, N] per lane; None means closed.
+    strict: Optional[torch.Tensor] = None
     
     def __post_init__(self):
         """Ensure all numeric fields are tensors for batch-native architecture."""
@@ -492,6 +494,8 @@ class OutputSpec(BaseOutputSpec[torch.Tensor]):
                     setattr(self, field, torch.tensor(val))
                 else:
                     setattr(self, field, torch.tensor([float(val)]))
+        if self.strict is not None:
+            self.strict = torch.as_tensor(self.strict, dtype=torch.bool)
 
     def encode_linear(
         self,
@@ -514,6 +518,7 @@ class OutputSpec(BaseOutputSpec[torch.Tensor]):
                             Tensor[B, N, n_out],# UNSAFE_LINEAR
               "d":          Tensor[B],          # LINEAR_LE
                             Tensor[B, N],       # UNSAFE_LINEAR
+              "strict":     Tensor[B, N] bool,  # UNSAFE_LINEAR, optional
               "lb":         Tensor[B, n_out],   # RANGE (if lb given)
               "ub":         Tensor[B, n_out],   # RANGE (if ub given)
               "C":          Tensor[B*M, n_out], # for verify_once
@@ -585,23 +590,48 @@ class OutputSpec(BaseOutputSpec[torch.Tensor]):
         elif self.kind == OutKind.UNSAFE_LINEAR:
             if self.c is None or self.d is None:
                 raise ValueError("UNSAFE_LINEAR requires both c and d")
-            c_mat = self.c.to(device=device, dtype=dtype)
-            if c_mat.dim() == 1:
-                c_mat = c_mat.unsqueeze(0)
-            N = c_mat.shape[0]
-            if c_mat.shape[1] != n_out:
+            # c is [N, n_out] (or [n_out]) shared by every lane, or [B, N, n_out]
+            # per lane; d is [N] shared or [B, N] per lane. Model synthesis with
+            # cd_group="shape" stacks lanes whose rows or thresholds differ.
+            c_full = self.c.to(device=device, dtype=dtype)
+            per_lane_c = c_full.dim() == 3
+            if per_lane_c:
+                c_lanes = c_full.expand(B, -1, -1) if c_full.shape[0] == 1 else c_full
+            else:
+                c_mat = c_full.unsqueeze(0) if c_full.dim() == 1 else c_full
+                c_lanes = c_mat.unsqueeze(0).expand(B, -1, -1)
+            if c_lanes.shape[0] != B or c_lanes.shape[2] != n_out:
                 raise ValueError(
-                    f"UNSAFE_LINEAR: c cols {c_mat.shape[1]} != n_out {n_out}"
+                    f"UNSAFE_LINEAR: c shape {tuple(self.c.shape)} incompatible "
+                    f"with B {B} and n_out {n_out}"
                 )
-            d_vec = self.d.to(device=device, dtype=dtype).flatten()
-            if d_vec.shape[0] != N:
-                raise ValueError(
-                    f"UNSAFE_LINEAR: d length {d_vec.shape[0]} != N {N}. A d of "
-                    f"shape {tuple(self.d.shape)} means this model was synthesized "
-                    f'with cd_group="shape", which batches per-lane d for fuzzing '
-                    f"and is not consumable by the verifier."
-                )
-            params["c"], params["d"], c_rows, thresholds = _expand_rows(c_mat, d_vec, B)
+            N = c_lanes.shape[1]
+            d_full = self.d.to(device=device, dtype=dtype)
+            if d_full.shape == (B, N) and (B > 1 or per_lane_c):
+                d_lanes = d_full
+            else:
+                d_vec = d_full.flatten()
+                if d_vec.shape[0] != N:
+                    raise ValueError(
+                        f"UNSAFE_LINEAR: d shape {tuple(self.d.shape)} is neither "
+                        f"({N},) shared by every lane nor ({B}, {N}) per lane"
+                    )
+                d_lanes = d_vec.unsqueeze(0).expand(B, -1)
+            params["c"], params["d"] = c_lanes.contiguous(), d_lanes.contiguous()
+            if self.strict is not None:
+                strict = self.strict.to(device=device)
+                if strict.shape == (N,):
+                    strict = strict.unsqueeze(0).expand(B, -1)
+                elif strict.shape == (1, N):
+                    strict = strict.expand(B, -1)
+                elif strict.shape != (B, N):
+                    raise ValueError(
+                        f"UNSAFE_LINEAR: strict shape {tuple(strict.shape)} "
+                        f"is neither ({N},) nor ({B}, {N})"
+                    )
+                params["strict"] = strict.contiguous()
+            c_rows = c_lanes.reshape(B * N, n_out).contiguous()
+            thresholds = d_lanes.contiguous()
             m_specs = N
 
         elif self.kind in (OutKind.TOP1_ROBUST, OutKind.MARGIN_ROBUST):
@@ -1011,8 +1041,7 @@ class OutputSpec(BaseOutputSpec[torch.Tensor]):
         forward pass, decide per batch lane whether the property is broken and
         by how much. Comparisons are exact, with no epsilon tolerance, because
         a genuine forward pass that breaks the property *is* a counterexample.
-        (``bab.check_violations_batched`` deliberately keeps a tolerance — it
-        validates LP-solver candidates, where numerical slop is expected.)
+        Backend counterexample validation uses this same concrete decision.
 
         The magnitude comes from :meth:`severity`; this method adds only the
         decision. ``TOP1_ROBUST``, ``MARGIN_ROBUST`` and ``UNSAFE_LINEAR``
@@ -1020,12 +1049,11 @@ class OutputSpec(BaseOutputSpec[torch.Tensor]):
         ``TOP1_ROBUST`` an exact tie already falsifies the strict
         ``z_t > z_j`` requirement, and ``MARGIN_ROBUST`` is the same
         requirement shifted by ``m`` — a separation of exactly ``m`` already
-        falsifies it. Both match ``bab.check_violations_batched`` and
-        ``encode_linear`` (whose ``thresholds`` are ``0`` and ``-m``
+        falsifies it. Both match ``encode_linear`` (whose ``thresholds`` are ``0`` and ``-m``
         respectively, certified iff the row max is strictly below the
-        threshold). For ``UNSAFE_LINEAR``: its unsafe set is the *closed*
-        polytope ``(C z <= d).all()``, so a lane sitting exactly on a face is
-        already unsafe.
+        threshold). For ``UNSAFE_LINEAR``, every row must satisfy ``C z <= d``,
+        and rows marked ``strict`` must satisfy ``C z < d``. Bounds still use
+        the closed polytope; severity remains the same attack objective.
 
         Note:
             ``argmax`` breaks ties toward the lowest index, so on an exact
@@ -1052,6 +1080,22 @@ class OutputSpec(BaseOutputSpec[torch.Tensor]):
                 ``self.kind`` is not one of the five supported output kinds.
         """
         severity = self.severity(y, rows=rows)
+        if self.kind == OutKind.UNSAFE_LINEAR and self.strict is not None:
+            z = y.reshape(y.shape[0], -1)
+            if rows is not None:
+                rows = rows.to(device=z.device, dtype=torch.long).reshape(-1)
+            params = self._gather_rows(
+                rows, z.shape[0], z.device, z.dtype,
+                {"c": 2, "d": 1, "strict": 1},
+            )
+            slack = -self._linear_row_slack(z, params["c"], params["d"])
+            strict = params["strict"]
+            if strict.shape not in ((slack.shape[1],), slack.shape):
+                raise ValueError(
+                    f"strict shape {tuple(strict.shape)} does not match "
+                    f"row slack shape {tuple(slack.shape)}"
+                )
+            return torch.where(strict, slack > 0, slack >= 0).all(dim=1), severity
         violated = (
             severity >= 0 if self.kind in self.CLOSED_KINDS else severity > 0
         )

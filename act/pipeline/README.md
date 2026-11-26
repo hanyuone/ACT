@@ -25,6 +25,11 @@ act/pipeline/
 ├── fuzzing/              # Whitebox fuzzing framework
 │   ├── actfuzzer.py      # Main fuzzing engine
 │   └── ...
+├── gui/                  # ACT-side support for ACT-GUI
+│   ├── act_gui.py        # Shared sink channel, record base, options, and run control
+│   ├── verifier_gui.py   # Propagation records, ReLU describers, verify_once options
+│   ├── bab_gui.py        # BaB wave and terminal search records
+│   └── fuzzer_gui.py     # ACTFuzzer options, lifecycle records, and FuzzControl
 └── log/                  # Centralized execution logs
 ```
 
@@ -103,7 +108,56 @@ Implements multi-level validation:
 A fast, GPU-accelerated fuzzer that uses:
 - **Gradient Mutations**: FGSM/PGD-style perturbations.
 - **Coverage Tracking**: DeepXplore-style neuron coverage.
-- **Property Checking**: Automated detection of `OutputSpec` violations.
+- **Property Checking**: `OutputSpec` violations through `act/util/counterexample.py`, the
+  same check verification uses.
+
+### GUI support (`gui/`)
+All ACT code that exists for ACT-GUI lives here. Verification (including BaB) and fuzzing
+share one interface in `gui.act_gui`:
+
+- **Channel**: `observe(sink)` registers a sink for a block, `emit(record)` delivers to every
+  sink, and `observed_phase(name)` brackets a function with `PhaseEvent` start/end/error.
+  A sink that raises is logged and detached. Producers check `enabled` before building records.
+- **Records**: every record derives from `Record` and carries `t_ns` (`perf_counter_ns`).
+- **Options**: `Option` (kind, admissible values, live flag, `validate`), `OptionDefault`
+  (an option with its YAML default), and `validate_changes(options, changes)`.
+- **Control**: `RunControl(options)`: `request_stop()`, `pause()` / `resume()`, and
+  `update(**changes)` for live options, validated at once and applied by the engine at its
+  own safe points.
+
+`gui.verifier_gui` adds the `verify_once` records: committed layer bounds (`LayerBounds`),
+ReLU descriptions (`Relaxation`, requested with the sink attribute `wants_relaxation = True`
+and built by `DESCRIBERS`, one per domain), and dual backward/specification records
+(`DualBackward`, `SpecBound`), all keyed by `RecordKey`. `verification_options()` lists the
+tunable `verify_once` settings (`dual_iters`, `dual_refresh_forward`, `dual_config.<field>`,
+`hybridz_tolerance`) with their backend.yaml defaults.
+These records reference live tensors; sinks copy values they need to retain.
+
+Interval and HybridZ report each layer's committed output (stage `out`); dual forward
+reports activation inputs as `pre` and other layers as `out`; dual backward records
+(alpha `[B, M, n]`, margins and slack `[B, M]`) use pass `backward`.
+
+`gui.bab_gui` adds `BaBWave` and `BaBTerminal` records for the batched search loop.
+Wave records contain solved nodes, parent/child IDs, split branches, bounds, and frontier
+changes; terminal records cover root presolve, counterexamples, and ordinary completion.
+
+`gui.fuzzer_gui` covers the whole `ACTFuzzer` lifecycle on the same interface:
+
+- **Options**: `fuzzing_options()` lists every tunable `FuzzingConfig` field
+  (`FUZZING_OPTIONS` in `fuzzing/actfuzzer.py`) with its pipeline.yaml default.
+- **Records** (to the same sinks): `FuzzStart` (resolved config, normalized strategy
+  weights, batch size, device); `FuzzStep` per fuzzed batch (seeds, mutated inputs,
+  strategy, the lanes ACT's property checker accepted with their `Counterexample`
+  objects, coverage, corpus size); `FuzzConfigChange` per applied or rejected update;
+  `FuzzEnd` (report and stop reason).
+- **Control**: `ACTFuzzer(..., control=FuzzControl())`, the `RunControl` over
+  `FUZZING_OPTIONS`; requests apply between batches (paused time is excluded from the
+  timeout) through `ACTFuzzer.update_config`, which scripts can call directly.
+
+The GUI modules each have a self-check entrypoint: `python -m act.pipeline.gui.act_gui`
+checks the shared channel; `python -m act.pipeline.gui.verifier_gui` checks propagation
+records; `python -m act.pipeline.gui.fuzzer_gui` checks fuzzing records and live control;
+and `python -m act.pipeline.gui.bab_gui` checks BaB wave and terminal records.
 
 ## Logging and Diagnostics
 

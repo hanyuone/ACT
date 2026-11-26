@@ -78,12 +78,11 @@ import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
-
-from act.back_end.layer_schema import REGISTRY, LayerKind
-from act.back_end.layer_util import create_layer
+from torch import nn
 
 # Import ACT components
+from act.back_end.layer_schema import REGISTRY, LayerKind
+from act.back_end.layer_util import create_layer
 from act.front_end.concept.output_spec import CombinedOutputSpec, ConceptOutKind
 from act.front_end.spec_creator_base import LabeledInputTensor
 from act.front_end.specs import (
@@ -94,6 +93,7 @@ from act.front_end.specs import (
     OutKind,
     OutputSpec,
 )
+from act.util.counterexample import input_constraint_satisfied, output_violations
 
 
 class VerifiableModel[O: BaseOutputSpec](nn.Module):
@@ -503,14 +503,24 @@ class InputSpecLayer(nn.Module):
         (lb/ub/center carry the leading B dim from the wrapped tensors).
         """
         del B
-        layer = create_layer(
-            id=layer_id_start,
-            kind=LayerKind.INPUT_SPEC.value,
-            params=self._act_params(),
-            in_vars=in_vars,
-            out_vars=in_vars,
-        )
-        return [layer], in_vars
+        params = self._act_params()
+        specs = [params]
+        if self.kind == InKind.LIN_POLY and "lb" in params and "ub" in params:
+            # A polytope stored with its enclosing box: the BOX layer seeds the
+            # analysis (interval domains cannot use A·x <= b) and the LIN_POLY
+            # layer keeps the relations for LP back ends and counterexample checks.
+            specs = [{"kind": InKind.BOX, "lb": params.pop("lb"), "ub": params.pop("ub")}, params]
+        layers = [
+            create_layer(
+                id=layer_id_start + k,
+                kind=LayerKind.INPUT_SPEC.value,
+                params=spec,
+                in_vars=in_vars,
+                out_vars=in_vars,
+            )
+            for k, spec in enumerate(specs)
+        ]
+        return layers, in_vars
 
     @staticmethod
     def _gather_rows(
@@ -565,12 +575,10 @@ class InputSpecLayer(nn.Module):
             ):
                 return (x, True, "⚠️ INPUT BOX: Missing lb/ub")
             
-            lb = self._gather_rows(lb_buffer, rows, batch_size, "lb")
-            ub = self._gather_rows(ub_buffer, rows, batch_size, "ub")
-
-            lb_ok = (x >= lb).reshape(batch_size, -1).all(dim=1)  # (batch,)
-            ub_ok = (x <= ub).reshape(batch_size, -1).all(dim=1)  # (batch,)
-            satisfied = lb_ok & ub_ok  # (batch,) bool tensor
+            satisfied = input_constraint_satisfied(x, self.kind, {
+                "lb": self._gather_rows(lb_buffer, rows, batch_size, "lb"),
+                "ub": self._gather_rows(ub_buffer, rows, batch_size, "ub"),
+            })
             n_ok = satisfied.sum().item()
             explanation = f"✅ INPUT BOX: {n_ok}/{batch_size} satisfied"
             
@@ -588,14 +596,12 @@ class InputSpecLayer(nn.Module):
                 center_buffer, rows, batch_size, "center"
             )
             
-            # Per-sample L∞ distance
-            linf = (x - center).abs().reshape(batch_size, -1).max(dim=1)[0]  # (batch,)
-            
-            # Compare against per-sample eps threshold.
             eps = self._gather_rows(
                 eps_buffer, rows, batch_size, "eps"
-            ).reshape(batch_size)
-            satisfied = linf <= eps
+            ).reshape(batch_size, *([1] * (x.dim() - 1)))
+            satisfied = input_constraint_satisfied(
+                x, self.kind, {"lb": center - eps, "ub": center + eps}
+            )
             
             n_ok = satisfied.sum().item()
             explanation = f"✅ INPUT L∞: {n_ok}/{batch_size} satisfied"
@@ -619,7 +625,7 @@ class InputSpecLayer(nn.Module):
                 self._gather_rows(mask_buffer, rows, batch_size, "perturbed_positions"),
                 float(norm_buffer.item()),
             )
-            satisfied = geometry.contains(x)
+            satisfied = input_constraint_satisfied(x, self.kind, {}, geometry=geometry)
             n_ok = satisfied.sum().item()
             explanation = f"✅ INPUT LP_EMBEDDING: {n_ok}/{batch_size} satisfied"
             return (x, satisfied, explanation)
@@ -631,15 +637,14 @@ class InputSpecLayer(nn.Module):
             ):
                 return (x, True, "⚠️ INPUT LIN_POLY: Missing A/b")
             
-            x_flat = x.reshape(batch_size, -1)  # (batch, n_vars)
             if A_buffer.dim() == 3:
-                A = self._gather_rows(A_buffer, rows, batch_size, "A")
-                b = self._gather_rows(b_buffer, rows, batch_size, "b")
-                residuals = torch.bmm(A, x_flat.unsqueeze(-1)).squeeze(-1) - b
-            else:
-                residuals = x_flat @ A_buffer.T - b_buffer
-            max_viol = residuals.max(dim=1)[0]  # (batch,)
-            satisfied = max_viol <= 0
+                A_buffer = self._gather_rows(A_buffer, rows, batch_size, "A")
+                b_buffer = self._gather_rows(b_buffer, rows, batch_size, "b")
+            params = {"A": A_buffer, "b": b_buffer}
+            if isinstance(self.lb, torch.Tensor) and isinstance(self.ub, torch.Tensor):
+                params["lb"] = self._gather_rows(self.lb, rows, batch_size, "lb")
+                params["ub"] = self._gather_rows(self.ub, rows, batch_size, "ub")
+            satisfied = input_constraint_satisfied(x, self.kind, params)
             
             # Unified explanation format (consistent across all batch sizes)
             n_ok = satisfied.sum().item()
@@ -744,7 +749,7 @@ class OutputSpecLayer[O: BaseOutputSpec](nn.Module):
             For batch=1 and batch>1: satisfied is (batch,) bool tensor
         """
         batch_size = y.shape[0]
-        violated, _severity = self.spec.violation(y)
+        violated, _severity = output_violations(y, self.spec)
         satisfied = ~violated
         n_ok = satisfied.sum().item()
         kind_label = self.kind.removesuffix("_ROBUST")

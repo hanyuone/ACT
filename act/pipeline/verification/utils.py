@@ -15,7 +15,7 @@
 
 import logging
 import math
-from typing import List, Any, Dict, Optional, Tuple
+from typing import Any
 import torch
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # Shape utilities
 # -----------------------------------------------------------------------------
 
-def _prod(shape_tail: Tuple[int, ...]) -> int:
+def _prod(shape_tail: tuple[int, ...]) -> int:
     """Compute product of shape dimensions."""
     result = 1
     for s in shape_tail:
@@ -33,7 +33,7 @@ def _prod(shape_tail: Tuple[int, ...]) -> int:
     return result
 
 
-def _normalize_tuple(val: Any, default: Tuple[int, int] = (1, 1)) -> Tuple[int, int]:
+def _normalize_tuple(val: Any, default: tuple[int, int] = (1, 1)) -> tuple[int, int]:
     """Normalize int, list, or tuple to 2-tuple for kernel_size/stride/padding.
 
     Lists are accepted because onnx2torch constructs nn.MaxPool2d/AvgPool2d with
@@ -45,7 +45,7 @@ def _normalize_tuple(val: Any, default: Tuple[int, int] = (1, 1)) -> Tuple[int, 
     return (val, val) if val is not None else default
 
 
-def _assert_dag(preds: Dict[int, List[int]], succs: Dict[int, List[int]], n_layers: int) -> None:
+def _assert_dag(preds: dict[int, list[int]], succs: dict[int, list[int]], n_layers: int) -> None:
     """Kahn's algorithm cycle check. Raises ValueError listing the cycle nodes."""
     if n_layers == 0:
         return
@@ -64,7 +64,7 @@ def _assert_dag(preds: Dict[int, List[int]], succs: Dict[int, List[int]], n_laye
         raise ValueError(f"Layer graph contains a cycle! Nodes: {cycle_nodes}")
 
 
-def _assert_dataflow(layers: List[Any], preds: Dict[int, List[int]]) -> None:
+def _assert_dataflow(layers: list[Any], preds: dict[int, list[int]]) -> None:
     """Assert every layer reads its in_vars from its predecessors' out_vars.
 
     A violation means an edge bypasses a layer (e.g. BatchNorm's SCALE), so
@@ -84,13 +84,13 @@ def _assert_dataflow(layers: List[Any], preds: Dict[int, List[int]]) -> None:
         )
 
 
-def _normalize_axes(axes: Any, rank: int) -> List[int]:
+def _normalize_axes(axes: Any, rank: int) -> list[int]:
     """Sort + dedupe + normalise possibly-negative axes against ``rank``."""
     return sorted({(a + rank) if a < 0 else a for a in (int(x) for x in axes)})
 
 
-def _reduce_output_shape(input_shape: Tuple[int, ...], norm_axes: List[int],
-                         keepdims: bool) -> Tuple[int, ...]:
+def _reduce_output_shape(input_shape: tuple[int, ...], norm_axes: list[int],
+                         keepdims: bool) -> tuple[int, ...]:
     """Output shape of a reduce-along-axes op. ``norm_axes`` must be already-normalised."""
     if keepdims:
         return tuple(1 if i in norm_axes else int(d) for i, d in enumerate(input_shape))
@@ -98,19 +98,19 @@ def _reduce_output_shape(input_shape: Tuple[int, ...], norm_axes: List[int],
 
 
 def _compute_slice_output_shape(
-    input_shape: Tuple[int, ...],
-    starts: List[int], ends: List[int],
-    axes: List[int], steps: List[int],
-) -> Tuple[Tuple[int, ...], List[int], List[int], List[int]]:
+    input_shape: tuple[int, ...],
+    starts: list[int], ends: list[int],
+    axes: list[int], steps: list[int],
+) -> tuple[tuple[int, ...], list[int], list[int], list[int]]:
     """ONNX Slice output shape with negative-index + clamp + step semantics.
 
     Returns ``(output_shape, n_starts, n_ends, n_axes)`` with all indices
     normalised against ``input_shape``. Raises on zero step.
     """
     rank = len(input_shape)
-    n_starts: List[int] = []
-    n_ends: List[int] = []
-    n_axes: List[int] = []
+    n_starts: list[int] = []
+    n_ends: list[int] = []
+    n_axes: list[int] = []
     output_shape = list(input_shape)
     for s, e, ax, st in zip(starts, ends, axes, steps):
         ax = int(ax) + rank if int(ax) < 0 else int(ax)
@@ -130,7 +130,7 @@ def _compute_slice_output_shape(
 
 
 def _broadcast_constant(
-    const: torch.Tensor, output_shape: Tuple[int, ...], dtype: torch.dtype,
+    const: torch.Tensor, output_shape: tuple[int, ...], dtype: torch.dtype,
 ) -> torch.Tensor:
     """Materialize a constant in the tensor's actual row-major output layout."""
     try:
@@ -151,7 +151,7 @@ def _broadcast_constant(
 
 import torch.fx as fx
 import torch.nn as nn
-from act.back_end.layer_schema import LayerKind
+from act.back_end.layer_schema import LayerKind, ROUNDING_FUNCTIONS
 
 def _convert_OnnxNeg(self, mod: nn.Module, node: fx.Node) -> None:
     """OnnxNeg: y = -x. Emitted as SCALE with a = -1."""
@@ -276,8 +276,8 @@ def _convert_OnnxConcat(self, mod: nn.Module, node: fx.Node) -> None:
     args = [a for a in node.args if isinstance(a, fx.Node)]
     if not args:
         raise ValueError(f"OnnxConcat: no inputs at {node.name}")
-    all_vars: List[int] = []
-    shapes: List[Tuple[int, ...]] = []
+    all_vars: list[int] = []
+    shapes: list[tuple[int, ...]] = []
     for arg in args:
         if arg.name not in self.node_outputs and not self._ensure_constant_vars(arg.name):
             raise ValueError(f"OnnxConcat at {node.name}: input '{arg.name}' is neither a registered variable nor a resolvable constant")
@@ -312,8 +312,19 @@ def _convert_OnnxReduceStaticAxes(self, mod: nn.Module, node: fx.Node) -> None:
     # OnnxReduceStaticAxes uses public ``axes`` / ``keepdims`` (different from
     # OnnxReduceSumStaticAxes which uses private ``_axes`` / ``_keepdims``).
     axes_attr = getattr(mod, 'axes', None) or list(range(len(self.shape)))
-    keepdims = bool(getattr(mod, 'keepdims', True))
-    norm_axes = _normalize_axes(axes_attr, len(self.shape))
+    _emit_mean(self, node, axes_attr, bool(getattr(mod, 'keepdims', True)))
+
+
+def _convert_OnnxGlobalAveragePool(self, mod: nn.Module, node: fx.Node) -> None:
+    """GlobalAveragePool: mean over every spatial axis (2..), keeping them as size 1."""
+    if not self._get_predecessor_state(node):
+        raise ValueError(f"GlobalAveragePool: missing predecessor for {node.name}")
+    _emit_mean(self, node, list(range(2, len(self.shape))), True)
+
+
+def _emit_mean(self, node: fx.Node, axes: list[int], keepdims: bool) -> None:
+    """Emit one MEAN layer reducing ``axes`` of the current shape."""
+    norm_axes = _normalize_axes(axes, len(self.shape))
     output_shape = _reduce_output_shape(self.shape, norm_axes, keepdims)
     out_vars = self._alloc_ids(_prod(output_shape) or 1)
     layer_id = self._add_layer(
@@ -403,41 +414,15 @@ def _convert_OnnxMatMul(self, mod: nn.Module, node: fx.Node) -> None:
     x_var = x_node.name in self.node_outputs
     w_var = w_node.name in self.node_outputs
 
-    if x_var and w_var:
-        xv = self.node_outputs[x_node.name]
-        yv = self.node_outputs[w_node.name]
-        xs = self.node_shapes[x_node.name]
-        ys = self.node_shapes[w_node.name]
-        try:
-            output_shape = tuple(int(d) for d in torch.matmul(
-                torch.zeros(xs, dtype=self.dtype),
-                torch.zeros(ys, dtype=self.dtype),
-            ).shape)
-        except RuntimeError as e:
-            raise ValueError(
-                f"OnnxMatMul at {node.name}: incompatible var-var shapes {xs} @ {ys} ({e})"
-            )
-        out_vars = self._alloc_ids(_prod(output_shape) or 1)
-        layer_id = self._add_layer(
-            LayerKind.MATMUL.value,
-            {"x_vars": xv, "y_vars": yv,
-             "x_shape": xs, "y_shape": ys,
-             "input_shape": xs, "output_shape": output_shape},
-            xv + yv, out_vars,
+    # const × var: materialise the constant via _ensure_constant_vars
+    # then take the var × var branch below. Note matmul is
+    # non-commutative — we keep operand order intact.
+    if not x_var and not self._ensure_constant_vars(x_node.name):
+        raise ValueError(
+            f"OnnxMatMul at {node.name}: cannot resolve constant first operand"
         )
-        self.prev_out = out_vars
-        self.shape = output_shape
-        self._register_node(node.name, layer_id)
-        return
-
-    if not x_var:
-        # const × var: materialise the constant via _ensure_constant_vars
-        # then re-enter the var × var branch above. Note matmul is
-        # non-commutative — we keep operand order intact.
-        if not self._ensure_constant_vars(x_node.name):
-            raise ValueError(
-                f"OnnxMatMul at {node.name}: cannot resolve constant first operand"
-            )
+    if w_var or not x_var:
+        label = "var-var" if x_var else "const-var"
         xv = self.node_outputs[x_node.name]
         yv = self.node_outputs[w_node.name]
         xs = self.node_shapes[x_node.name]
@@ -449,7 +434,7 @@ def _convert_OnnxMatMul(self, mod: nn.Module, node: fx.Node) -> None:
             ).shape)
         except RuntimeError as e:
             raise ValueError(
-                f"OnnxMatMul at {node.name}: incompatible const-var shapes {xs} @ {ys} ({e})"
+                f"OnnxMatMul at {node.name}: incompatible {label} shapes {xs} @ {ys} ({e})"
             )
         out_vars = self._alloc_ids(_prod(output_shape) or 1)
         layer_id = self._add_layer(
@@ -514,9 +499,9 @@ def _convert_OnnxMatMul(self, mod: nn.Module, node: fx.Node) -> None:
         )
     output_shape = tuple(self.shape[:-1]) + (out_features,)
     out_vars = self._alloc_ids(_prod(output_shape) or out_features)
-    # DENSE concretizes against the FLAT var vector, so a batched
-    # (..., M, K) @ (K, N) that shares W across M tokens must become a
-    # block-diagonal weight (token_count copies of W.T) — exact, not relaxed.
+    # A batched (..., M, K) @ (K, N) shares W across the M tokens: emit a
+    # token-wise DENSE (as nn.Linear does) instead of a block-diagonal weight,
+    # whose size grows with the square of the token count.
     weight_t = W.t().contiguous().detach().clone().to(self.dtype)
     n_in_vars = len(self.prev_out)
     if n_in_vars % in_features != 0:
@@ -524,15 +509,11 @@ def _convert_OnnxMatMul(self, mod: nn.Module, node: fx.Node) -> None:
             f"OnnxMatMul at {node.name}: flat input var count {n_in_vars} "
             f"is not a multiple of weight in_features {in_features}"
         )
-    token_count = n_in_vars // in_features
-    weight_mat = torch.block_diag(*([weight_t] * token_count)) if token_count > 1 else weight_t
-    layer_id = self._add_layer(
-        LayerKind.DENSE.value,
-        {"weight": weight_mat,
-         "in_features": int(weight_mat.shape[1]), "out_features": int(weight_mat.shape[0]),
-         "input_shape": self.shape, "output_shape": output_shape},
-        self.prev_out, out_vars,
-    )
+    params = {"weight": weight_t, "in_features": in_features, "out_features": out_features,
+              "input_shape": self.shape, "output_shape": output_shape}
+    if n_in_vars // in_features > 1:
+        params["token_wise"] = True
+    layer_id = self._add_layer(LayerKind.DENSE.value, params, self.prev_out, out_vars)
     self.prev_out = out_vars
     self.shape = output_shape
     self._register_node(node.name, layer_id)
@@ -630,9 +611,9 @@ def _convert_OnnxPow(self, mod: nn.Module, node: fx.Node) -> None:
     power_id = self.node_to_layer_id.get(args[0].name)
     if power_id is not None and power_id < 0:
         power_id = None
-    result_vars: Optional[List[int]] = None
-    result_id: Optional[int] = None
-    first_id: Optional[int] = None
+    result_vars: list[int] | None = None
+    result_id: int | None = None
+    first_id: int | None = None
     exponent = int(exp_val)
     while exponent:
         if exponent & 1:
@@ -704,7 +685,7 @@ def _convert_OnnxSplit13(self, mod: nn.Module, node: fx.Node) -> None:
             f"do not cover axis {norm_axis}"
         )
 
-    getitem_children: Dict[int, List[fx.Node]] = {}
+    getitem_children: dict[int, list[fx.Node]] = {}
     if self.fx_graph is not None:
         for n in self.fx_graph.nodes:
             if n.op == 'call_function' and 'getitem' in str(n.target).lower() and n.args:
@@ -722,8 +703,8 @@ def _convert_OnnxSplit13(self, mod: nn.Module, node: fx.Node) -> None:
     # that producing layer so graph-edge resolution can't mis-wire siblings to
     # the split node (which maps only to the last chunk).
     input_layer_id = self.node_to_layer_id.get(args[0].name)
-    last_chunk_vars: List[int] = var_vars
-    last_chunk_shape: Tuple[int, ...] = var_shape
+    last_chunk_vars: list[int] = var_vars
+    last_chunk_shape: tuple[int, ...] = var_shape
     last_layer_id = -1
     offset = 0
     for i, size in enumerate(split_sizes):
@@ -766,11 +747,15 @@ def _convert_OnnxResize(self, mod: nn.Module, node: fx.Node) -> None:
     if not self._get_predecessor_state(node):
         raise ValueError(f"OnnxResize: missing predecessor for {node.name}")
     args = [a for a in node.args if isinstance(a, fx.Node)]
-    scales_t: Optional[torch.Tensor] = None
-    sizes_t: Optional[torch.Tensor] = None
+    scales_t: torch.Tensor | None = None
+    sizes_t: torch.Tensor | None = None
     for a in args[1:]:
         t = self._resolve_constant_tensor(a.name)
-        if t is None or t.numel() == 0:
+        if t is None:
+            t = self._evaluate_constant_subgraph(a.name)
+        # scales/sizes hold one entry per input axis; roi holds two (start, end),
+        # so dtype alone cannot tell a float roi from float scales.
+        if t is None or t.numel() != len(self.shape):
             continue
         if t.dtype.is_floating_point and scales_t is None:
             scales_t = t
@@ -787,7 +772,16 @@ def _convert_OnnxResize(self, mod: nn.Module, node: fx.Node) -> None:
         size_param = tuple(int(x) for x in sizes_t.tolist())
     else:
         raise ValueError(f"OnnxResize at {node.name}: cannot resolve scales or sizes")
-    params: Dict[str, Any] = {
+    # ONNX scales/sizes cover every axis; UPSAMPLE (F.interpolate) resizes the
+    # spatial axes only, so batch and channels must stay as they are.
+    if len(output_shape) < 3 or tuple(output_shape[:2]) != tuple(self.shape[:2]):
+        raise NotImplementedError(
+            f"OnnxResize at {node.name}: resizing batch or channel axes is unsupported "
+            f"({tuple(self.shape)} -> {output_shape})"
+        )
+    scale_factor = scale_factor[2:] if scale_factor is not None else None
+    size_param = size_param[2:] if size_param is not None else None
+    params: dict[str, Any] = {
         "mode": str(getattr(mod, 'onnx_mode', 'nearest')),
         "input_shape": self.shape,
         "output_shape": output_shape,
@@ -949,7 +943,7 @@ def _convert_OnnxSqueezeDynamicAxes(self, mod: nn.Module, node: fx.Node) -> None
     out_vars = self._same_size_forward()
     layer_id = self._add_layer(
         LayerKind.SQUEEZE.value,
-        {"dims": list(axes)},
+        {"dims": list(axes), "input_shape": tuple(self.shape), "output_shape": output_shape},
         self.prev_out, out_vars,
     )
     self.prev_out = out_vars
@@ -983,13 +977,13 @@ def _convert_OnnxWhere(self, mod: nn.Module, node: fx.Node) -> None:
     self.shape = output_shape
     self._register_node(node.name, layer_id)
 
-def _convert_unary_same_shape(self, node: fx.Node, kind: LayerKind, op_name: str) -> None:
+def _convert_unary_same_shape(self, node: fx.Node, kind: LayerKind, op_name: str, **params: Any) -> None:
     if not self._get_predecessor_state(node):
         raise ValueError(f"{op_name}: missing predecessor for {node.name}")
     out_vars = self._same_size_forward()
     layer_id = self._add_layer(
         kind.value,
-        {"input_shape": self.shape, "output_shape": self.shape},
+        {**params, "input_shape": self.shape, "output_shape": self.shape},
         self.prev_out, out_vars,
     )
     self.prev_out = out_vars
@@ -999,7 +993,7 @@ def _same_tensor_value(a: torch.Tensor, b: torch.Tensor) -> bool:
     return tuple(a.shape) == tuple(b.shape) and torch.equal(a.detach().cpu(), b.detach().cpu())
 
 
-def _flat_broadcast_param(param: torch.Tensor, shape: Tuple[int, ...], axis: Optional[int], dtype: torch.dtype) -> torch.Tensor:
+def _flat_broadcast_param(param: torch.Tensor, shape: tuple[int, ...], axis: int | None, dtype: torch.dtype) -> torch.Tensor:
     param = param.detach().clone().to(dtype=dtype)
     n = _prod(shape) or 1
     if param.numel() == 1:
@@ -1019,8 +1013,13 @@ def _convert_OnnxQuantizeLinear(self, mod: nn.Module, node: fx.Node) -> None:
     if not self._get_predecessor_state(node):
         raise ValueError(f"OnnxQuantizeLinear: missing predecessor for {node.name}")
     out_vars = self._same_size_forward()
-    scale = _flat_broadcast_param(getattr(mod, "scale"), self.shape, getattr(mod, "axis", None), self.dtype)
-    zero_point = _flat_broadcast_param(getattr(mod, "zero_point"), self.shape, getattr(mod, "axis", None), self.dtype)
+    # Per-tensor parameters stay one element (every QUANTIZE consumer broadcasts
+    # them); expanding them would store two activation-sized tensors per layer.
+    scale, zero_point = (
+        param.detach().clone().to(dtype=self.dtype).reshape(1) if param.numel() == 1
+        else _flat_broadcast_param(param, self.shape, getattr(mod, "axis", None), self.dtype)
+        for param in (getattr(mod, "scale"), getattr(mod, "zero_point"))
+    )
     layer_id = self._add_layer(
         LayerKind.QUANTIZE.value,
         {"scale": scale, "zero_point": zero_point,
@@ -1097,6 +1096,13 @@ def _convert_OnnxSin(self, mod: nn.Module, node: fx.Node) -> None:
 def _convert_OnnxCos(self, mod: nn.Module, node: fx.Node) -> None:
     """OnnxCos: y = cos(x), dedicated onnx2torch module route."""
     _convert_unary_same_shape(self, node, LayerKind.COS, "OnnxCos")
+
+def _convert_OnnxRound(self, mod: nn.Module, node: fx.Node) -> None:
+    """OnnxRound (ONNX Floor / Ceil / Round): element-wise ROUND with the matching mode."""
+    mode = next((m for m, f in ROUNDING_FUNCTIONS.items() if f is mod.round_function), None)
+    if mode is None:
+        raise NotImplementedError(f"OnnxRound at {node.name}: unsupported rounding {mod.round_function}")
+    _convert_unary_same_shape(self, node, LayerKind.ROUND, "OnnxRound", mode=mode)
 
 def _convert_OnnxFunction(self, mod: nn.Module, node: fx.Node) -> None:
     """OnnxFunction: dispatch by inner-function name for supported unary ops."""
@@ -1233,9 +1239,12 @@ ONNX_HANDLERS = {
     'OnnxNeg': _convert_OnnxNeg,
     'OnnxPow': _convert_OnnxPow,
     'OnnxReduceStaticAxes': _convert_OnnxReduceStaticAxes,
+    'OnnxGlobalAveragePool': _convert_OnnxGlobalAveragePool,
+    'OnnxGlobalAveragePoolWithKnownInputShape': _convert_OnnxGlobalAveragePool,
     'OnnxReduceSumStaticAxes': _convert_OnnxReduceSumStaticAxes,
     'OnnxReshape': _convert_OnnxReshape,
     'OnnxResize': _convert_OnnxResize,
+    'OnnxRound': _convert_OnnxRound,
     'OnnxScatterND': _convert_OnnxScatterND,
     'OnnxShape': _convert_OnnxShape,
     'OnnxSlice': _convert_OnnxSlice,

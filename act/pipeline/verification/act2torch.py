@@ -20,8 +20,8 @@
 #
 # ===---------------------------------------------------------------------===#
 
-from typing import Optional, Dict, Any, cast
-from typing import Set, List
+from typing import Any, cast
+from collections.abc import Callable
 import importlib
 import torch  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
@@ -29,7 +29,7 @@ import logging
 
 from act.back_end.core import Net, Layer, Bounds, get_topo_order
 from act.back_end.interval_tf.tf_transformer import softmax_rowsize
-from act.back_end.layer_schema import ACT_TO_TORCH, LayerKind, REGISTRY
+from act.back_end.layer_schema import ACT_TO_TORCH, LayerKind, REGISTRY, step_function
 from act.util.device_manager import get_default_dtype, get_default_device
 
 logger = logging.getLogger(__name__)
@@ -197,12 +197,12 @@ class ACTLayerNorm(nn.Module):
 class ACTMHASplit(nn.Module):
     def __init__(
         self,
-        weight: Optional[torch.Tensor],
-        bias: Optional[torch.Tensor],
+        weight: torch.Tensor | None,
+        bias: torch.Tensor | None,
         role: str,
         position: int,
         feature: int,
-        hidden_size: Optional[int],
+        hidden_size: int | None,
     ) -> None:
         super().__init__()
         self.register_buffer(
@@ -238,7 +238,7 @@ class ACTMHASplit(nn.Module):
 
 
 class ACTAttentionScores(nn.Module):
-    def __init__(self, dk: float, mask: Optional[torch.Tensor]) -> None:
+    def __init__(self, dk: float, mask: torch.Tensor | None) -> None:
         super().__init__()
         self.dk = dk
         self.register_buffer(
@@ -259,7 +259,7 @@ class ACTAttentionMix(nn.Module):
 
 
 class ACTMHAJoin(nn.Module):
-    def __init__(self, sequence_length: int, hidden_size: Optional[int]) -> None:
+    def __init__(self, sequence_length: int, hidden_size: int | None) -> None:
         super().__init__()
         self.sequence_length = sequence_length
         self.hidden_size = hidden_size
@@ -391,404 +391,345 @@ class ActGraphModule(nn.Module):
 
     def _apply_functional(self, layer, inputs):
         kind = layer.kind
-        if kind == LayerKind.ADD.value:
-            if len(inputs) < 2:
-                raise RuntimeError(
-                    f"ActGraphModule: ADD layer {layer.id} expects at least 2 inputs, "
-                    f"got {len(inputs)}."
-                )
-            out = inputs[0]
-            for t in inputs[1:]:
-                out = out + t
-            return out
-        if kind == LayerKind.CONCAT.value:
-            if len(inputs) < 2:
-                raise RuntimeError(
-                    f"ActGraphModule: CONCAT layer {layer.id} expects at least 2 inputs, "
-                    f"got {len(inputs)}."
-                )
-            return torch.cat(inputs, dim=layer.params.get("concat_dim", 1))
-        if kind == LayerKind.MUL.value:
-            if len(inputs) < 2:
-                raise RuntimeError(
-                    f"ActGraphModule: MUL layer {layer.id} expects at least 2 inputs, "
-                    f"got {len(inputs)}."
-                )
-            out = inputs[0]
-            for t in inputs[1:]:
-                out = out * t
-            return out
-        if kind == LayerKind.SCALE.value:
-            return inputs[0] * _align_elementwise_param(
-                getattr(self, f"_scale_a_{layer.id}"), inputs[0],
-                layer.params.get("input_shape"),
+        if kind not in _FUNCTIONAL_HANDLERS:
+            raise NotImplementedError(
+                f"ActGraphModule: functional layer kind '{kind}' (id={layer.id}) not supported."
             )
-        if kind == LayerKind.BIAS.value:
-            return inputs[0] + _align_elementwise_param(
-                getattr(self, f"_bias_c_{layer.id}"), inputs[0],
-                layer.params.get("input_shape"),
+        arity, handler = _FUNCTIONAL_HANDLERS[kind]
+        if arity == _AT_LEAST_TWO and len(inputs) < 2:
+            raise RuntimeError(
+                f"ActGraphModule: {kind} layer {layer.id} expects at least 2 inputs, "
+                f"got {len(inputs)}."
             )
-        if kind == LayerKind.TRANSPOSE.value:
-            perm = layer.params.get("perm")
-            if perm is None:
-                return inputs[0]
-            return inputs[0].permute(*perm).contiguous()
-        if kind == LayerKind.UNSQUEEZE.value:
-            dims = layer.params.get("dims") or []
-            out = inputs[0]
-            for d in sorted(dims):
-                out = out.unsqueeze(d)
-            return out
-        if kind == LayerKind.SQUEEZE.value:
-            dims = layer.params.get("dims") or []
-            out = inputs[0]
-            for d in sorted(dims, reverse=True):
-                out = out.squeeze(d)
-            return out
-        if kind == LayerKind.RESHAPE.value:
-            target = layer.params.get("target_shape") or layer.params.get("output_shape")
-            if target is None:
-                return inputs[0]
-            input_shape = layer.params.get("input_shape")
-            if input_shape is not None and (int(input_shape[0]) != 1 or int(target[0]) != 1):
-                # A fixed-shape ONNX leading dimension belongs to the model,
-                # not to the verifier's independent sample lanes.
-                return inputs[0].reshape(tuple(int(d) for d in target))
-            # Native templates carry one conceptual lane; preserve the live B.
-            return inputs[0].reshape(inputs[0].shape[0], *target[1:])
-        if kind == LayerKind.MAX.value:
-            if len(inputs) < 2:
-                raise RuntimeError(
-                    f"ActGraphModule: MAX layer {layer.id} expects at least 2 inputs, "
-                    f"got {len(inputs)}."
-                )
-            out = inputs[0]
-            for t in inputs[1:]:
-                out = torch.maximum(out, t)
-            return out
-        if kind == LayerKind.MIN.value:
-            if len(inputs) < 2:
-                raise RuntimeError(
-                    f"ActGraphModule: MIN layer {layer.id} expects at least 2 inputs, "
-                    f"got {len(inputs)}."
-                )
-            out = inputs[0]
-            for t in inputs[1:]:
-                out = torch.minimum(out, t)
-            return out
-        if kind == LayerKind.CONSTANT.value:
-            val = getattr(self, f"_const_value_{layer.id}")
-            target_shape = layer.params.get("output_shape") or layer.params.get("input_shape")
-            if target_shape is not None:
-                val = val.reshape(*target_shape)
-            # A CONSTANT source receives x as inputs[0]; broadcast its leading
-            # (batch) axis to the runtime batch so it concatenates/adds against
-            # batched activations.
-            if inputs and val.dim() >= 1 and val.shape[0] == 1:
-                batch = inputs[0].shape[0]
-                if batch != 1:
-                    val = val.expand(batch, *val.shape[1:])
-            return val.clone()
-        if kind == LayerKind.SIGN.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: SIGN layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            return torch.sign(inputs[0])
-        if kind == LayerKind.REDUCE_SUM.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: REDUCE_SUM layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            axes = layer.params.get("axes")
-            keepdims = bool(layer.params.get("keepdims", 0))
-            if axes is None:
-                axes = tuple(range(inputs[0].dim()))
-            return torch.sum(inputs[0], dim=tuple(int(a) for a in axes), keepdim=keepdims)
-        if kind == LayerKind.COMPARE.value:
-            if len(inputs) != 2:
-                raise RuntimeError(
-                    f"ActGraphModule: COMPARE layer {layer.id} expects exactly 2 inputs, "
-                    f"got {len(inputs)}."
-                )
-            op = layer.params["op"]
-            return getattr(torch, op)(inputs[0], inputs[1]).to(inputs[0].dtype)
-        if kind == LayerKind.WHERE.value:
-            if len(inputs) != 3:
-                raise RuntimeError(
-                    f"ActGraphModule: WHERE layer {layer.id} expects exactly 3 inputs, "
-                    f"got {len(inputs)}."
-                )
-            return torch.where(inputs[0].bool(), inputs[1], inputs[2])
-        if kind == LayerKind.MATMUL.value:
-            if len(inputs) != 2:
-                raise RuntimeError(
-                    f"ActGraphModule: MATMUL layer {layer.id} expects exactly 2 inputs, "
-                    f"got {len(inputs)}."
-                )
-            return torch.matmul(inputs[0], inputs[1])
-        if kind == LayerKind.ARG_EXTREMUM.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: ARG_EXTREMUM layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            op = layer.params["op"]
-            axis = int(layer.params.get("axis", 0))
-            keepdims = bool(layer.params.get("keepdims", 0))
-            fn = torch.argmax if op == "argmax" else torch.argmin
-            return fn(inputs[0], dim=axis, keepdim=keepdims).to(inputs[0].dtype)
-        if kind == LayerKind.UPSAMPLE.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: UPSAMPLE layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            import torch.nn.functional as F
-            mode = str(layer.params.get("mode", "nearest")).lower()
-            scale_factor = layer.params.get("scale_factor")
-            size = layer.params.get("size")
-            kwargs: Dict[str, Any] = {"mode": mode}
-            if mode != "nearest" and layer.params.get("align_corners") is not None:
-                kwargs["align_corners"] = bool(layer.params["align_corners"])
-            if size is not None:
-                kwargs["size"] = tuple(int(s) for s in size)
-            elif scale_factor is not None:
-                kwargs["scale_factor"] = tuple(float(s) for s in scale_factor)
-            return F.interpolate(inputs[0], **kwargs)
-        if kind == LayerKind.EXPAND.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: EXPAND layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            target = layer.params.get("output_shape") or layer.params.get("shape")
-            if target is None:
-                return inputs[0].clone()
-            out_shape = torch.broadcast_shapes(
-                inputs[0].shape, tuple(int(d) for d in target)
+        if arity > 0 and len(inputs) != arity:
+            raise RuntimeError(
+                f"ActGraphModule: {kind} layer {layer.id} expects exactly {arity} "
+                f"input{'s' if arity > 1 else ''}, got {len(inputs)}."
             )
-            return inputs[0].broadcast_to(out_shape).clone()
-        if kind == LayerKind.SCATTER_ND.value:
-            if len(inputs) != 3:
-                raise RuntimeError(
-                    f"ActGraphModule: SCATTER_ND layer {layer.id} expects exactly 3 inputs, "
-                    f"got {len(inputs)}."
-                )
-            data, idx, upd = inputs
-            out = data.clone()
-            idx_long = idx.long()
-            if idx_long.dim() == 1:
-                idx_long = idx_long.unsqueeze(-1)
-            indices_per_dim = tuple(idx_long[..., d] for d in range(idx_long.shape[-1]))
-            out.index_put_(indices_per_dim, upd, accumulate=False)
-            return out
-        if kind == LayerKind.PAD.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: PAD layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            import torch.nn.functional as F
-            pad = layer.params.get("pad")
-            if pad is None:
-                pad = layer.params.get("pads")
-            if pad is None:
-                return inputs[0].clone()
-            pad_list = [int(p) for p in pad]
-            mode = str(layer.params.get("mode", "constant")).lower()
-            if mode == "constant":
-                value = float(layer.params.get("value", 0.0))
-                return F.pad(inputs[0], pad_list, mode=mode, value=value)
-            return F.pad(inputs[0], pad_list, mode=mode)
-        if kind == LayerKind.MASK_ADD.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: MASK_ADD layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            M = layer.params["M"].to(
-                device=inputs[0].device, dtype=inputs[0].dtype
-            )
-            return inputs[0] + M
-        if kind == LayerKind.MHA_SPLIT.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: MHA_SPLIT layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            import torch.nn.functional as F
-            x = inputs[0]
-            weight = layer.params["weight"].to(device=x.device, dtype=x.dtype)
-            bias_param = layer.params.get("bias")
-            bias = bias_param.to(device=x.device, dtype=x.dtype) if isinstance(bias_param, torch.Tensor) else None
-            if x.dim() >= 3:
-                projected = F.linear(x.reshape(x.shape[0], -1, weight.shape[1]), weight, bias)
-            else:
-                projected = F.linear(x.reshape(x.shape[0], -1, weight.shape[1]), weight, bias)
-            role = str(layer.params.get("role", ""))
-            if role in {"query", "key"}:
-                position = int(layer.params.get("position", 0))
-                hidden = int(layer.params.get("hidden_size", projected.shape[-1]))
-                seq_len = projected.shape[1] if projected.dim() >= 3 else max(projected.shape[-1] // max(hidden, 1), 1)
-                projected = projected.reshape(x.shape[0], seq_len, hidden)
-                return projected[:, position, :]
-            if role == "value":
-                feature = int(layer.params.get("feature", 0))
-                hidden = int(layer.params.get("hidden_size", projected.shape[-1]))
-                seq_len = projected.shape[1] if projected.dim() >= 3 else max(projected.shape[-1] // max(hidden, 1), 1)
-                projected = projected.reshape(x.shape[0], seq_len, hidden)
-                return projected[:, :, feature]
-            return projected
-        if kind == LayerKind.ATT_SCORES.value:
-            if len(inputs) != 2:
-                raise RuntimeError(
-                    f"ActGraphModule: ATT_SCORES layer {layer.id} expects exactly 2 inputs, "
-                    f"got {len(inputs)}."
-                )
-            scale = float(layer.params["dk"])
-            return (inputs[0] * inputs[1]).sum(dim=-1, keepdim=True) / scale
-        if kind == LayerKind.ATT_MIX.value:
-            if len(inputs) != 2:
-                raise RuntimeError(
-                    f"ActGraphModule: ATT_MIX layer {layer.id} expects exactly 2 inputs, "
-                    f"got {len(inputs)}."
-                )
-            return (inputs[0] * inputs[1]).sum(dim=-1, keepdim=True)
-        if kind == LayerKind.MHA_JOIN.value:
-            if not inputs:
-                raise RuntimeError(f"ActGraphModule: MHA_JOIN layer {layer.id} expects inputs.")
-            out = torch.cat(inputs, dim=-1)
-            seq_len = int(layer.params.get("seq_len", 1))
-            hidden = int(layer.params.get("hidden_size", out.shape[-1]))
-            if seq_len == 1:
-                return out.reshape(out.shape[0], 1, hidden)
-            return out.reshape(out.shape[0], seq_len, hidden)
-        if kind == LayerKind.POSENC.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: POSENC layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            P = layer.params["pos_vec"].to(
-                device=inputs[0].device, dtype=inputs[0].dtype
-            )
-            return inputs[0] + P
-        if kind == LayerKind.LAYERNORM.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: LAYERNORM layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            import torch.nn.functional as F
-            gamma = layer.params["gamma"].to(
-                device=inputs[0].device, dtype=inputs[0].dtype
-            )
-            beta = layer.params["beta"].to(
-                device=inputs[0].device, dtype=inputs[0].dtype
-            )
-            eps = float(layer.params.get("eps", 1e-5))
-            return F.layer_norm(
-                inputs[0], gamma.shape, weight=gamma, bias=beta, eps=eps
-            )
-        if kind == LayerKind.SQUARE.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: SQUARE layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            return inputs[0] * inputs[0]
-        if kind == LayerKind.POWER.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: POWER layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            p = float(layer.params["p"])
-            return torch.pow(torch.clamp(inputs[0], min=0.0), p)
-        if kind == LayerKind.SUB.value:
-            if len(inputs) != 2:
-                raise RuntimeError(
-                    f"ActGraphModule: SUB layer {layer.id} expects exactly 2 inputs, "
-                    f"got {len(inputs)}."
-                )
-            return inputs[0] - inputs[1]
-        if kind == LayerKind.DIV.value:
-            if len(inputs) != 2:
-                raise RuntimeError(
-                    f"ActGraphModule: DIV layer {layer.id} expects exactly 2 inputs, "
-                    f"got {len(inputs)}."
-                )
-            return inputs[0] / inputs[1]
-        if kind == LayerKind.ABS.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: ABS layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            return torch.abs(inputs[0])
-        if kind == LayerKind.BN.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: BN layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            A = layer.params["A"].to(device=inputs[0].device, dtype=inputs[0].dtype)
-            c = layer.params["c"].to(device=inputs[0].device, dtype=inputs[0].dtype)
-            return A * inputs[0] + c
-        if kind == LayerKind.SLICE.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: SLICE layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            starts = layer.params["starts"]
-            ends = layer.params["ends"]
-            axes = layer.params.get("axes")
-            steps = layer.params.get("steps")
-            x = inputs[0]
-            if axes is None:
-                axes = list(range(len(starts)))
-            if steps is None:
-                steps = [1] * len(starts)
-            # Axis indices may be per-sample (excluding batch) or over the full
-            # input_shape (which already includes a leading dim). Shift by +1
-            # only when the live tensor carries an extra leading axis.
-            shift = _axis_shift(layer.params.get("input_shape"), x)
-            for s, e, a, st in zip(starts, ends, axes, steps):
-                dim = int(a) + shift
-                st = int(st)
-                if st == 1:
-                    x = x.narrow(dim, int(s), int(e) - int(s))
-                else:
-                    # narrow cannot express a stride, so a strided step must be
-                    # realised by explicit indexing to match the analyzed Net.
-                    end = min(int(e), x.shape[dim])
-                    idx = torch.arange(int(s), end, st, device=x.device)
-                    x = x.index_select(dim, idx)
-            return x
-        if kind == LayerKind.GATHER.value:
-            if len(inputs) != 1:
-                raise RuntimeError(
-                    f"ActGraphModule: GATHER layer {layer.id} expects exactly 1 input, "
-                    f"got {len(inputs)}."
-                )
-            indices = layer.params["indices"]
-            axis = int(layer.params.get("axis", 0))
-            # Same axis convention as SLICE (see _axis_shift).
-            shift = _axis_shift(layer.params.get("input_shape"), inputs[0])
-            idx = torch.as_tensor(indices, dtype=torch.long, device=inputs[0].device)
-            return torch.index_select(inputs[0], dim=axis + shift, index=idx)
-        if kind == LayerKind.MEAN.value:
-            keepdim = bool(layer.params.get("keepdim", 0))
-            shift = _axis_shift(layer.params.get("input_shape"), inputs[0])
-            dims = [int(d) + shift for d in layer.params["dim"]]
-            return inputs[0].mean(dim=dims, keepdim=keepdim)
-        raise NotImplementedError(
-            f"ActGraphModule: functional layer kind '{kind}' (id={layer.id}) not supported."
-        )
+        return _absorb_lanes(layer, handler(self, layer, inputs))
+
+
+# Input-count rule per functional kind: a positive int is an exact count.
+_UNCHECKED, _AT_LEAST_TWO = 0, -2
+_Functional = Callable[[ActGraphModule, Layer, list[torch.Tensor]], torch.Tensor]
+
+
+def _absorb_lanes(layer: Layer, out: torch.Tensor) -> torch.Tensor:
+    """Give every output stored with a unit leading dimension one lane layout.
+
+    An output stored as ``(1, *rest)`` lives as ``(B, *rest)``: the unit model
+    batch carries the lanes, as in _reshape. A handler that kept the lanes on
+    an extra leading axis (see _axis_shift) returns ``(B, 1, *rest)``; that unit
+    axis is folded. A stored ``(1,)`` keeps its value axis, ``(B, 1)``, so that
+    operands of a later elementwise layer always align lane by lane.
+    """
+    shape = layer.params.get("output_shape")
+    if not shape or int(shape[0]) != 1:
+        return out
+    if len(shape) == 1:
+        return out.unsqueeze(1) if out.dim() == 1 else out
+    if out.dim() == len(shape) + 1 and out.shape[1] == 1:
+        return out.squeeze(1)
+    return out
+
+
+def _fold(combine: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]) -> _Functional:
+    """Left-fold handler for a variadic elementwise kind."""
+    def handler(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+        out = inputs[0]
+        for t in inputs[1:]:
+            out = combine(out, t)
+        return out
+    return handler
+
+
+def _transpose(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    perm = layer.params.get("perm")
+    if perm is None:
+        return inputs[0]
+    # Same axis convention as SLICE (see _axis_shift): lanes stay in front.
+    if _axis_shift(layer.params.get("input_shape"), inputs[0]):
+        perm = [0, *(int(p) + 1 for p in perm)]
+    return inputs[0].permute(*perm).contiguous()
+
+
+def _unsqueeze(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    dims = layer.params.get("dims") or []
+    out = inputs[0]
+    for d in sorted(dims):
+        out = out.unsqueeze(d)
+    return out
+
+
+def _squeeze(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    dims = layer.params.get("dims") or []
+    out = inputs[0]
+    input_shape = layer.params.get("input_shape")
+    shift = _axis_shift(input_shape, out) if input_shape is not None else 0
+    for d in sorted(dims, reverse=True):
+        # Without a shift the stored axis 0 is the live sample-lane axis (template
+        # size 1): squeezing it would drop the lanes, so torch2act keeps it too.
+        if d + shift == 0:
+            continue
+        out = out.squeeze(d + shift)
+    return out
+
+
+def _reshape(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    target = layer.params.get("target_shape") or layer.params.get("output_shape")
+    if target is None:
+        return inputs[0]
+    x, target = inputs[0], tuple(int(d) for d in target)
+    input_shape = layer.params.get("input_shape")
+    if input_shape is not None and (int(input_shape[0]) != 1 or target[0] != 1):
+        # A fixed-shape ONNX leading dimension belongs to the model, not to
+        # the verifier's lanes: each lane holds one ``input_shape`` sample.
+        # Several lanes ride on an extra leading axis (see _axis_shift),
+        # which a unit model batch absorbs.
+        per_lane = torch.Size(int(d) for d in input_shape).numel()
+        lanes = x.numel() // per_lane if per_lane > 0 else 1
+        if lanes > 1:
+            return x.reshape(lanes, *(target[1:] if target[0] == 1 else target))
+        return x.reshape(target)
+    # Native templates carry one conceptual lane; preserve the live B.
+    return x.reshape(x.shape[0], *target[1:])
+
+
+def _constant(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    val = getattr(graph, f"_const_value_{layer.id}")
+    target_shape = layer.params.get("output_shape") or layer.params.get("input_shape")
+    if target_shape is not None:
+        val = val.reshape(*target_shape)
+    # A CONSTANT source receives x as inputs[0]; broadcast its leading
+    # (batch) axis to the runtime batch so it concatenates/adds against
+    # batched activations.
+    if inputs and val.dim() >= 1 and val.shape[0] == 1:
+        batch = inputs[0].shape[0]
+        if batch != 1:
+            val = val.expand(batch, *val.shape[1:])
+    return val.clone()
+
+
+def _reduce_sum(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    axes = layer.params.get("axes")
+    keepdims = bool(layer.params.get("keepdims", 0))
+    if axes is None:
+        axes = tuple(range(inputs[0].dim()))
+    return torch.sum(inputs[0], dim=tuple(int(a) for a in axes), keepdim=keepdims)
+
+
+def _arg_extremum(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    op = layer.params["op"]
+    axis = int(layer.params.get("axis", 0))
+    keepdims = bool(layer.params.get("keepdims", 0))
+    fn = torch.argmax if op == "argmax" else torch.argmin
+    axis += _axis_shift(layer.params.get("input_shape"), inputs[0])
+    return fn(inputs[0], dim=axis, keepdim=keepdims).to(inputs[0].dtype)
+
+
+def _upsample(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    import torch.nn.functional as F
+    mode = str(layer.params.get("mode", "nearest")).lower()
+    scale_factor = layer.params.get("scale_factor")
+    size = layer.params.get("size")
+    kwargs: dict[str, Any] = {"mode": mode}
+    if mode != "nearest" and layer.params.get("align_corners") is not None:
+        kwargs["align_corners"] = bool(layer.params["align_corners"])
+    if size is not None:
+        kwargs["size"] = tuple(int(s) for s in size)
+    elif scale_factor is not None:
+        kwargs["scale_factor"] = tuple(float(s) for s in scale_factor)
+    return F.interpolate(inputs[0], **kwargs)
+
+
+def _expand(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    target = layer.params.get("output_shape") or layer.params.get("shape")
+    if target is None:
+        return inputs[0].clone()
+    out_shape = torch.broadcast_shapes(inputs[0].shape, tuple(int(d) for d in target))
+    return inputs[0].broadcast_to(out_shape).clone()
+
+
+def _scatter_nd(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    data, idx, upd = inputs
+    out = data.clone()
+    idx_long = idx.long()
+    if idx_long.dim() == 1:
+        idx_long = idx_long.unsqueeze(-1)
+    indices_per_dim = tuple(idx_long[..., d] for d in range(idx_long.shape[-1]))
+    out.index_put_(indices_per_dim, upd, accumulate=False)
+    return out
+
+
+def _pad(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    import torch.nn.functional as F
+    pad = layer.params.get("pad")
+    if pad is None:
+        pad = layer.params.get("pads")
+    if pad is None:
+        return inputs[0].clone()
+    pad_list = [int(p) for p in pad]
+    mode = str(layer.params.get("mode", "constant")).lower()
+    if mode == "constant":
+        value = float(layer.params.get("value", 0.0))
+        return F.pad(inputs[0], pad_list, mode=mode, value=value)
+    return F.pad(inputs[0], pad_list, mode=mode)
+
+
+def _mha_split(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    import torch.nn.functional as F
+    x = inputs[0]
+    weight = layer.params["weight"].to(device=x.device, dtype=x.dtype)
+    bias_param = layer.params.get("bias")
+    bias = bias_param.to(device=x.device, dtype=x.dtype) if isinstance(bias_param, torch.Tensor) else None
+    projected = F.linear(x.reshape(x.shape[0], -1, weight.shape[1]), weight, bias)
+    role = str(layer.params.get("role", ""))
+    if role in {"query", "key"}:
+        position = int(layer.params.get("position", 0))
+        hidden = int(layer.params.get("hidden_size", projected.shape[-1]))
+        seq_len = projected.shape[1] if projected.dim() >= 3 else max(projected.shape[-1] // max(hidden, 1), 1)
+        projected = projected.reshape(x.shape[0], seq_len, hidden)
+        return projected[:, position, :]
+    if role == "value":
+        feature = int(layer.params.get("feature", 0))
+        hidden = int(layer.params.get("hidden_size", projected.shape[-1]))
+        seq_len = projected.shape[1] if projected.dim() >= 3 else max(projected.shape[-1] // max(hidden, 1), 1)
+        projected = projected.reshape(x.shape[0], seq_len, hidden)
+        return projected[:, :, feature]
+    return projected
+
+
+def _att_scores(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    scale = float(layer.params["dk"])
+    return (inputs[0] * inputs[1]).sum(dim=-1, keepdim=True) / scale
+
+
+def _mha_join(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    if not inputs:
+        raise RuntimeError(f"ActGraphModule: MHA_JOIN layer {layer.id} expects inputs.")
+    out = torch.cat(inputs, dim=-1)
+    seq_len = int(layer.params.get("seq_len", 1))
+    hidden = int(layer.params.get("hidden_size", out.shape[-1]))
+    return out.reshape(out.shape[0], seq_len, hidden)
+
+
+def _layernorm(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    import torch.nn.functional as F
+    gamma = layer.params["gamma"].to(device=inputs[0].device, dtype=inputs[0].dtype)
+    beta = layer.params["beta"].to(device=inputs[0].device, dtype=inputs[0].dtype)
+    eps = float(layer.params.get("eps", 1e-5))
+    return F.layer_norm(inputs[0], gamma.shape, weight=gamma, bias=beta, eps=eps)
+
+
+def _power(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    p = float(layer.params["p"])
+    return torch.pow(torch.clamp(inputs[0], min=0.0), p)
+
+
+def _bn(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    A = layer.params["A"].to(device=inputs[0].device, dtype=inputs[0].dtype)
+    c = layer.params["c"].to(device=inputs[0].device, dtype=inputs[0].dtype)
+    return A * inputs[0] + c
+
+
+def _slice(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    starts = layer.params["starts"]
+    ends = layer.params["ends"]
+    axes = layer.params.get("axes")
+    steps = layer.params.get("steps")
+    x = inputs[0]
+    if axes is None:
+        axes = list(range(len(starts)))
+    if steps is None:
+        steps = [1] * len(starts)
+    # Axis indices may be per-sample (excluding batch) or over the full
+    # input_shape (which already includes a leading dim). Shift by +1
+    # only when the live tensor carries an extra leading axis.
+    shift = _axis_shift(layer.params.get("input_shape"), x)
+    for s, e, a, st in zip(starts, ends, axes, steps):
+        dim = int(a) + shift
+        st = int(st)
+        if st == 1:
+            x = x.narrow(dim, int(s), int(e) - int(s))
+        else:
+            # narrow cannot express a stride, so a strided step must be
+            # realised by explicit indexing to match the analyzed Net.
+            end = min(int(e), x.shape[dim])
+            idx = torch.arange(int(s), end, st, device=x.device)
+            x = x.index_select(dim, idx)
+    return x
+
+
+def _gather(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    indices = layer.params["indices"]
+    axis = int(layer.params.get("axis", 0))
+    # Same axis convention as SLICE (see _axis_shift).
+    shift = _axis_shift(layer.params.get("input_shape"), inputs[0])
+    if axis + shift == 0:
+        # Stored axis 0 is the unit model batch that carries the lanes (as in
+        # _squeeze): its only index selects every lane's own sample.
+        return inputs[0]
+    idx = torch.as_tensor(indices, dtype=torch.long, device=inputs[0].device)
+    return torch.index_select(inputs[0], dim=axis + shift, index=idx)
+
+
+def _mean(graph: ActGraphModule, layer: Layer, inputs: list[torch.Tensor]) -> torch.Tensor:
+    keepdim = bool(layer.params.get("keepdim", 0))
+    shift = _axis_shift(layer.params.get("input_shape"), inputs[0])
+    dims = [int(d) + shift for d in layer.params["dim"]]
+    return inputs[0].mean(dim=dims, keepdim=keepdim)
+
+
+_FUNCTIONAL_HANDLERS: dict[str, tuple[int, _Functional]] = {
+    LayerKind.ADD.value: (_AT_LEAST_TWO, _fold(lambda a, b: a + b)),
+    LayerKind.CONCAT.value: (
+        _AT_LEAST_TWO, lambda g, layer, xs: torch.cat(xs, dim=layer.params.get("concat_dim", 1))),
+    LayerKind.MUL.value: (_AT_LEAST_TWO, _fold(lambda a, b: a * b)),
+    LayerKind.SCALE.value: (_UNCHECKED, lambda g, layer, xs: xs[0] * _align_elementwise_param(
+        getattr(g, f"_scale_a_{layer.id}"), xs[0], layer.params.get("input_shape"))),
+    LayerKind.BIAS.value: (_UNCHECKED, lambda g, layer, xs: xs[0] + _align_elementwise_param(
+        getattr(g, f"_bias_c_{layer.id}"), xs[0], layer.params.get("input_shape"))),
+    LayerKind.TRANSPOSE.value: (_UNCHECKED, _transpose),
+    LayerKind.UNSQUEEZE.value: (_UNCHECKED, _unsqueeze),
+    LayerKind.SQUEEZE.value: (_UNCHECKED, _squeeze),
+    LayerKind.RESHAPE.value: (_UNCHECKED, _reshape),
+    LayerKind.MAX.value: (_AT_LEAST_TWO, _fold(torch.maximum)),
+    LayerKind.MIN.value: (_AT_LEAST_TWO, _fold(torch.minimum)),
+    LayerKind.CONSTANT.value: (_UNCHECKED, _constant),
+    LayerKind.SIGN.value: (1, lambda g, layer, xs: step_function(layer.kind, layer.params)(xs[0])),
+    LayerKind.ROUND.value: (1, lambda g, layer, xs: step_function(layer.kind, layer.params)(xs[0])),
+    LayerKind.REDUCE_SUM.value: (1, _reduce_sum),
+    LayerKind.COMPARE.value: (
+        2, lambda g, layer, xs: getattr(torch, layer.params["op"])(xs[0], xs[1]).to(xs[0].dtype)),
+    LayerKind.WHERE.value: (3, lambda g, layer, xs: torch.where(xs[0].bool(), xs[1], xs[2])),
+    LayerKind.MATMUL.value: (2, lambda g, layer, xs: torch.matmul(xs[0], xs[1])),
+    LayerKind.ARG_EXTREMUM.value: (1, _arg_extremum),
+    LayerKind.UPSAMPLE.value: (1, _upsample),
+    LayerKind.EXPAND.value: (1, _expand),
+    LayerKind.SCATTER_ND.value: (3, _scatter_nd),
+    LayerKind.PAD.value: (1, _pad),
+    LayerKind.MASK_ADD.value: (1, lambda g, layer, xs: xs[0] + layer.params["M"].to(
+        device=xs[0].device, dtype=xs[0].dtype)),
+    LayerKind.MHA_SPLIT.value: (1, _mha_split),
+    LayerKind.ATT_SCORES.value: (2, _att_scores),
+    LayerKind.ATT_MIX.value: (2, lambda g, layer, xs: (xs[0] * xs[1]).sum(dim=-1, keepdim=True)),
+    LayerKind.MHA_JOIN.value: (_UNCHECKED, _mha_join),
+    LayerKind.POSENC.value: (1, lambda g, layer, xs: xs[0] + layer.params["pos_vec"].to(
+        device=xs[0].device, dtype=xs[0].dtype)),
+    LayerKind.LAYERNORM.value: (1, _layernorm),
+    LayerKind.SQUARE.value: (1, lambda g, layer, xs: xs[0] * xs[0]),
+    LayerKind.POWER.value: (1, _power),
+    LayerKind.SUB.value: (2, lambda g, layer, xs: xs[0] - xs[1]),
+    LayerKind.DIV.value: (2, lambda g, layer, xs: xs[0] / xs[1]),
+    LayerKind.ABS.value: (1, lambda g, layer, xs: torch.abs(xs[0])),
+    LayerKind.BN.value: (1, _bn),
+    LayerKind.SLICE.value: (1, _slice),
+    LayerKind.GATHER.value: (1, _gather),
+    LayerKind.MEAN.value: (_UNCHECKED, _mean),
+}
+
+
+
 
 
 class ACTToTorch:
@@ -957,13 +898,11 @@ class ACTToTorch:
 
         # Multiple INPUT_SPEC layers are allowed (the verifier handles each
         # spec independently via add_all_input_specs). The PyTorch model
-        # only needs ONE spec for concrete input-satisfaction checks in
-        # find_concrete_counterexample; pick the BOX/LINF_BALL seed using
-        # the same priority as seed_from_input_specs. LIN_POLY refinements
-        # are kept on the ACT Net for the symbolic verifier path; at the
-        # concrete inference level they are not enforced (any sampled x
-        # outside the polytope simply fails to be a true counterexample to
-        # the joint spec, which is benign for soundness).
+        # carries ONE spec for concrete input-satisfaction checks; pick the
+        # BOX/LINF_BALL seed using the same priority as seed_from_input_specs.
+        # LIN_POLY layers next to a BOX seed are folded into that spec below,
+        # so concrete checks (and the fuzzer's projection) enforce A·x <= b
+        # as the verifier does.
         seed_spec_act = next(
             (L for L in input_spec_acts
              if L.params.get("kind") in ("BOX", "LINF_BALL", "LP_EMBEDDING")),
@@ -1011,6 +950,15 @@ class ACTToTorch:
                 input_spec_dict[param_key] = _to_target_float_tensor(
                     input_spec_params[param_key]
                 )
+        poly_acts = [L for L in input_spec_acts if L.params.get("kind") == "LIN_POLY"]
+        if poly_acts and input_spec_kind == InKind.BOX:
+            input_spec_dict["kind"] = InKind.LIN_POLY
+            input_spec_dict["A"] = torch.cat(
+                [_to_target_float_tensor(L.params["A"]) for L in poly_acts], dim=-2
+            )
+            input_spec_dict["b"] = torch.cat(
+                [_to_target_float_tensor(L.params["b"]) for L in poly_acts], dim=-1
+            )
         input_spec_mod = InputSpecLayer(InputSpec(**input_spec_dict))
 
         body_ids = {layer.id for layer in body_acts}
@@ -1034,9 +982,9 @@ class ACTToTorch:
         # original order and multiplicity (e.g. h + h reads h twice).
         topo_order = [lid for lid in get_topo_order(self.act_net) if lid in body_ids]
 
-        layer_modules: Dict[int, Optional[nn.Module]] = {}
-        skip_ids: Set[int] = set()
-        bn_aliases: Dict[int, int] = {}
+        layer_modules: dict[int, nn.Module | None] = {}
+        skip_ids: set[int] = set()
+        bn_aliases: dict[int, int] = {}
         layer_indices = {layer.id: idx for idx, layer in enumerate(self.act_net.layers)}
 
         for act_layer in body_acts:
@@ -1153,6 +1101,8 @@ class ACTToTorch:
             )
         if "d" in output_params:
             output_spec_dict["d"] = _to_target_float_tensor(output_params["d"])
+        if "strict" in output_params:
+            output_spec_dict["strict"] = _to_target_tensor(output_params["strict"])
         for param_key in ["c", "lb", "ub"]:
             if param_key in output_params:
                 output_spec_dict[param_key] = _to_target_float_tensor(
@@ -1174,7 +1124,7 @@ class ACTToTorch:
         )
         return model
 
-    def _find_paired_bias(self, scale_idx: int) -> Optional[Layer]:
+    def _find_paired_bias(self, scale_idx: int) -> Layer | None:
         """Find BIAS layer paired with SCALE at given index."""
         layers = self.act_net.layers
         for j in range(scale_idx + 1, len(layers)):
@@ -1188,7 +1138,7 @@ class ACTToTorch:
                 break
         return None
 
-    def _restore_batchnorm(self, scale_layer: Layer) -> Optional[nn.Module]:
+    def _restore_batchnorm(self, scale_layer: Layer) -> nn.Module | None:
         """Restore BatchNorm from SCALE layer with batchnorm_* params."""
         params = scale_layer.params
 
@@ -1201,12 +1151,12 @@ class ACTToTorch:
         cls = getattr(importlib.import_module(mod_name), cls_name)
 
         # Create BatchNorm instance
-        args = cast(List[Any], params.get("batchnorm_args", []))
-        kwargs = cast(Dict[str, Any], params.get("batchnorm_kwargs", {}))
+        args = cast(list[Any], params.get("batchnorm_args", []))
+        kwargs = cast(dict[str, Any], params.get("batchnorm_kwargs", {}))
         bn = cls(*args, **kwargs)
 
         # Load state from batchnorm_state
-        bn_state = cast(Dict[str, Any], params.get("batchnorm_state", {}))
+        bn_state = cast(dict[str, Any], params.get("batchnorm_state", {}))
         if bn_state:
             state_dict = {}
             for key in [
@@ -1223,7 +1173,7 @@ class ACTToTorch:
 
         return bn
 
-    def _build_from_schema(self, act_layer: Layer) -> Optional[nn.Module]:
+    def _build_from_schema(self, act_layer: Layer) -> nn.Module | None:
         """Build PyTorch module from REGISTRY params + ACT_TO_TORCH mapping."""
         kind = act_layer.kind
         params = act_layer.params
@@ -1274,8 +1224,8 @@ class ACTToTorch:
         if kind == LayerKind.MHA_SPLIT.value:
             hidden_size = params.get("hidden_size")
             return ACTMHASplit(
-                weight=cast(Optional[torch.Tensor], params.get("weight")),
-                bias=cast(Optional[torch.Tensor], params.get("bias")),
+                weight=cast(torch.Tensor | None, params.get("weight")),
+                bias=cast(torch.Tensor | None, params.get("bias")),
                 role=str(params.get("role", "")),
                 position=int(cast(Any, params.get("position", 0))),
                 feature=int(cast(Any, params.get("feature", 0))),
@@ -1284,7 +1234,7 @@ class ACTToTorch:
         if kind == LayerKind.ATT_SCORES.value:
             return ACTAttentionScores(
                 dk=float(cast(Any, params["dk"])),
-                mask=cast(Optional[torch.Tensor], params.get("mask")),
+                mask=cast(torch.Tensor | None, params.get("mask")),
             )
         if kind == LayerKind.ATT_MIX.value:
             return ACTAttentionMix()
@@ -1351,6 +1301,8 @@ class ACTToTorch:
                     kwargs[key] = params[key]
         if kind == LayerKind.GELU.value and "approximate" in params:
             kwargs["approximate"] = params["approximate"]
+        if kind == LayerKind.CONVTRANSPOSE2D.value and "output_padding" in params:
+            kwargs["output_padding"] = params["output_padding"]
 
         # Create module instance
         m = cls(*args, **kwargs)
@@ -1379,7 +1331,7 @@ class ACTToTorch:
                 f"{params['num_layers']}, only single-layer is supported."
             )
 
-        ctor_kwargs: Dict[str, Any] = {
+        ctor_kwargs: dict[str, Any] = {
             "input_size":   int(cast(Any, params["input_size"])),
             "hidden_size":  int(cast(Any, params["hidden_size"])),
             "num_layers":   1,

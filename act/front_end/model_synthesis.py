@@ -26,6 +26,7 @@ if __name__ == "__main__" and __package__ is None:
     sys.exit(1)
 
 import copy
+import dataclasses
 import torch
 import torch.fx as fx
 import torch.nn as nn
@@ -73,6 +74,32 @@ def _assert_same_center_shape(in_specs: List[InputSpec]) -> None:
     assert first_center is not None
     assert all(s.center is not None and s.center.shape == first_center.shape for s in in_specs), \
         f"InputSpec.center shape mismatch: {[s.center.shape if s.center is not None else None for s in in_specs]}"
+
+
+def _pad_unsafe_rows(out_specs: List[OutputSpec]) -> List[OutputSpec]:
+    """Give every UNSAFE_LINEAR lane the group's largest row count.
+
+    A lane's unsafe set is the conjunction of its rows, so repeating one of its
+    own rows leaves the set, its bounds and its witness ranking unchanged. This
+    lets disjunct queries with different row counts share one model.
+    """
+    rows = max(s.c.reshape(-1, s.c.shape[-1]).shape[0] for s in out_specs)
+    padded: List[OutputSpec] = []
+    for spec in out_specs:
+        c = spec.c.reshape(-1, spec.c.shape[-1])
+        extra = rows - c.shape[0]
+        if extra == 0:
+            padded.append(spec)
+            continue
+        d = spec.d.reshape(-1)
+        strict = None if spec.strict is None else spec.strict.reshape(-1)
+        padded.append(dataclasses.replace(
+            spec,
+            c=torch.cat([c, c[:1].expand(extra, -1)]),
+            d=torch.cat([d, d[:1].expand(extra)]),
+            strict=None if strict is None else torch.cat([strict, strict[:1].expand(extra)]),
+        ))
+    return padded
 
 
 def _merge_specs_to_batch[O: BaseOutputSpec](
@@ -198,6 +225,10 @@ def _merge_specs_to_batch[O: BaseOutputSpec](
         eps = torch.stack(eps_values).reshape(center.shape[0], *([1] * (center.ndim - 1)))
         p_norm = torch.stack(p_norm_values)
         perturbed_positions = torch.cat(position_masks, dim=0)
+    elif in_kind == InKind.LIN_POLY:
+        # Grouped one lane at a time (see synthesize_models_and_seeds_from_specs).
+        (spec,) = in_specs
+        lb, ub, center, eps = spec.lb, spec.ub, None, None
     else:
         raise NotImplementedError(f"Batching for {in_kind} not implemented")
     
@@ -214,6 +245,8 @@ def _merge_specs_to_batch[O: BaseOutputSpec](
             p_norm=p_norm,
             perturbed_positions=perturbed_positions,
         )
+    elif in_kind == InKind.LIN_POLY:
+        batched_in = in_specs[0]
     else:
         batched_in = InputSpec(kind=in_kind, lb=lb, ub=ub, center=center, eps=eps)
 
@@ -325,23 +358,26 @@ def synthesize_models_and_seeds_from_specs(
         for idx, (in_spec, out_spec) in enumerate(spec_pairs):
             lt = labeled_tensors[min(idx // sps if sps > 0 else 0, len(labeled_tensors) - 1)]
             cd_sig: Any = None
+
             if out_spec.get_kind() in (OutKind.UNSAFE_LINEAR, OutKind.LINEAR_LE) and out_spec.c is not None:
-                merge_d = (
-                    cd_group == "shape" and out_spec.get_kind() is OutKind.UNSAFE_LINEAR
+                # "shape" merges UNSAFE_LINEAR lanes whose c and d differ in value only;
+                # each lane keeps its own rows and thresholds.
+                merge_cd = (
+                    cd_group == "shape" and out_spec.kind is OutKind.UNSAFE_LINEAR
                 )
-                if out_spec.d is None:
-                    d_sig: Any = None
-                elif merge_d:
-                    d_sig = tuple(out_spec.d.shape)
+                if merge_cd:
+                    # Row counts may differ too: _pad_unsafe_rows aligns them.
+                    cd_sig = (int(out_spec.c.shape[-1]),)
                 else:
-                    d_sig = out_spec.d.detach().cpu().reshape(-1).numpy().tobytes()
-                cd_sig = (
-                    tuple(out_spec.c.shape),
-                    out_spec.c.detach().cpu().reshape(-1).numpy().tobytes(),
-                    d_sig,
-                )
+                    cd_sig = (
+                        tuple(out_spec.c.shape),
+                        out_spec.c.detach().cpu().reshape(-1).numpy().tobytes(),
+                        None if out_spec.d is None
+                        else out_spec.d.detach().cpu().reshape(-1).numpy().tobytes(),
+                    )
             gkey = (data_source, mid, in_spec.kind, out_spec.get_kind(), cd_sig)
-            if _is_fixed_model_input(lt, in_spec):
+            # A LIN_POLY lane keeps its own polytope A x <= b, so it is never merged.
+            if _is_fixed_model_input(lt, in_spec) or in_spec.kind == InKind.LIN_POLY:
                 gkey += (result_index, idx)
             groups[gkey].append((lt, in_spec, out_spec, f"{data_source}:{model_name}:s{idx}"))
     
