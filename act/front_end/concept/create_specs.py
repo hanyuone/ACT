@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader
 
 from act.front_end.concept.input_spec import ConceptInputSpec
 from act.front_end.concept.output_spec import (
+    CombinedOutputSpec,
     ConceptOutKind,
     ConceptOutputSpec,
     Confidence,
@@ -75,7 +76,7 @@ class ConceptSpecCreator(BaseSpecCreator):
 
     def _create_output_specs(
         self, num_elements: int, label: Tensor
-    ) -> list[tuple[ConceptOutputSpec, OutputSpec]]:
+    ) -> list[CombinedOutputSpec]:
         """
         Args:
         - `label`: [batch_size]
@@ -87,7 +88,9 @@ class ConceptSpecCreator(BaseSpecCreator):
             match spec_type:
                 case ConceptOutKind.CONFIDENCE:
                     threshold = torch.tensor([self.confidence_threshold])
-                    concept_output_specs.append(Confidence(num_elements, label, threshold))
+                    concept_output_specs.append(
+                        Confidence(num_elements, label, threshold)
+                    )
                 case ConceptOutKind.TOP_N:
                     threshold = torch.tensor([self.ranking_threshold])
                     concept_output_specs.append(TopN(num_elements, label, threshold))
@@ -116,7 +119,11 @@ class ConceptSpecCreator(BaseSpecCreator):
         # Currently only supporting TOP1_ROBUST as class spec
         class_output_specs.append(OutputSpec(kind=OutKind.TOP1_ROBUST, y_true=label))
 
-        return [(con, cls) for con in concept_output_specs for cls in class_output_specs]
+        return [
+            CombinedOutputSpec(con, cls)
+            for con in concept_output_specs
+            for cls in class_output_specs
+        ]
 
     def _dataset_model_spec(
         self,
@@ -147,7 +154,7 @@ class ConceptSpecCreator(BaseSpecCreator):
             input_specs = self._create_input_specs(images, masks)
             output_specs = self._create_output_specs(num_elements, targets)
 
-            pairs = [(i, o[0], o[1]) for i in input_specs for o in output_specs]
+            pairs = [(i, o) for i in input_specs for o in output_specs]
             spec_pairs.extend(pairs)
 
         if not spec_pairs:

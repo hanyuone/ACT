@@ -14,13 +14,13 @@ import logging
 import torch
 from torch import nn
 
-from act.front_end.specs import InputSpec, OutputSpec, InKind, OutKind
+from act.front_end.specs import InputSpec, OutputSpec, InKind, OutKind, BaseOutputSpec
 from act.config.config import FrontEndConfig
 
 
 logger = logging.getLogger(__name__)
 
-type SpecTuple = tuple[str, str, nn.Module, list[LabeledInputTensor], Sequence[tuple[InputSpec, OutputSpec]]]
+type SpecTuple = tuple[str, str, nn.Module, list[LabeledInputTensor], Sequence[tuple[InputSpec, BaseOutputSpec]]]
 
 @dataclass
 class LabeledInputTensor:
