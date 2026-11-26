@@ -1,3 +1,5 @@
+from typing import cast
+
 from act.front_end.concept.output_spec import CombinedOutputSpec
 from act.front_end.concept.verifiable_model import ConceptVerifiableModel
 from act.front_end.spec_creator_base import LabeledInputTensor
@@ -15,7 +17,7 @@ class ConceptFuzzer(BaseFuzzer):
         output_spec = model.output_spec.spec
         assert output_spec is CombinedOutputSpec
 
-        property_checker = ConceptPropertyChecker(output_spec)
+        property_checker = ConceptPropertyChecker(cast(CombinedOutputSpec, output_spec))
 
         super().__init__(
             wrapped_model=model,
